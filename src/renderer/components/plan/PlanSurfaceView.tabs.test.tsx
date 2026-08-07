@@ -67,6 +67,27 @@ function model(): PlanDocumentsModel {
         populated: false,
         documents: [],
       },
+      {
+        key: 'supplements',
+        populated: true,
+        documents: [
+          {
+            ref: { source: 'folder', documentId: 'd-invalid-machine' },
+            name: 'work-packages.md',
+            kind: 'supplement',
+            sizeBytes: 300,
+            mtimeMs: 1,
+            machine: { kind: 'work-packages', status: 'invalid' },
+          },
+          {
+            ref: { source: 'folder', documentId: 'd-human-supplement' },
+            name: 'notes.md',
+            kind: 'supplement',
+            sizeBytes: 70,
+            mtimeMs: 1,
+          },
+        ],
+      },
     ],
   };
 }
@@ -90,6 +111,8 @@ beforeEach(() => {
       'd-plan': '# Plan\n\nplan body',
       'd-del1': '# Attr\n\ndelib one',
       'd-del2': '# Risk\n\ndelib two',
+      'd-invalid-machine': 'RAW MACHINE BODY MUST NOT RENDER',
+      'd-human-supplement': '# Notes\n\nhuman supplement body',
     };
     return readResult({ ref: ref as PlanDocumentReadResult['ref'], name: `${ref.documentId}.md`, content: map[ref.documentId] ?? '' });
   });
@@ -159,7 +182,7 @@ describe('PlanDocumentTabs (WP-P4B tabbed document home)', () => {
   it('renders only projected keys — no plan.json / .gitkeep tab', async () => {
     await render(<PlanDocumentTabs planId="plan-1" />);
     const keys = tabButtons().map((b) => b.getAttribute('data-tab-key'));
-    expect(keys).toEqual(['overview', 'plan', 'deliberations', 'research']);
+    expect(keys).toEqual(['overview', 'plan', 'deliberations', 'research', 'supplements']);
     expect(keys).not.toContain('plan.json');
     expect(keys).not.toContain('.gitkeep');
   });
@@ -215,6 +238,28 @@ describe('PlanDocumentTabs (WP-P4B tabbed document home)', () => {
     });
     await flush();
     expect(document.querySelector('[data-testid="plan-tab-empty"]')?.textContent).toContain('no documents yet');
+  });
+
+  it('shows a diagnostic for an invalid machine supplement while human supplements render normally', async () => {
+    await render(<PlanDocumentTabs planId="plan-1" />);
+    await act(async () => {
+      tabByKey('supplements').click();
+    });
+    await flush();
+
+    const diagnostic = document.querySelector('[data-testid="plan-supplement-machine-diagnostic"]');
+    expect(diagnostic?.textContent).toContain("couldn't be read");
+    expect(body().textContent).not.toContain('RAW MACHINE BODY MUST NOT RENDER');
+    expect(document.querySelector('[data-testid="proposal-reader"]')).toBeNull();
+
+    const siblings = document.querySelectorAll('[data-testid="plan-tab-sibling"]');
+    await act(async () => {
+      (siblings[1] as HTMLButtonElement).click();
+    });
+    await flush();
+
+    expect(document.querySelector('[data-testid="plan-supplement-machine-diagnostic"]')).toBeNull();
+    expect(document.querySelector('[data-testid="proposal-reader-body"]')?.textContent).toContain('human supplement body');
   });
 
   it('renders "Plan not found" when the projection is null', async () => {

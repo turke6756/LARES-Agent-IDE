@@ -21,8 +21,8 @@ import type {
   PlanningReaderReadResult,
   Workspace,
 } from '../../shared/types';
-import { getDb, getPlanSourceProposalProjectionState, getWorkspace,
-  type PlanSourceProposalProjectionState } from '../database';
+import { getDb, getPlanFolderProjectionState, getPlanSourceProposalProjectionState, getWorkspace,
+  type PlanFolderProjectionState, type PlanSourceProposalProjectionState } from '../database';
 import { translateStateRelPath, workspaceStateDir } from '../workspace-state-dir';
 import { listPlanningEntries, readPlanningDocument } from './planning-reader';
 
@@ -59,6 +59,7 @@ export interface PlanDocumentsDeps {
   listRegisteredDocuments?: (planId: string) => RegisteredDocumentRow[];
   getRegisteredDocument?: (planId: string, documentId: string) => RegisteredDocumentRow | null;
   getSourceProposalProjectionState?: (planId: string) => PlanSourceProposalProjectionState | null;
+  getFolderProjectionState?: (planId: string) => PlanFolderProjectionState | null;
   maxRegisteredReadBytes?: number;
 }
 
@@ -109,6 +110,11 @@ function defaultSourceProposalProjectionState(planId: string): PlanSourceProposa
   catch { return null; }
 }
 
+function defaultFolderProjectionState(planId: string): PlanFolderProjectionState | null {
+  try { return getPlanFolderProjectionState(planId); }
+  catch { return null; }
+}
+
 function depsWithDefaults(deps: PlanDocumentsDeps) {
   return {
     getPlanContext: deps.getPlanContext ?? defaultPlanContext,
@@ -118,6 +124,7 @@ function depsWithDefaults(deps: PlanDocumentsDeps) {
     listRegisteredDocuments: deps.listRegisteredDocuments ?? defaultListRegistered,
     getRegisteredDocument: deps.getRegisteredDocument ?? defaultGetRegistered,
     getSourceProposalProjectionState: deps.getSourceProposalProjectionState ?? defaultSourceProposalProjectionState,
+    getFolderProjectionState: deps.getFolderProjectionState ?? defaultFolderProjectionState,
     maxRegisteredReadBytes: deps.maxRegisteredReadBytes ?? MAX_REGISTERED_READ_BYTES,
   };
 }
@@ -257,6 +264,7 @@ export function buildPlanDocuments(
   if (sourceProjection?.status === 'invalid' || sourceProjection?.status === 'conflict') {
     warnings.push(`source proposal ${sourceProjection.status}: ${sourceProjection.diagnosticCode ?? 'unknown'}`);
   }
+  const folderProjection = d.getFolderProjectionState(planId);
   let manifest: PlanningReaderListResult = { entries: [], warnings: [] };
   try {
     manifest = d.listPlanningEntries(workspace.path, { pathType: workspace.pathType });
@@ -272,6 +280,10 @@ export function buildPlanDocuments(
   for (const doc of entry?.documents ?? []) {
     const key = folderTab(doc.category, doc.name);
     if (!key) continue;
+    const registeredRelPath = key === 'supplements' ? `supplements/${doc.name}` : null;
+    const isWorkPackageSource = folderProjection?.wpSourceRelPath !== null
+      && folderProjection?.wpSourceRelPath !== undefined
+      && registeredRelPath === folderProjection.wpSourceRelPath;
     const projected: PlanTabDocument = {
       ref: { source: 'folder', documentId: doc.docId },
       name: doc.name,
@@ -279,6 +291,13 @@ export function buildPlanDocuments(
       sizeBytes: doc.sizeBytes,
       mtimeMs: doc.mtimeMs,
     };
+    if (isWorkPackageSource && folderProjection.wpStatus === 'synced') {
+      projected.machine = { kind: 'work-packages', status: 'source' };
+      continue;
+    }
+    if (isWorkPackageSource && (folderProjection.wpStatus === 'invalid' || folderProjection.wpStatus === 'conflict')) {
+      projected.machine = { kind: 'work-packages', status: 'invalid' };
+    }
     if (key === 'proposal') manifestProposalDocuments.push(projected);
     else byKey.get(key)!.documents.push(projected);
   }

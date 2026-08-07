@@ -5245,6 +5245,7 @@ export interface PlanTabDocument {
   kind: 'arc' | 'plan' | 'deliberation' | 'research' | 'supplement' | 'proposal' | 'legacy-html';
   sizeBytes: number;
   mtimeMs: number | null;
+  machine?: { kind: 'work-packages'; status: 'source' | 'invalid' };
 }
 
 export interface PlanDocumentTab {

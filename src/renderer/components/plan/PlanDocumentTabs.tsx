@@ -536,13 +536,22 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
               </aside>
             )}
             <div className="min-w-0 flex-1">
-              <ProposalReader
-                name={doc?.name ?? null}
-                content={doc?.content ?? null}
-                truncated={doc?.truncated ?? false}
-                error={doc?.error ?? null}
-                loading={doc?.loading ?? false}
-              />
+              {activeDoc?.machine?.status === 'invalid' ? (
+                <div
+                  className="flex h-full items-center justify-center px-6 text-center text-[13px] text-amber-300"
+                  data-testid="plan-supplement-machine-diagnostic"
+                >
+                  This work-package file couldn't be read. Fix its machine block; the parsed board shows the last valid packages.
+                </div>
+              ) : (
+                <ProposalReader
+                  name={doc?.name ?? null}
+                  content={doc?.content ?? null}
+                  truncated={doc?.truncated ?? false}
+                  error={doc?.error ?? null}
+                  loading={doc?.loading ?? false}
+                />
+              )}
             </div>
           </div>
         )}

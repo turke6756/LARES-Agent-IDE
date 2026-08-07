@@ -12,6 +12,7 @@ import type {
   PlanningReaderListResult,
   Workspace,
 } from '../../shared/types';
+import type { PlanFolderProjectionState } from '../database';
 import {
   buildPlanDocuments,
   readPlanDocument,
@@ -86,8 +87,31 @@ function fixture(documents: PlanningReaderDocument[] = []): Fixture {
     getRegisteredDocument: (planId, id) =>
       registered.find((row) => row.planId === planId && row.id === id) ?? null,
     getSourceProposalProjectionState: () => null,
+    getFolderProjectionState: () => null,
   };
   return { root, context, workspace, manifest, registered, deps, dispose: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
+
+function folderProjection(overrides: Partial<PlanFolderProjectionState>): PlanFolderProjectionState {
+  return {
+    planId: PLAN_ID,
+    workspaceId: 'ws-1',
+    wpStatus: 'synced',
+    wpSourceRelPath: 'supplements/work-packages.md',
+    wpProjectionHash: 'sha256:packages',
+    wpDiagnosticsJson: '[]',
+    wpReconciledAt: 1,
+    responsibilityEventId: null,
+    responsibilityStatus: 'absent',
+    responsibilityDetail: null,
+    responsibilityReconciledAt: null,
+    overviewStatus: 'absent',
+    overviewSourceHash: null,
+    overviewDiagnosticsJson: '[]',
+    overviewReconciledAt: null,
+    overviewAdoptionState: 'never-seen',
+    ...overrides,
+  };
 }
 
 function tab(model: NonNullable<ReturnType<typeof buildPlanDocuments>>, key: string) {
@@ -113,6 +137,69 @@ test('plan.json and every .gitkeep are suppressed defensively', () => {
   try {
     const model = buildPlanDocuments(PLAN_ID, f.deps)!;
     assert.equal(model.tabs.flatMap((t) => t.documents).length, 0);
+  } finally { f.dispose(); }
+});
+
+test('synced work-package source is omitted while human supplements remain', () => {
+  const f = fixture([
+    doc('machine', 'work-packages.md', 'supplement'),
+    doc('human', 'notes.md', 'supplement'),
+  ]);
+  f.deps.getFolderProjectionState = () => folderProjection({});
+  try {
+    const supplements = tab(buildPlanDocuments(PLAN_ID, f.deps)!, 'supplements');
+    assert.deepEqual(supplements.documents.map((document) => document.name), ['notes.md']);
+    assert.equal(supplements.populated, true);
+  } finally { f.dispose(); }
+});
+
+test('invalid recorded work-package source is tagged instead of suppressed', () => {
+  const f = fixture([
+    doc('machine', 'work-packages.md', 'supplement'),
+    doc('human', 'notes.md', 'supplement'),
+  ]);
+  f.deps.getFolderProjectionState = () => folderProjection({ wpStatus: 'invalid' });
+  try {
+    const supplements = tab(buildPlanDocuments(PLAN_ID, f.deps)!, 'supplements');
+    assert.deepEqual(supplements.documents.map((document) => ({
+      name: document.name,
+      machine: document.machine,
+    })), [
+      { name: 'work-packages.md', machine: { kind: 'work-packages', status: 'invalid' } },
+      { name: 'notes.md', machine: undefined },
+    ]);
+  } finally { f.dispose(); }
+});
+
+test('missing recorded work-package source path suppresses no supplements', () => {
+  const f = fixture([
+    doc('named-like-machine', 'work-packages.md', 'supplement'),
+    doc('human', 'notes.md', 'supplement'),
+  ]);
+  f.deps.getFolderProjectionState = () => folderProjection({ wpSourceRelPath: null });
+  try {
+    const supplements = tab(buildPlanDocuments(PLAN_ID, f.deps)!, 'supplements');
+    assert.deepEqual(supplements.documents.map((document) => ({
+      name: document.name,
+      machine: document.machine,
+    })), [
+      { name: 'work-packages.md', machine: undefined },
+      { name: 'notes.md', machine: undefined },
+    ]);
+  } finally { f.dispose(); }
+});
+
+test('a matching basename at a different recorded relative path remains human-visible', () => {
+  const f = fixture([doc('human', 'work-packages.md', 'supplement')]);
+  f.deps.getFolderProjectionState = () => folderProjection({
+    wpSourceRelPath: 'research/work-packages.md',
+  });
+  try {
+    const supplements = tab(buildPlanDocuments(PLAN_ID, f.deps)!, 'supplements');
+    assert.deepEqual(supplements.documents.map((document) => ({
+      name: document.name,
+      machine: document.machine,
+    })), [{ name: 'work-packages.md', machine: undefined }]);
   } finally { f.dispose(); }
 });
 
