@@ -61,6 +61,7 @@ import {
   proposalToPlanEntries,
   writeProposalEntry,
   readPlanningSurfaceEntry,
+  WRITE_PROPOSAL_SKILL_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2_HASH,
@@ -163,6 +164,7 @@ import {
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3,
   PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1,
 } from './proposal-to-plan-old-body-fixtures';
+import { WRITE_PROPOSAL_SKILL_MD_V1 } from './write-proposal-old-body-fixtures';
 import {
   SUPERVISOR_V11_ORCH_THROUGH_BROWSER,
   SUPERVISOR_V11_REORIENT_EXTRA,
@@ -3879,7 +3881,18 @@ test('WP-P0C-TREE-HELPER. proposalToPlanEntries expands the full tree under a ro
   }, 'capture.md must remain in the managed tree as a cumulative v4 retirement entry');
 });
 
-test('WP-2-CONTENT. write-proposal owns threshold, path, stamp, plain lead, and human hand-off', () => {
+test('WP-1-PRECONDITION. frozen write-proposal v1 hashes to its literal and differs from the live v2 body', () => {
+  assert.equal(
+    sha256Hex(WRITE_PROPOSAL_SKILL_MD_V1), WRITE_PROPOSAL_SKILL_MD_V1_HASH,
+    'the frozen v1 body must hash to previousHashes[1], or pristine v1 copies cannot silently upgrade',
+  );
+  assert.notEqual(
+    sha256Hex(WRITE_PROPOSAL_SKILL_MD), WRITE_PROPOSAL_SKILL_MD_V1_HASH,
+    'the live v2 body must differ from the frozen v1 hash',
+  );
+});
+
+test('WP-1-CONTENT. write-proposal owns the conceptual model, bounded decisions, reconfirmation, and hand-off', () => {
   const normativeFrontmatterBlock = [
     'author: "<agent title verbatim>" (<lane>, <workspace>)',
     'author_agent_id: <dashboard agent uuid>',
@@ -3899,16 +3912,33 @@ test('WP-2-CONTENT. write-proposal owns threshold, path, stamp, plain lead, and 
   assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('`supporting/` is reserved for a supervisor subscribed to a plan'));
   assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('.lares/proposals/YYYY-MM-DD-<slug>.md'));
   assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('`## In plain terms`'));
-  assert.ok(WRITE_PROPOSAL_SKILL_MD.includes('what is this, why does it matter, and what changes\nfor the user?'));
+  for (const required of [
+    '**What it is** - one sentence.',
+    '**The problem** - why it matters, in user terms.',
+    '**How it works, in parts** - name 3-6 moving parts in plain language',
+    '**What changes for you**.',
+    '**The main trade-off / open choice**.',
+    "**What's up to you** - 0-3 genuine decisions.",
+    'Each must be a real, still-open\n   decision, explained in ordinary language and stating what changes depending',
+    'It must be understandable by a non-technical reader and must\n   not already be answered by the proposal.',
+    'Target 150-300 words and never exceed 450 words.',
+    'Use no file paths, identifiers,\nor jargon in this section.',
+    'No decision is needed right now - tell me if this model looks wrong',
+    'After any material change to the technical body, re-read `## In plain terms`',
+    'Update it to match, or explicitly reconfirm that it still\nholds.',
+  ]) {
+    assert.ok(WRITE_PROPOSAL_SKILL_MD.includes(required), `missing write-proposal contract text: ${required}`);
+  }
   assert.ok(WRITE_PROPOSAL_SKILL_MD.includes(
     'Tell the human the proposal exists and where it is; the lifecycle continues only\nfrom the Plans pane.'));
 });
 
-test('WP-2-MIG. write-proposal is a managed v1 skill in every native lane', () => {
+test('WP-1-MIG. write-proposal is a managed v2 skill in every native lane', () => {
   const helperEntry = writeProposalEntry('.lares/example/.agents/skills/write-proposal');
   assert.deepEqual(helperEntry['.lares/example/.agents/skills/write-proposal/SKILL.md'], {
     content: WRITE_PROPOSAL_SKILL_MD,
-    version: 1,
+    version: 2,
+    previousHashes: { 1: WRITE_PROPOSAL_SKILL_MD_V1_HASH },
   });
 
   const workDir = mktmp('write-proposal-all-lanes');
@@ -3930,8 +3960,35 @@ test('WP-2-MIG. write-proposal is a managed v1 skill in every native lane', () =
     for (const rel of paths) {
       assert.equal(fs.readFileSync(path.join(workDir, ...rel.split('/')), 'utf8'), WRITE_PROPOSAL_SKILL_MD,
         `${rel} must contain the exact shared skill body`);
-      assert.equal(sidecar[rel.replace(/^\.lares\//, '')], 1, `${rel} must be recorded at v1`);
+      assert.equal(sidecar[rel.replace(/^\.lares\//, '')], 2, `${rel} must be recorded at v2`);
     }
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('WP-1-MIG-UPGRADE. a pristine write-proposal v1 silently upgrades to v2', () => {
+  const workDir = mktmp('write-proposal-v1');
+  const { supervisor, cleanup } = makeSupervisor();
+  const rel = '.lares/workers/codex/.agents/skills/write-proposal/SKILL.md';
+  const skillPath = path.join(workDir, ...rel.split('/'));
+  const sidecarKey = rel.replace(/^\.lares\//, '');
+  try {
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.writeFileSync(skillPath, WRITE_PROPOSAL_SKILL_MD_V1, 'utf8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(sidecarPath(workDir), JSON.stringify({ [sidecarKey]: 1 }, null, 2) + '\n', 'utf8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    assert.equal(fs.readFileSync(skillPath, 'utf8'), WRITE_PROPOSAL_SKILL_MD);
+    assert.equal(readSidecar(workDir)[sidecarKey], 2);
+    assert.equal(
+      fs.readdirSync(path.dirname(skillPath)).filter((name) => name.startsWith('SKILL.md.bak.')).length,
+      0,
+      'a pristine v1 body must upgrade without a backup',
+    );
   } finally {
     cleanup();
     rmrf(workDir);

@@ -1282,6 +1282,10 @@ export const PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH = '64a1f0a1f880
 // through read-planning-surface. Older entries remain cumulative below.
 export const PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH = '0294b56880d8faf9481bd8dae747d1877b0fd6e30569c670d684971b47f453c5';
 
+// WP-1 - frozen hash of the pristine write-proposal v1 body. The byte-exact
+// body lives in the test-only write-proposal-old-body-fixtures.ts module.
+export const WRITE_PROPOSAL_SKILL_MD_V1_HASH = 'e025a7762b1765c2cb402fd851c816d44b57ca589b211266ac32eee2f6236078';
+
 // WP-P0C — proposal-to-plan skill tree deploy. One versioned content constant per
 // file (constants.ts); this manifest expands the tree under each of the four skill
 // roots (Claude+Codex x supervisor+worker). New-skill shape was version 1, no
@@ -1349,11 +1353,14 @@ export function proposalToPlanEntries(rootPrefix: string): Record<string, Scaffo
   return out;
 }
 
-/** The proposal authoring entry is shared by every native lane. It starts at
- * version 1 because WP-2 is its first managed workspace deployment. */
+/** The proposal authoring entry is shared by every native lane. */
 export function writeProposalEntry(rootPrefix: string): Record<string, ScaffoldFile> {
   return {
-    [`${rootPrefix}/SKILL.md`]: { content: WRITE_PROPOSAL_SKILL_MD, version: 1 },
+    [`${rootPrefix}/SKILL.md`]: {
+      content: WRITE_PROPOSAL_SKILL_MD,
+      version: 2,
+      previousHashes: { 1: WRITE_PROPOSAL_SKILL_MD_V1_HASH },
+    },
   };
 }
 

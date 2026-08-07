@@ -5583,16 +5583,36 @@ The first body section is required and must be titled exactly:
 
 \`## In plain terms\`
 
-In ordinary words, answer: **what is this, why does it matter, and what changes
-for the user?** Use no file paths, identifiers, or jargon in this section. A
-non-specialist who stops there must still understand the idea. Technical detail
-may follow and may be as deep as needed; the plain lead supplements it.
+In ordinary words, give the human a compact mental model with all six of these
+elements. Bold lead-ins are welcome but not required:
+
+1. **What it is** - one sentence.
+2. **The problem** - why it matters, in user terms.
+3. **How it works, in parts** - name 3-6 moving parts in plain language, and
+   explain how they relate.
+4. **What changes for you**.
+5. **The main trade-off / open choice**.
+6. **What's up to you** - 0-3 genuine decisions. Each must be a real, still-open
+   decision, explained in ordinary language and stating what changes depending
+   on the answer. It must be understandable by a non-technical reader and must
+   not already be answered by the proposal. If no decision remains, say plainly:
+   "No decision is needed right now - tell me if this model looks wrong" instead
+   of inventing one.
+
+Target 150-300 words and never exceed 450 words. Use no file paths, identifiers,
+or jargon in this section. A non-specialist who stops there must still understand
+the idea. Technical detail may follow and may be as deep as needed; the plain
+lead supplements it.
 
 ## 5. Write with zero further ceremony
 
 Write plain Markdown after the required lead. Do not create a plan folder,
 \`plan.json\`, subdirectories, intent sentinels, or lifecycle markup. Authoring a
 proposal does not obligate later hardening.
+
+After any material change to the technical body, re-read \`## In plain terms\`
+before finishing. Update it to match, or explicitly reconfirm that it still
+holds.
 
 ## Hand-off
 
