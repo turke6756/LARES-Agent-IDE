@@ -6682,7 +6682,9 @@ invalid until its responsible supervisor adds a reviewed v1 block.
 export const PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD = `# Contract reference — PLAN-TAB-OVERVIEWS:v1
 
 \`OVERVIEW.md\` lives beside \`ARC.md\` and is the human-register source for structured-plan tab
-summaries. It begins with exact frontmatter identity:
+summaries. During \`package\`, the responsible supervisor authors this file; the app then parses and
+projects it. Application code does not auto-synthesize \`OVERVIEW.md\`, and its prose is not rewritten
+on lifecycle transitions. It begins with exact frontmatter identity:
 
 \`\`\`markdown
 ---
@@ -6737,6 +6739,18 @@ Derive tabs from bounded, contained disk evidence, never SQLite: Overview and Pl
 when the manifest source resolves to a contained regular non-symlink file; Deliberations, Research,
 and Supplements when their directories contain a regular non-symlink output other than
 \`.gitkeep\`; Packages always during \`package\`; never infer Legacy HTML.
+
+The \`deliberations\` body is 3-6 plain-language bullets stating what was decided and why. It is a
+decision readout, not a transcript.
+
+The \`packages\` body is a package-time structural readout only: package count, dependency/start
+sequence, and a pointer to the live package board. Do not copy runtime lifecycle state
+(ready/executing/done) or per-package Outcome text into it; the live board owns current progress and
+outcomes. Example: "Eight packages; three can start independently, then five land in dependency
+order. See the package board for live progress and outcomes."
+
+Any later change to package count, ordering, or dependencies requires refreshing the Packages
+overview before dispatch readiness.
 
 When editing a valid file, preserve unrelated sections and unmapped prose byte-for-byte. Replace
 only the selected body; insert/remove the index entry and complete delimited section together;

@@ -1291,6 +1291,10 @@ export const WRITE_PROPOSAL_SKILL_MD_V1_HASH = 'e025a7762b1765c2cb402fd851c816d4
 export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH = '97fd1cf2f4945aeed0a0b3543a71885429ded54c08dd1ffbe79aace4b495b461';
 export const PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH = '1332922da5b48594b46f875af29d15fbb327233f173403fc3b5c73e6c9fa80ee';
 
+// WP-3 - frozen hash of the pristine pre-clarification human-overview v1 body.
+// The byte-exact body lives in proposal-to-plan-old-body-fixtures.ts.
+export const PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH = '7625a5fcf79ae0fd4882a26042f9311dd9817d7ecb652e43528aa1bdd12012d2';
+
 // WP-P0C — proposal-to-plan skill tree deploy. One versioned content constant per
 // file (constants.ts); this manifest expands the tree under each of the four skill
 // roots (Claude+Codex x supervisor+worker). New-skill shape was version 1, no
@@ -1331,7 +1335,8 @@ const PROPOSAL_TO_PLAN_TREE: Array<{
                       2: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2_HASH } },
   { rel: 'references/contracts/arc.md', content: PROPOSAL_TO_PLAN_CONTRACT_ARC_MD },
   { rel: 'references/contracts/folder-schema.md', content: PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD },
-  { rel: 'references/contracts/human-overview.md', content: PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD },
+  { rel: 'references/contracts/human-overview.md', content: PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD, version: 2,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH } },
   { rel: 'references/contracts/intent-lifecycle.md', content: PROPOSAL_TO_PLAN_CONTRACT_INTENT_LIFECYCLE_MD },
   { rel: 'references/contracts/manifest-lock.md', content: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD, version: 2,
     previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } },

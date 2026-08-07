@@ -71,6 +71,7 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
   PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V3_HASH,
@@ -163,6 +164,7 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2,
   PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1,
   PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1,
+  PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V2,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V3,
@@ -3845,6 +3847,9 @@ const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; prev
   ['references/contracts/responsibility.md', { version: 2, previousHashes: {
     1: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH,
   } }],
+  ['references/contracts/human-overview.md', { version: 2, previousHashes: {
+    1: PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH,
+  } }],
   ['references/contracts/work-packages.md', { version: 2, previousHashes: {
     1: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
   } }],
@@ -4200,6 +4205,70 @@ test('WP-2-MIG. pristine work-packages v1 and package v1/v2 silently upgrade to 
       cleanup();
       rmrf(workDir);
     }
+  }
+});
+
+test('WP-3-PRECONDITION. frozen human-overview v1 pins the new migration-history entry', () => {
+  assert.equal(
+    sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1),
+    PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH,
+    'frozen human-overview.md v1 must hash to previousHashes[1]',
+  );
+  assert.notEqual(
+    sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD),
+    PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH,
+    'live human-overview.md v2 must differ from frozen v1',
+  );
+});
+
+test('WP-3-CONTENT. overview deliberations and packages stay plain, structural, and non-duplicative', () => {
+  for (const phrase of [
+    'During `package`, the responsible supervisor authors this file; the app then parses and',
+    'Application code does not auto-synthesize `OVERVIEW.md`, and its prose is not rewritten',
+    '3-6 plain-language bullets stating what was decided and why',
+    'decision readout, not a transcript',
+    'package-time structural readout only: package count, dependency/start',
+    'Do not copy runtime lifecycle state',
+    '(ready/executing/done) or per-package Outcome text',
+    'See the package board for live progress and outcomes.',
+    'Any later change to package count, ordering, or dependencies requires refreshing the Packages',
+    'overview before dispatch readiness.',
+  ]) {
+    assert.ok(PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD.includes(phrase),
+      `missing human-overview clarification: ${phrase}`);
+  }
+  assert.ok(PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD.includes('schema_version: 1'));
+  assert.ok(PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD.includes('"schema_version": 1'));
+  const indexedTabs = [...PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD.matchAll(/\{ "tab": "([^"]+)"/g)]
+    .map((match) => match[1]);
+  assert.deepEqual(indexedTabs, ['overview', 'proposal', 'plan', 'deliberations', 'supplements', 'packages'],
+    'WP-3 must not add a tab');
+});
+
+test('WP-3-MIG. pristine human-overview v1 silently upgrades to v2', () => {
+  const workDir = mktmp('wp3-human-overview-v1');
+  const { supervisor, cleanup } = makeSupervisor();
+  const rel = '.lares/workers/codex/.agents/skills/proposal-to-plan/references/contracts/human-overview.md';
+  const overviewPath = path.join(workDir, ...rel.split('/'));
+  const sidecarKey = rel.replace(/^\.lares\//, '');
+  try {
+    fs.mkdirSync(path.dirname(overviewPath), { recursive: true });
+    fs.writeFileSync(overviewPath, PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1, 'utf8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(sidecarPath(workDir), JSON.stringify({ [sidecarKey]: 1 }, null, 2) + '\n', 'utf8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    assert.equal(fs.readFileSync(overviewPath, 'utf8'), PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD);
+    assert.equal(readSidecar(workDir)[sidecarKey], 2);
+    assert.equal(
+      fs.readdirSync(path.dirname(overviewPath)).filter((name) => name.startsWith('human-overview.md.bak.')).length,
+      0,
+      'a pristine human-overview v1 body must upgrade without a backup',
+    );
+  } finally {
+    cleanup();
+    rmrf(workDir);
   }
 });
 
