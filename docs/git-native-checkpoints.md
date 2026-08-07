@@ -31,6 +31,15 @@ refs/lares/recovery/<enc(workspaceId)>/<enc(operationId)>/pre
   are invisible to `git branch`, `git tag`, and `git log` — but **not** to
   everything (see below).
 
+### Lares saves do not run Git hooks or signing
+
+Lares intentionally builds save commits with `git commit-tree` from the exact
+objects you reviewed. As a ruled design choice, this path does **not** run
+`pre-commit` or `commit-msg` hooks and does **not** sign commits: a hook that can
+rewrite the index could introduce bytes outside the reviewed tree. Consequently,
+any Git hook you add to this repository will not fire for commits produced by a
+Lares save.
+
 ## What leaks the refs, and what does not
 
 | Operation | Copies `refs/lares/*`? | Notes |
