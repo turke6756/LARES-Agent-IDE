@@ -2374,6 +2374,75 @@ export type CommitCoordinatorConsumeResponse =
       finalizations: CommitCoordinatorClosureResult[];
     };
 
+// ── Save sweep — durable main-owned multi-package gesture ────────────────────
+
+export const SAVE_SWEEP_CHANNEL = 'savecard:sweep' as const;
+
+/** One durable package intent captured from a reviewed union. Live renderer
+ * component, bundle, and dirty-entry ids are deliberately absent. */
+export interface SaveSweepIntent {
+  repositoryKey: string;
+  finalizationId: string;
+  packageId: string;
+  packageRevision: number;
+  frozenMemberManifestDigest: string;
+  reviewedManifestDigest: string;
+  message: string;
+}
+
+export interface SaveSweepRequest {
+  intents: SaveSweepIntent[];
+  /** Immutable package-review identities displayed by the opening union review. */
+  reviewedManifestDigests: string[];
+  /** Exact union of independently acknowledged atoms; fresh WP-4 checks may use
+   * any covered subset but can never add an unseen atom. */
+  acknowledgedChallengeAtoms: import('./commit-candidates').ReviewChallengeAtom[];
+}
+
+interface SaveSweepTerminalBase {
+  repositoryKey: string;
+  finalizationId: string;
+  packageId: string;
+  packageRevision: number;
+}
+
+/** Exactly one of these terminal records is returned for every input intent. */
+export type SaveSweepTerminalResult =
+  | (SaveSweepTerminalBase & {
+      kind: 'saved';
+      attemptId: string;
+      commitOid: string;
+    })
+  | (SaveSweepTerminalBase & {
+      kind: 'already-saved';
+      provingCommitOids: string[];
+    })
+  | (SaveSweepTerminalBase & {
+      kind: 'needs-attention';
+      code: string;
+      message: string;
+    })
+  | (SaveSweepTerminalBase & {
+      kind: 'blocked-unmerged';
+    })
+  | (SaveSweepTerminalBase & {
+      kind: 'not-attempted';
+      haltedAfterFinalizationId: string;
+    })
+  | (SaveSweepTerminalBase & {
+      kind: 'halted-uncertain';
+      code: string;
+      message: string;
+      attemptId?: string;
+      commitOid?: string;
+    });
+
+export interface SaveSweepResponse {
+  results: SaveSweepTerminalResult[];
+  halted: boolean;
+  haltKind: 'unmerged' | 'uncertain' | null;
+}
+
 // ── SC-WP-3I — Plan-lens candidate preview channel ────────────────────────────
 //
 // The plan lens's OWN read-only preview transport, deliberately kept SEPARATE from

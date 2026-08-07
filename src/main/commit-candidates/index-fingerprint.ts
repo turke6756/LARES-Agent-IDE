@@ -59,6 +59,21 @@ export interface IndexFingerprintResult {
   writeTreeOid: string | null;
 }
 
+/** Repository-wide gate consumed immediately by a fresh sweep iteration. This
+ * projection intentionally has no path argument: an unmerged stage anywhere in
+ * the index blocks every package in the repository. */
+export interface FreshIndexGate {
+  fingerprint: string;
+  hasUnmerged: boolean;
+}
+
+export function freshIndexGate(result: IndexFingerprintResult): FreshIndexGate {
+  return {
+    fingerprint: result.fingerprint,
+    hasUnmerged: result.hasUnmerged,
+  };
+}
+
 export interface ComputeIndexFingerprintOptions {
   /** Repo-root cwd for git; the real index is read (no `GIT_INDEX_FILE` override). */
   repoRoot: string;

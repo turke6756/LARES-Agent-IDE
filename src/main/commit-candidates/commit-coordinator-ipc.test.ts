@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { COMMIT_COORDINATOR_CHANNEL } from '../../shared/types';
 import type { CandidateTokenSnapshot } from './candidate-service';
 import {
+  consumeCommitCoordinatorForSweep,
   registerCommitCoordinatorIpc,
   type CommitCoordinatorRoutes,
 } from './commit-coordinator-ipc';
@@ -323,6 +324,46 @@ test('a 4G failure is explicit and can never be mislabeled saved', async () => {
     refusal: {
       stage: 'reconciliation', code: 'tree-mismatch',
       message: 'Reconciliation stage refused: marked tree differs',
+    },
+  });
+});
+
+test('the sweep adapter distinguishes pre-consumption refusal from an attempt', async () => {
+  const result = await consumeCommitCoordinatorForSweep(
+    { candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save it' },
+    routesFixture({ coordinator: { commit: async () => ({ kind: 'compose-in-flight' }) } }),
+    () => undefined,
+  );
+  assert.deepEqual(result, {
+    attempt: { created: false },
+    reconciliation: 'not-applicable',
+    response: {
+      kind: 'compose-in-flight',
+      refusal: {
+        stage: 'token-consume', code: 'token-consume-busy',
+        message: 'Token-consume stage refused because another save holds the repository coordinator.',
+      },
+    },
+  });
+});
+
+test('the sweep adapter preserves the known commit when reconciliation transport fails', async () => {
+  const result = await consumeCommitCoordinatorForSweep(
+    { candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save it' },
+    routesFixture({ reconcileCommitted: async () => { throw new Error('database unavailable'); } }),
+    () => undefined,
+  );
+  assert.deepEqual(result, {
+    attempt: { created: true, attemptId: 'attempt-1', commitOid: COMMIT_OID },
+    reconciliation: 'failed',
+    response: {
+      kind: 'reconciliation-error',
+      outcome: committedResult().outcome,
+      error: { code: 'reconciliation-transport-error', message: 'database unavailable' },
+      refusal: {
+        stage: 'reconciliation', code: 'reconciliation-transport-error',
+        message: 'Reconciliation stage refused: database unavailable',
+      },
     },
   });
 });

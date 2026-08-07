@@ -77,7 +77,10 @@ function requireRoutes(routes: CommitCoordinatorRoutes | null): CommitCoordinato
   return routes;
 }
 
-function passthroughResult(result: Exclude<CommitCoordinatorResult, { kind: 'outcome' }>): CommitCoordinatorConsumeResponse {
+type PreConsumeResponse = Extract<CommitCoordinatorConsumeResponse,
+  { kind: 'token-unresolved' | 'invalid-message' | 'compose-in-flight' }>;
+
+function passthroughResult(result: Exclude<CommitCoordinatorResult, { kind: 'outcome' }>): PreConsumeResponse {
   if (result.kind === 'token-unresolved') {
     return {
       ...result,
@@ -102,6 +105,156 @@ function passthroughResult(result: Exclude<CommitCoordinatorResult, { kind: 'out
   };
 }
 
+export type SweepConsumableCoordinatorResult =
+  | {
+      attempt: { created: false };
+      reconciliation: 'not-applicable';
+      response: Extract<CommitCoordinatorConsumeResponse,
+        { kind: 'token-unresolved' | 'invalid-message' | 'compose-in-flight' }>;
+    }
+  | {
+      attempt: { created: true; attemptId: string; commitOid?: string };
+      reconciliation: 'not-applicable' | 'failed';
+      response: Extract<CommitCoordinatorConsumeResponse,
+        { kind: 'outcome' | 'reconciliation-error' }>;
+    }
+  | {
+      attempt: { created: true; attemptId: string; commitOid: string };
+      reconciliation: 'succeeded';
+      response: Extract<CommitCoordinatorConsumeResponse, { kind: 'saved' }>;
+    };
+
+/** Main-side consume adapter used by both IPC and the save sweep. It makes the
+ * pre/post-consumption boundary explicit and keeps reconciliation inseparable
+ * from the coordinator outcome. */
+export async function consumeCommitCoordinatorForSweep(
+  request: CommitCoordinatorConsumeRequest,
+  routes: CommitCoordinatorRoutes,
+  telemetry: SaveFunnelTelemetry = ({ stage, code }) => {
+    console.info('[save-funnel]', { stage, code });
+  },
+): Promise<SweepConsumableCoordinatorResult> {
+  const snapshot = routes.resolveCandidateToken(request.tokenId);
+  if (!snapshot || snapshot.candidate.candidateId !== request.candidateId) {
+    const response = passthroughResult({ kind: 'token-unresolved' });
+    telemetry({ stage: 'token-consume', code: 'token-unresolved-or-expired' });
+    return { attempt: { created: false }, reconciliation: 'not-applicable', response };
+  }
+
+  const coordinated = await routes.coordinator.commit({
+    tokenId: request.tokenId,
+    message: request.message,
+  });
+  if (coordinated.kind !== 'outcome') {
+    const response = passthroughResult(coordinated);
+    if ('refusal' in response && response.refusal) {
+      telemetry({ stage: response.refusal.stage, code: response.refusal.code });
+    }
+    return { attempt: { created: false }, reconciliation: 'not-applicable', response };
+  }
+  if (coordinated.outcome.status !== 'committed') {
+    const stale = coordinated.outcome.status === 'aborted-stale';
+    const detail = 'reason' in coordinated.outcome
+      ? coordinated.outcome.reason
+      : coordinated.outcome.status;
+    const response = {
+      kind: 'outcome',
+      outcome: coordinated.outcome,
+      refusal: {
+        stage: 'commit',
+        code: stale ? 'coordinator-stale' : `commit-${coordinated.outcome.status}`,
+        message: stale
+          ? `Commit stage refused because coordinator state is stale: ${detail}`
+          : `Commit stage refused: ${detail}.`,
+        ...('mismatchedPaths' in coordinated.outcome
+          ? { paths: coordinated.outcome.mismatchedPaths.map((path) => path.pathBytesBase64) }
+          : {}),
+      },
+    } satisfies CommitCoordinatorConsumeResponse;
+    telemetry({ stage: response.refusal.stage, code: response.refusal.code });
+    const commitOid = 'commitOid' in coordinated.outcome ? coordinated.outcome.commitOid : undefined;
+    return {
+      attempt: {
+        created: true,
+        attemptId: coordinated.outcome.attemptId,
+        ...(commitOid ? { commitOid } : {}),
+      },
+      reconciliation: 'not-applicable',
+      response,
+    };
+  }
+
+  const repository = routes.locateRepository(snapshot);
+  const reconcile = routes.reconcileCommitted ?? reconcileCommittedCandidate;
+  let reconciled: ReconcileCommittedCandidateResult;
+  try {
+    reconciled = await reconcile({
+      outcome: coordinated.outcome,
+      snapshot,
+      ...repository,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const response = {
+      kind: 'reconciliation-error',
+      outcome: coordinated.outcome,
+      error: { code: 'reconciliation-transport-error', message },
+      refusal: {
+        stage: 'reconciliation',
+        code: 'reconciliation-transport-error',
+        message: `Reconciliation stage refused: ${message}`,
+      },
+    } satisfies CommitCoordinatorConsumeResponse;
+    telemetry({ stage: response.refusal.stage, code: response.refusal.code });
+    return {
+      attempt: {
+        created: true,
+        attemptId: coordinated.outcome.attemptId,
+        commitOid: coordinated.outcome.commitOid,
+      },
+      reconciliation: 'failed',
+      response,
+    };
+  }
+  if (!reconciled.ok) {
+    const response = {
+      kind: 'reconciliation-error',
+      outcome: coordinated.outcome,
+      error: reconciled.error,
+      refusal: {
+        stage: 'reconciliation',
+        code: reconciled.error.code,
+        message: `Reconciliation stage refused: ${reconciled.error.message}`,
+      },
+    } satisfies CommitCoordinatorConsumeResponse;
+    telemetry({ stage: response.refusal.stage, code: response.refusal.code });
+    return {
+      attempt: {
+        created: true,
+        attemptId: coordinated.outcome.attemptId,
+        commitOid: coordinated.outcome.commitOid,
+      },
+      reconciliation: 'failed',
+      response,
+    };
+  }
+  const response = {
+    kind: 'saved',
+    outcome: coordinated.outcome,
+    finalizations: reconciled.finalizations,
+  } satisfies CommitCoordinatorConsumeResponse;
+  telemetry({ stage: 'reconciliation', code: 'save-verified' });
+  return {
+    attempt: {
+      created: true,
+      attemptId: coordinated.outcome.attemptId,
+      commitOid: coordinated.outcome.commitOid,
+    },
+    reconciliation: 'succeeded',
+    response,
+  };
+}
+
 /** Register the shared Save/Plan consume channel. `isCoordinatorEnabled` is read
  * for every invocation so the disabled-route test remains stable after WP-4K
  * flips the production constant. The flag is checked before route resolution. */
@@ -123,74 +276,6 @@ export function registerCommitCoordinatorIpc(
 
     const request = requireRequest(raw);
     const routes = requireRoutes(getRoutes());
-    const snapshot = routes.resolveCandidateToken(request.tokenId);
-    if (!snapshot || snapshot.candidate.candidateId !== request.candidateId) {
-      const response = passthroughResult({ kind: 'token-unresolved' });
-      telemetry({ stage: 'token-consume', code: 'token-unresolved-or-expired' });
-      return response;
-    }
-
-    const coordinated = await routes.coordinator.commit({
-      tokenId: request.tokenId,
-      message: request.message,
-    });
-    if (coordinated.kind !== 'outcome') {
-      const response = passthroughResult(coordinated);
-      if ('refusal' in response && response.refusal) {
-        telemetry({ stage: response.refusal.stage, code: response.refusal.code });
-      }
-      return response;
-    }
-    if (coordinated.outcome.status !== 'committed') {
-      const stale = coordinated.outcome.status === 'aborted-stale';
-      const detail = 'reason' in coordinated.outcome
-        ? coordinated.outcome.reason
-        : coordinated.outcome.status;
-      const response = {
-        kind: 'outcome',
-        outcome: coordinated.outcome,
-        refusal: {
-          stage: 'commit',
-          code: stale ? 'coordinator-stale' : `commit-${coordinated.outcome.status}`,
-          message: stale
-            ? `Commit stage refused because coordinator state is stale: ${detail}`
-            : `Commit stage refused: ${detail}.`,
-          ...('mismatchedPaths' in coordinated.outcome
-            ? { paths: coordinated.outcome.mismatchedPaths.map((path) => path.pathBytesBase64) }
-            : {}),
-        },
-      } satisfies CommitCoordinatorConsumeResponse;
-      telemetry({ stage: response.refusal.stage, code: response.refusal.code });
-      return response;
-    }
-
-    const repository = routes.locateRepository(snapshot);
-    const reconcile = routes.reconcileCommitted ?? reconcileCommittedCandidate;
-    const reconciled = await reconcile({
-      outcome: coordinated.outcome,
-      snapshot,
-      ...repository,
-    });
-    if (!reconciled.ok) {
-      const response = {
-        kind: 'reconciliation-error',
-        outcome: coordinated.outcome,
-        error: reconciled.error,
-        refusal: {
-          stage: 'reconciliation',
-          code: reconciled.error.code,
-          message: `Reconciliation stage refused: ${reconciled.error.message}`,
-        },
-      } satisfies CommitCoordinatorConsumeResponse;
-      telemetry({ stage: response.refusal.stage, code: response.refusal.code });
-      return response;
-    }
-    const response = {
-      kind: 'saved',
-      outcome: coordinated.outcome,
-      finalizations: reconciled.finalizations,
-    } satisfies CommitCoordinatorConsumeResponse;
-    telemetry({ stage: 'reconciliation', code: 'save-verified' });
-    return response;
+    return (await consumeCommitCoordinatorForSweep(request, routes, telemetry)).response;
   });
 }
