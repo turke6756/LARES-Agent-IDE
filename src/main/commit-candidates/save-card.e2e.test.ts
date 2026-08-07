@@ -498,7 +498,7 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     }
     fs.rmSync(path.join(repo, '.lares/proposals/expiry.md'));
 
-    // A real rejecting hook aborts cleanly and leaves HEAD unchanged.
+    // Lares' exact-object save path deliberately bypasses repository hooks.
     fs.writeFileSync(path.join(repo, '.lares/proposals/hook.md'), 'hook candidate\n');
     const hookInventory = await ipc.invoke<SaveCardInventoryResponse>(SAVECARD_CHANNELS.getInventory, { workspaceId: 'ws-repo' });
     const hookBundle = hookInventory.bundles.find((item) => item.kind === 'unattributed')!;
@@ -517,16 +517,17 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     });
     const hookCandidate = hookMint.candidate as CommitCandidate;
     const hookPath = path.join(repo, '.git', 'hooks', 'pre-commit');
-    fs.writeFileSync(hookPath, '#!/bin/sh\necho "e2e hook rejected" 1>&2\nexit 1\n');
+    const hookMarker = path.join(repo, 'hook-ran.txt');
+    fs.writeFileSync(hookPath, '#!/bin/sh\nprintf hook-ran > hook-ran.txt\nexit 1\n');
     fs.chmodSync(hookPath, 0o755);
     const headBeforeHook = git(gitExe, repo, ['rev-parse', 'HEAD']);
-    const hookRefusal = await ipc.invoke<CommitCoordinatorConsumeResponse>(COMMIT_COORDINATOR_CHANNEL, {
+    const hookSave = await ipc.invoke<CommitCoordinatorConsumeResponse>(COMMIT_COORDINATOR_CHANNEL, {
       candidateId: hookCandidate.candidateId, tokenId: hookCandidate.token!.tokenId, message: 'Hook rejection',
     });
-    assert.equal(hookRefusal.kind, 'outcome');
-    assert.equal(hookRefusal.kind === 'outcome' ? hookRefusal.outcome.status : null, 'aborted-error');
-    assert.equal(hookRefusal.kind === 'outcome' ? hookRefusal.refusal.stage : null, 'commit');
-    assert.equal(git(gitExe, repo, ['rev-parse', 'HEAD']), headBeforeHook);
+    assert.equal(hookSave.kind, 'saved');
+    assert.equal(hookSave.kind === 'saved' ? hookSave.outcome.status : null, 'committed');
+    assert.notEqual(git(gitExe, repo, ['rev-parse', 'HEAD']), headBeforeHook);
+    assert.equal(fs.existsSync(hookMarker), false, 'pre-commit hook did not run');
 
     console.log('All save-card production-shaped e2e tests passed');
   } finally {
