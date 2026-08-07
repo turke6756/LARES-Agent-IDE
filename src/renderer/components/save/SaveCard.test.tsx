@@ -171,8 +171,7 @@ let root: Root;
 let getInventory: ReturnType<typeof vi.fn>;
 let markDone: ReturnType<typeof vi.fn>;
 let preview: ReturnType<typeof vi.fn>;
-let mint: ReturnType<typeof vi.fn>;
-let commit: ReturnType<typeof vi.fn>;
+let sweep: ReturnType<typeof vi.fn>;
 
 async function render() {
   await act(async () => {
@@ -188,11 +187,9 @@ beforeEach(() => {
   getInventory = vi.fn();
   markDone = vi.fn();
   preview = vi.fn();
-  mint = vi.fn();
-  commit = vi.fn();
+  sweep = vi.fn();
   (window as unknown as { api: unknown }).api = {
-    saveCard: { getInventory, markDone, preview },
-    commitCoordinator: { mint, commit },
+    saveCard: { getInventory, markDone, preview, sweep },
     demandProbe: { record: vi.fn(async () => undefined) },
   };
   container = document.createElement('div');
@@ -433,6 +430,7 @@ function readyMarkDone() {
     pinnedSelection: {
       selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 1,
     },
+    refusal: null,
   };
 }
 
@@ -464,17 +462,15 @@ function readyCandidatePreview(): SaveCardPreviewResponse {
     pinnedSelection: {
       selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 1,
     },
-  };
-}
-
-function readyCandidateMint(): SaveCardPreviewResponse {
-  const response = readyCandidatePreview();
-  return {
-    ...response,
-    candidate: {
-      ...response.candidate,
-      token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
-    } as CommitCandidate,
+    reviewedManifest: {
+      manifestVersion: 1, reviewedManifestDigest: 'review-1', members: [],
+      challengeVersion: 1, challengeAtoms: [],
+    },
+    durableFinalizationIntent: [{
+      finalizationId: 'fin-1', packageId: 'b-loud', packageRevision: 1,
+      boundaryStatus: 'ready', frozenMemberManifestDigest: 'frozen-1',
+    }],
+    refusal: null,
   };
 }
 
@@ -492,11 +488,12 @@ describe('SaveCard decisive save gesture', () => {
     getInventory.mockResolvedValue(inv([loudBundle]));
     markDone.mockResolvedValue(readyMarkDone());
     preview.mockResolvedValue(readyCandidatePreview());
-    mint.mockResolvedValue(readyCandidateMint());
-    commit.mockResolvedValue({
-      kind: 'saved',
-      outcome: { status: 'committed', commitOid: 'saved-oid', attemptId: 'attempt-1', indexIntegrity: 'verified' },
-      finalizations: [],
+    sweep.mockResolvedValue({
+      halted: false, haltKind: null,
+      results: [{
+        kind: 'saved', repositoryKey: 'repo-1', finalizationId: 'fin-1',
+        packageId: 'b-loud', packageRevision: 1, commitOid: 'saved-oid', attemptId: 'attempt-1',
+      }],
     });
   });
 
@@ -580,7 +577,7 @@ describe('SaveCard decisive save gesture', () => {
     expect(container.querySelectorAll('[data-testid="save-gesture-refusal"] button')).toHaveLength(1);
   });
 
-  it('submits preview then consume and renders Saved without opening the optional expander', async () => {
+  it('submits durable review evidence to the sweep and renders its saved terminal result', async () => {
     await render();
     expect(container.querySelector('[data-testid="candidate-preview"]')).toBeNull();
     expect(container.querySelector('[data-testid="save-bundle-details-toggle"]')?.getAttribute('aria-expanded')).toBe('false');
@@ -590,14 +587,17 @@ describe('SaveCard decisive save gesture', () => {
     expect(preview).toHaveBeenCalledWith(expect.objectContaining({
       workspaceId: 'ws-1', selectedComponentIds: ['c1'], finalizationIds: ['fin-1'],
     }));
-    expect(mint).toHaveBeenCalledWith(expect.objectContaining({
-      workspaceId: 'ws-1', selectedComponentIds: ['c1'], finalizationIds: ['fin-1'],
-      acknowledgeTopologyDigest: 'topo-1', acknowledgeUnattributedEntryIds: [],
-    }));
-    expect(commit).toHaveBeenCalledWith({
-      candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save Memory Architecture',
+    expect(sweep).toHaveBeenCalledWith({
+      intents: [{
+        repositoryKey: 'repo-1', finalizationId: 'fin-1', packageId: 'b-loud', packageRevision: 1,
+        frozenMemberManifestDigest: 'frozen-1', reviewedManifestDigest: 'review-1',
+        message: 'Save Memory Architecture',
+      }],
+      reviewedManifestDigests: ['review-1'], acknowledgedChallengeAtoms: [],
     });
-    expect(container.querySelector('[data-state="saved"]')?.textContent).toContain('Saved');
+    const terminal = container.querySelector('[data-testid="save-sweep-terminal-result"]');
+    expect(terminal?.getAttribute('data-kind')).toBe('saved');
+    expect(terminal?.textContent).toContain('saved-oid');
     expect(container.querySelector('[data-testid="candidate-preview"]')).toBeNull();
   });
 
@@ -630,6 +630,18 @@ describe('SaveCard decisive save gesture', () => {
       ...readyCandidatePreview(),
       requiresOverlapAck: true,
       componentTopologyDigest: 'three-component-digest',
+      reviewedManifest: {
+        ...readyCandidatePreview().reviewedManifest!,
+        challengeAtoms: [{
+          kind: 'overlap' as const, atomId: 'overlap-1', digest: 'overlap-digest', reasonVersion: 1 as const,
+          memberPathBytesBase64: ['c3JjL21haW4vbWVtb3J5L3JlY2FsbC50cw=='],
+          contributors: [], ownershipGroupKeys: ['owner-1'],
+        }],
+      },
+      durableFinalizationIntent: [1, 2, 3].map((index) => ({
+        finalizationId: `fin-${index}`, packageId: `b-${index}`, packageRevision: 1,
+        boundaryStatus: 'ready' as const, frozenMemberManifestDigest: `frozen-${index}`,
+      })),
       candidate: {
         ...readyCandidatePreview().candidate,
         componentIds: ['c1', 'c2', 'c3'],
@@ -642,12 +654,12 @@ describe('SaveCard decisive save gesture', () => {
       },
     };
     preview.mockResolvedValue(overlapPreview);
-    mint.mockResolvedValue({
-      ...overlapPreview,
-      candidate: {
-        ...overlapPreview.candidate,
-        token: { tokenId: 'token-1', candidateId: 'candidate-1', contractVersion: 1, issuedAt: 1, expiresAt: 2 },
-      },
+    sweep.mockResolvedValue({
+      halted: false, haltKind: null,
+      results: [1, 2, 3].map((index) => ({
+        kind: 'saved' as const, repositoryKey: 'repo-1', finalizationId: `fin-${index}`,
+        packageId: `b-${index}`, packageRevision: 1, attemptId: `a-${index}`, commitOid: `c-${index}`,
+      })),
     });
 
     await render();
@@ -657,38 +669,44 @@ describe('SaveCard decisive save gesture', () => {
     await gestureClick(acknowledgement);
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
-    expect(preview).toHaveBeenCalledTimes(2); // one visible P1 plus one submit-time P2
-    expect(mint).toHaveBeenCalledTimes(1);
-    expect(mint).toHaveBeenCalledWith(expect.objectContaining({
-      selectedComponentIds: ['c1', 'c2', 'c3'],
-      acknowledgeTopologyDigest: 'three-component-digest',
-    }));
-    expect(commit).toHaveBeenCalledTimes(1);
-    expect(container.querySelector('[data-state="saved"]')?.textContent).toContain('Saved');
+    expect(preview).toHaveBeenCalledTimes(1);
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(sweep.mock.calls[0][0].intents).toHaveLength(3);
+    expect(sweep.mock.calls[0][0].acknowledgedChallengeAtoms).toEqual([
+      expect.objectContaining({ atomId: 'overlap-1', digest: 'overlap-digest' }),
+    ]);
+    expect(container.querySelectorAll('[data-testid="save-sweep-terminal-result"]')).toHaveLength(3);
   });
 
-  it('installs a changed submit-time preview and resets the overlap checkbox', async () => {
-    const first = { ...readyCandidatePreview(), requiresOverlapAck: true, componentTopologyDigest: 'digest-a' };
-    const second = { ...first, componentTopologyDigest: 'digest-b' };
-    preview.mockResolvedValueOnce(first).mockResolvedValue(second);
+  it('renders a needs-attention carry verdict without reclassifying it locally', async () => {
+    sweep.mockResolvedValue({
+      halted: false, haltKind: null,
+      results: [{
+        kind: 'needs-attention', repositoryKey: 'repo-1', finalizationId: 'fin-1',
+        packageId: 'b-loud', packageRevision: 1, code: 'reviewed-effect-changed',
+        message: 'Server says this reviewed effect changed.',
+      }],
+    });
     await render();
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
-    await gestureClick(container.querySelector('[data-testid="save-bundle-details-toggle"]')!);
-    let acknowledgement = container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')!;
-    await gestureClick(acknowledgement);
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
-    acknowledgement = container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')!;
-    expect(acknowledgement.checked).toBe(false);
-    expect(container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent).toContain('multi-owner work changed');
-    expect(mint).not.toHaveBeenCalled();
-
-    await gestureClick(acknowledgement);
-    await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
-    expect(mint).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeTopologyDigest: 'digest-b' }));
+    const terminal = container.querySelector('[data-testid="save-sweep-terminal-result"]');
+    expect(terminal?.getAttribute('data-kind')).toBe('needs-attention');
+    expect(terminal?.textContent).toContain('Server says this reviewed effect changed.');
+    expect(terminal?.textContent).toContain('reviewed-effect-changed');
   });
 
   it('propagates a checkbox change into an immediately adjacent outer submit', async () => {
-    const overlap = { ...readyCandidatePreview(), requiresOverlapAck: true };
+    const overlap = {
+      ...readyCandidatePreview(), requiresOverlapAck: true,
+      reviewedManifest: {
+        ...readyCandidatePreview().reviewedManifest!,
+        challengeAtoms: [{
+          kind: 'overlap' as const, atomId: 'overlap-adjacent', digest: 'digest-adjacent', reasonVersion: 1 as const,
+          memberPathBytesBase64: ['c3JjL21haW4vbWVtb3J5L3JlY2FsbC50cw=='], contributors: [], ownershipGroupKeys: [],
+        }],
+      },
+    };
     preview.mockResolvedValue(overlap);
     await render();
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
@@ -702,91 +720,72 @@ describe('SaveCard decisive save gesture', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(mint).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeTopologyDigest: 'topo-1' }));
-    expect(commit).toHaveBeenCalledTimes(1);
+    expect(sweep).toHaveBeenCalledWith(expect.objectContaining({
+      acknowledgedChallengeAtoms: [expect.objectContaining({ atomId: 'overlap-adjacent', digest: 'digest-adjacent' })],
+    }));
   });
 
-  it('installs the mint response when acknowledgement moves during mint', async () => {
-    const overlap = { ...readyCandidatePreview(), requiresOverlapAck: true };
-    const p3 = {
-      ...overlap,
-      componentTopologyDigest: 'topo-p3',
-      refusal: { stage: 'mint' as const, code: 'acknowledgement-stale', message: 'moved during mint' },
-      candidate: {
-        ...overlap.candidate,
-        members: [{
-          ...overlap.candidate.members[0],
-          path: { ...overlap.candidate.members[0].path, displayPath: 'src/p3-current.ts' },
-        }],
-        eligibility: { eligible: false as const, reason: 'overlap-not-acknowledged' as const },
-        token: null,
-      } as CommitCandidate,
-    };
-    preview.mockResolvedValue(overlap);
-    mint.mockResolvedValue(p3);
+  it('renders halted-uncertain evidence and offers no retry', async () => {
+    sweep.mockResolvedValue({
+      halted: true, haltKind: 'uncertain',
+      results: [{
+        kind: 'halted-uncertain', repositoryKey: 'repo-1', finalizationId: 'fin-1',
+        packageId: 'b-loud', packageRevision: 1, code: 'reconciliation-lost',
+        message: 'Reconciliation could not be verified.', attemptId: 'attempt-uncertain', commitOid: 'maybe-oid',
+      }],
+    });
     await render();
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
-    await gestureClick(container.querySelector('[data-testid="save-bundle-details-toggle"]')!);
-    await gestureClick(container.querySelector('[data-testid="candidate-preview-overlap-ack"] input')!);
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
-    expect(container.textContent).toContain('src/p3-current.ts');
-    expect(container.querySelector<HTMLInputElement>('[data-testid="candidate-preview-overlap-ack"] input')?.checked).toBe(false);
-    expect(preview).toHaveBeenCalledTimes(2);
+    const terminal = container.querySelector('[data-kind="halted-uncertain"]');
+    expect(terminal?.textContent).toContain('attempt-uncertain');
+    expect(terminal?.textContent).toContain('maybe-oid');
+    expect(terminal?.textContent).toContain('will not retry automatically');
+    expect(container.querySelector('[data-testid="save-bundle-submit"]')?.hasAttribute('disabled')).toBe(true);
+    expect(container.querySelector('[data-testid="save-bundle-repin"]')).toBeNull();
   });
 
-  it('SC-WP-W6: routes an unacknowledged mint refusal to the ack gate, not the generic no-candidate line', async () => {
+  it('renders one terminal row per intent, including already-saved and not-attempted', async () => {
     // The server minted nothing because the human has not yet acknowledged the
     // unattributed atoms — it names the reason. The renderer must surface the ack
     // gate, never the confusing "did not produce a committable candidate".
-    mint.mockResolvedValue({
-      ...readyCandidateMint(),
-      isCandidate: true,
-      candidate: {
-        ...readyCandidateMint().candidate,
-        eligibility: { eligible: false, reason: 'unattributed-not-acknowledged' },
-        token: null,
-      },
-      unacknowledgedUnattributedEntryIds: ['eu'],
+    sweep.mockResolvedValue({
+      halted: true, haltKind: 'uncertain',
+      results: [
+        { kind: 'already-saved', repositoryKey: 'repo-1', finalizationId: 'fin-1', packageId: 'b-loud', packageRevision: 1, provingCommitOids: ['proof-oid'] },
+        { kind: 'not-attempted', repositoryKey: 'repo-1', finalizationId: 'fin-2', packageId: 'b-next', packageRevision: 1, haltedAfterFinalizationId: 'fin-1' },
+      ],
     });
     await render();
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
-    const refusal = container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent ?? '';
-    expect(refusal.toLowerCase()).toContain('review it and confirm');
-    expect(refusal).not.toContain('did not produce a committable candidate');
-    expect(commit).not.toHaveBeenCalled();
+    const terminals = container.querySelectorAll('[data-testid="save-sweep-terminal-result"]');
+    expect(terminals).toHaveLength(2);
+    expect(terminals[0].getAttribute('data-kind')).toBe('already-saved');
+    expect(terminals[0].textContent).toContain('proof-oid');
+    expect(terminals[1].getAttribute('data-kind')).toBe('not-attempted');
+    expect(terminals[1].textContent).toContain('fin-1');
   });
 
-  it('names server-reported pinned drift and asks for a re-pin', async () => {
-    const pathBytes = 'c3JjL21haW4vbWVtb3J5L3JlY2FsbC50cw==';
-    mint.mockResolvedValue({
-      ...readyCandidateMint(),
-      candidate: {
-        ...readyCandidateMint().candidate,
-        eligibility: { eligible: false, reason: 'byte-mismatch' },
-        token: null,
-      },
-      selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [pathBytes] },
-      selectionDriftDisplayPaths: { [pathBytes]: 'src/main/memory/recall.ts' },
-      pinnedSelection: {
-        selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 15,
-      },
+  it('renders blocked-unmerged exactly as the server terminal kind', async () => {
+    sweep.mockResolvedValue({
+      halted: true, haltKind: 'unmerged',
+      results: [{
+        kind: 'blocked-unmerged', repositoryKey: 'repo-1', finalizationId: 'fin-1',
+        packageId: 'b-loud', packageRevision: 1,
+      }],
     });
     await render();
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
-    const refusal = container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent ?? '';
-    expect(refusal).toContain('This package changed before Lares could save it.');
-    expect(refusal).toContain('src/main/memory/recall.ts');
-    expect(refusal).not.toContain('Pinned bytes no longer qualify');
-    expect(commit).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-kind="blocked-unmerged"]')?.textContent).toContain('blocked-unmerged');
   });
 
-  it('makes a second submit inert while the first consume is still pending', async () => {
-    let resolveCommit!: (value: unknown) => void;
-    commit.mockImplementation(() => new Promise((resolve) => { resolveCommit = resolve; }));
+  it('makes a second submit inert while the first sweep is still pending', async () => {
+    let resolveSweep!: (value: unknown) => void;
+    sweep.mockImplementation(() => new Promise((resolve) => { resolveSweep = resolve; }));
     await render();
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
     const submit = container.querySelector('[data-testid="save-bundle-submit"]') as HTMLButtonElement;
@@ -797,36 +796,31 @@ describe('SaveCard decisive save gesture', () => {
       await Promise.resolve();
     });
     expect(preview).toHaveBeenCalledTimes(1);
-    expect(commit).toHaveBeenCalledTimes(1);
+    expect(sweep).toHaveBeenCalledTimes(1);
     expect(submit.disabled).toBe(true);
     await act(async () => {
-      resolveCommit({
-        kind: 'saved',
-        outcome: { status: 'committed', commitOid: 'saved-oid', attemptId: 'attempt-1', indexIntegrity: 'verified' },
-        finalizations: [],
+      resolveSweep({
+        halted: false, haltKind: null,
+        results: [{
+          kind: 'saved', repositoryKey: 'repo-1', finalizationId: 'fin-1', packageId: 'b-loud',
+          packageRevision: 1, commitOid: 'saved-oid', attemptId: 'attempt-1',
+        }],
       });
       await Promise.resolve();
     });
   });
 
-  it('shows the surfaced drift prominently and re-previews without retrying commit', async () => {
-    commit.mockResolvedValue({
-      kind: 'outcome',
-      outcome: { status: 'aborted-stale', reason: 'src/main/memory/recall.ts changed after pin', attemptId: 'attempt-stale' },
-    });
+  it('locks the gesture after sweep transport uncertainty and never offers retry', async () => {
+    sweep.mockRejectedValue(new Error('transport lost'));
     await render();
     await gestureClick(container.querySelector('[data-testid="save-bundle-pin"]')!);
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
 
-    const diff = container.querySelector('[data-testid="save-gesture-diff"]');
-    expect(diff?.textContent).toContain('Changed work');
-    expect(container.querySelector('[data-state="stale-refused"]')).toBeNull();
-    expect(container.querySelector('[data-testid="save-bundle-repin"]')).toBeTruthy();
-
-    await gestureClick(container.querySelector('[data-testid="save-bundle-repin"]')!);
-    expect(preview).toHaveBeenCalledTimes(2);
-    expect(commit).toHaveBeenCalledTimes(1);
-    expect(container.querySelector('[data-testid="candidate-preview"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="save-gesture-refusal"]')?.textContent)
+      .toContain('could not confirm whether this package was saved');
+    expect(container.querySelector('[data-testid="save-bundle-repin"]')).toBeNull();
+    expect((container.querySelector('[data-testid="save-bundle-submit"]') as HTMLButtonElement).disabled).toBe(true);
+    expect(sweep).toHaveBeenCalledTimes(1);
   });
 
   it('uses the edited message and appends optional user trailers after one blank line', async () => {
@@ -845,9 +839,11 @@ describe('SaveCard decisive save gesture', () => {
     });
 
     await gestureClick(container.querySelector('[data-testid="save-bundle-submit"]')!);
-    expect(commit).toHaveBeenCalledWith(expect.objectContaining({
-      message: 'feat: decisive save\n\nCo-authored-by: Example <example@example.com>',
-    }));
+    expect(sweep.mock.calls[0][0].intents).toEqual([
+      expect.objectContaining({
+        message: 'feat: decisive save\n\nCo-authored-by: Example <example@example.com>',
+      }),
+    ]);
   });
 });
 

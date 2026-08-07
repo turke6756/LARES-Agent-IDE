@@ -1,8 +1,8 @@
 import type { SaveRefusal, SaveRefusalStage } from '../../../shared/commit-candidates';
 import type {
-  CommitCoordinatorConsumeResponse,
   SaveCardFleetAdhocMarkDoneSuccess,
   SaveCardPreviewResponse,
+  SaveSweepResponse,
 } from '../../../shared/types';
 import type { CandidatePreviewDraft } from './CandidatePreview';
 
@@ -16,10 +16,9 @@ export type SaveGestureState =
   | ({ status: 'pinning' } & GestureContext)
   | ({ status: 'pinned' } & GestureContext)
   | ({ status: 'reviewing' } & GestureContext)
-  | ({ status: 'minting' } & GestureContext)
-  | ({ status: 'committing' } & GestureContext)
-  | ({ status: 'committed'; outcome: Extract<CommitCoordinatorConsumeResponse, { kind: 'saved' }> } & GestureContext)
-  | ({ status: 'refused'; refusal: SaveRefusal; outcome?: CommitCoordinatorConsumeResponse; latestPreview?: SaveCardPreviewResponse | null } & GestureContext)
+  | ({ status: 'sweeping' } & GestureContext)
+  | ({ status: 'completed'; outcome: SaveSweepResponse } & GestureContext)
+  | ({ status: 'refused'; refusal: SaveRefusal; latestPreview?: SaveCardPreviewResponse | null } & GestureContext)
   | ({
       status: 'uncertain';
       stage: Extract<SaveRefusalStage, 'token-consume' | 'commit' | 'reconciliation'>;
@@ -31,15 +30,15 @@ export type SaveGestureEvent =
   | { type: 'pin-started' }
   | { type: 'pins-updated'; pins: SaveCardFleetAdhocMarkDoneSuccess[]; complete: boolean }
   | { type: 'draft-updated'; draft: CandidatePreviewDraft }
-  | { type: 'submit-stage'; stage: 'reviewing' | 'minting' | 'committing' }
-  | { type: 'refused'; refusal: SaveRefusal; outcome?: CommitCoordinatorConsumeResponse; latestPreview?: SaveCardPreviewResponse | null }
+  | { type: 'submit-stage'; stage: 'reviewing' | 'sweeping' }
+  | { type: 'refused'; refusal: SaveRefusal; latestPreview?: SaveCardPreviewResponse | null }
   | {
       type: 'uncertain';
       stage: Extract<SaveRefusalStage, 'token-consume' | 'commit' | 'reconciliation'>;
       code: 'repository-outcome-uncertain';
       message: string;
     }
-  | { type: 'committed'; outcome: Extract<CommitCoordinatorConsumeResponse, { kind: 'saved' }> }
+  | { type: 'completed'; outcome: SaveSweepResponse }
   | { type: 're-pin' }
   | { type: 'acknowledged' };
 
@@ -62,13 +61,13 @@ export function saveGestureReducer(state: SaveGestureState, event: SaveGestureEv
     case 'refused':
       return {
         status: 'refused', pins: state.pins, draft: state.draft,
-        refusal: event.refusal, ...(event.outcome ? { outcome: event.outcome } : {}),
+        refusal: event.refusal,
         ...(event.latestPreview !== undefined ? { latestPreview: event.latestPreview } : {}),
       };
     case 'uncertain':
       return { status: 'uncertain', pins: state.pins, draft: state.draft, ...event };
-    case 'committed':
-      return { status: 'committed', pins: [], draft: null, outcome: event.outcome };
+    case 'completed':
+      return { status: 'completed', pins: state.pins, draft: state.draft, outcome: event.outcome };
     case 're-pin':
       return { status: 'idle', pins: [], draft: state.draft };
     case 'acknowledged':

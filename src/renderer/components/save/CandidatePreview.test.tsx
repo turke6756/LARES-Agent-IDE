@@ -22,6 +22,7 @@ import type {
   CommitCandidate,
   CommitEligibility,
   PackageVerificationState,
+  ReviewChallengeAtom,
   SelectionPreview,
 } from '../../../shared/commit-candidates';
 import CandidatePreview, { type CandidatePreviewSelection } from './CandidatePreview';
@@ -82,6 +83,15 @@ function response(over: Partial<SaveCardPreviewResponse> = {}): SaveCardPreviewR
     pinnedSelection: {
       selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], frozenMemberCount: 1,
     },
+    refusal: null,
+    reviewedManifest: {
+      manifestVersion: 1, reviewedManifestDigest: 'review-1', members: [],
+      challengeVersion: 1, challengeAtoms: [],
+    },
+    durableFinalizationIntent: [{
+      finalizationId: 'fin-1', packageId: 'pkg-1', packageRevision: 3,
+      boundaryStatus: 'ready', frozenMemberManifestDigest: 'frozen-1',
+    }],
     ...over,
   };
 }
@@ -241,9 +251,23 @@ describe('CandidatePreview', () => {
   });
 
   it('gates one-click save behind the overlap and unattributed acknowledgements', async () => {
+    const overlapAtom: ReviewChallengeAtom = {
+      kind: 'overlap', atomId: 'overlap-1', digest: 'overlap-digest', reasonVersion: 1,
+      memberPathBytesBase64: ['b64-e1'], contributors: [], ownershipGroupKeys: ['owner-1'],
+    };
+    const unattributedAtom: ReviewChallengeAtom = {
+      kind: 'unattributed', atomId: 'unattributed-1', digest: 'unattributed-digest',
+      pathBytesBase64: 'b64-eu', memberEffectDigest: 'effect-eu',
+    };
     preview.mockResolvedValue(response({
+      candidate: candidate({ eligible: true }, [
+        member('e1', 'verified-match'), member('eu', 'verified-match'),
+      ]),
       requiresOverlapAck: true,
       unacknowledgedUnattributedEntryIds: ['eu'],
+      reviewedManifest: {
+        ...response().reviewedManifest!, challengeAtoms: [overlapAtom, unattributedAtom],
+      },
     }));
     await render();
 
@@ -258,6 +282,44 @@ describe('CandidatePreview', () => {
     const unattr = q('candidate-preview-unattributed-ack')!.querySelector('input') as HTMLInputElement;
     await act(async () => { unattr.click(); });
     expect(save().disabled).toBe(false);
+  });
+
+  it('retains only acknowledgements whose atom id and digest are unchanged', async () => {
+    const overlapAtom: ReviewChallengeAtom = {
+      kind: 'overlap', atomId: 'overlap-1', digest: 'overlap-digest', reasonVersion: 1,
+      memberPathBytesBase64: ['b64-e1'], contributors: [], ownershipGroupKeys: ['owner-1'],
+    };
+    const unattributedAtom: ReviewChallengeAtom = {
+      kind: 'unattributed', atomId: 'unattributed-1', digest: 'unattributed-old',
+      pathBytesBase64: 'b64-eu', memberEffectDigest: 'effect-eu',
+    };
+    const candidateWithUnattributed = candidate({ eligible: true }, [
+      member('e1', 'verified-match'), member('eu', 'verified-match'),
+    ]);
+    const first = response({
+      candidate: candidateWithUnattributed, requiresOverlapAck: true,
+      unacknowledgedUnattributedEntryIds: ['eu'],
+      reviewedManifest: { ...response().reviewedManifest!, challengeAtoms: [overlapAtom, unattributedAtom] },
+    });
+    await render({ authoritativeResponse: first });
+    await act(async () => {
+      (q('candidate-preview-overlap-ack')!.querySelector('input') as HTMLInputElement).click();
+      (q('candidate-preview-unattributed-ack')!.querySelector('input') as HTMLInputElement).click();
+    });
+
+    const changedUnattributed = { ...unattributedAtom, digest: 'unattributed-new' };
+    const second = response({
+      candidate: candidateWithUnattributed, requiresOverlapAck: true,
+      unacknowledgedUnattributedEntryIds: ['eu'],
+      reviewedManifest: {
+        ...response().reviewedManifest!, reviewedManifestDigest: 'review-2',
+        challengeAtoms: [overlapAtom, changedUnattributed],
+      },
+    });
+    await render({ authoritativeResponse: second });
+
+    expect((q('candidate-preview-overlap-ack')!.querySelector('input') as HTMLInputElement).checked).toBe(true);
+    expect((q('candidate-preview-unattributed-ack')!.querySelector('input') as HTMLInputElement).checked).toBe(false);
   });
 
   it('surfaces an honest error when the preview cannot be assembled', async () => {

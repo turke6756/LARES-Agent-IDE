@@ -9,7 +9,7 @@ import type {
   SaveCardFleetAdhocMarkDoneResponse,
   SaveCardFleetAdhocMarkDoneSuccess,
   SaveCardInventoryResponse,
-  SaveCardPreviewResponse,
+  SaveSweepTerminalResult,
 } from '../../../shared/types';
 import type { SaveCardQuotaWeakening, SaveRefusal } from '../../../shared/commit-candidates';
 import SaveBundle, { isQuietlySaved, type WorkBundleDto } from './SaveBundle';
@@ -17,7 +17,6 @@ import CandidatePreview, {
   type CandidatePreviewDraft,
   type CandidatePreviewSelection,
 } from './CandidatePreview';
-import CommitOutcome from './CommitOutcome';
 import QuotaWeakeningBanner from './QuotaWeakeningBanner';
 import { groupExpiryEdgesByBundle, formatExpiresIn } from './save-card-expiry';
 import { renderSaveRefusal } from './save-refusal-copy';
@@ -60,13 +59,26 @@ function selectionForPins(pins: SaveCardFleetAdhocMarkDoneSuccess[]): CandidateP
  * so the Stage ① read-only bundle card stays untouched. The pane itself decides
  * whether a one-click save is offered (never for mismatch/degraded/unfinalized).
  */
-function previewMismatchPaths(response: SaveCardPreviewResponse): string[] {
-  const blocking = [
-    ...response.selectionDrift.missing,
-    ...response.selectionDrift.byteMoved,
-    ...response.selectionDrift.reAttributed,
-  ];
-  return [...new Set(blocking)].map((path) => response.selectionDriftDisplayPaths[path] ?? path);
+function terminalResultText(result: SaveSweepTerminalResult): string {
+  switch (result.kind) {
+    case 'saved':
+      return `saved — commit ${result.commitOid} (attempt ${result.attemptId})`;
+    case 'already-saved':
+      return `already-saved — proven by ${result.provingCommitOids.join(', ')}`;
+    case 'needs-attention':
+      return `needs-attention — ${result.message} (${result.code})`;
+    case 'blocked-unmerged':
+      return 'blocked-unmerged';
+    case 'not-attempted':
+      return `not-attempted — sweep halted after ${result.haltedAfterFinalizationId}`;
+    case 'halted-uncertain': {
+      const evidence = [
+        result.attemptId ? `attempt ${result.attemptId}` : null,
+        result.commitOid ? `commit ${result.commitOid}` : null,
+      ].filter(Boolean).join(', ');
+      return `halted-uncertain — ${result.message} (${result.code})${evidence ? ` — ${evidence}` : ''}. A commit may have been created; Lares will not retry automatically.`;
+    }
+  }
 }
 
 function PackageSaveGesture({
@@ -100,7 +112,7 @@ function PackageSaveGesture({
 
   const pinPackage = async (replaceExisting = false) => {
     if (gesture.status === 'pinning' || gesture.status === 'reviewing'
-      || gesture.status === 'minting' || gesture.status === 'committing') return;
+      || gesture.status === 'sweeping') return;
     const unsaveable = group.find((bundle) => bundle.saveability?.saveable === false);
     if (unsaveable?.saveability?.saveable === false) {
       dispatch({
@@ -187,43 +199,26 @@ function PackageSaveGesture({
         void window.api.demandProbe.record({ workspaceId, kind: `save_${event}` }).catch(() => {});
       },
     });
-    if (result.kind === 'committed') {
-      dispatch({ type: 'committed', outcome: result.response });
+    if (result.kind === 'completed') {
+      dispatch({ type: 'completed', outcome: result.response });
       setDetailsOpen(false);
     } else if (result.kind === 'uncertain') {
       dispatch({ type: 'uncertain', ...result });
-    } else {
-      let refusal = result.refusal;
-      if (result.mint) {
-        const paths = previewMismatchPaths(result.mint);
-        if (paths.length > 0) {
-          refusal = {
-            ...refusal, paths,
-            message: `${paths.length} of ${result.mint.pinnedSelection.frozenMemberCount} reviewed files changed.`,
-          };
-        }
-      }
+    } else if (result.kind === 'refused') {
       dispatch({
-        type: 'refused', refusal, outcome: result.response,
-        latestPreview: result.mint ?? result.preview ?? null,
+        type: 'refused', refusal: result.refusal,
+        latestPreview: result.preview ?? null,
       });
       setDetailsOpen(true);
     }
   };
-  const submitting = gesture.status === 'reviewing' || gesture.status === 'minting' || gesture.status === 'committing';
+  const submitting = gesture.status === 'reviewing' || gesture.status === 'sweeping';
+  const submitLocked = submitting || gesture.status === 'uncertain' || gesture.status === 'completed';
   const gestureError = gesture.status === 'refused'
     ? renderSaveRefusal(gesture.refusal)
     : gesture.status === 'uncertain' ? 'Lares could not confirm whether this package was saved.' : null;
   const movedPaths = gesture.status === 'refused' ? gesture.refusal.paths ?? [] : [];
-  const outcome = gesture.status === 'committed'
-    ? gesture.outcome
-    : gesture.status === 'refused' ? gesture.outcome ?? null : null;
   const recover = () => {
-    if (gesture.status === 'refused' && outcome) {
-      dispatch({ type: 'submit-stage', stage: 'reviewing' });
-      setDetailsOpen(true);
-      return;
-    }
     void pinPackage(true);
   };
   return (
@@ -239,7 +234,7 @@ function PackageSaveGesture({
         type="button"
         className="ui-btn ui-btn-primary px-3 py-1 text-[12.5px]"
         data-testid="save-bundle-submit"
-        disabled={!pinned || submitting}
+        disabled={!pinned || submitLocked}
         onClick={() => { void submit(); }}
       >
         {submitting ? 'Saving…' : 'Save package'}
@@ -257,7 +252,7 @@ function PackageSaveGesture({
       {gestureError && (
         <div className="sc-save-refusal" role="alert" data-testid="save-gesture-refusal">
           {gestureError}
-          {(movedPaths.length > 0 || (outcome?.kind === 'outcome' && outcome.outcome.status === 'aborted-stale')) && (
+          {movedPaths.length > 0 && (
             <div className="sc-save-diff" data-testid="save-gesture-diff">
               <strong>Changed work</strong>
               {movedPaths.length > 0
@@ -265,14 +260,14 @@ function PackageSaveGesture({
                 : null}
             </div>
           )}
-          <button
+          {gesture.status === 'refused' && <button
             type="button"
             className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px] sc-repin"
             data-testid="save-bundle-repin"
             onClick={recover}
           >
-            {outcome ? 'Check package again' : 'Refresh package'}
-          </button>
+            Refresh package
+          </button>}
         </div>
       )}
       {detailsOpen && pinned && (
@@ -286,17 +281,27 @@ function PackageSaveGesture({
           onClose={() => setDetailsOpen(false)}
         />
       )}
-      {gesture.status === 'committed' && outcome && (
-        <CommitOutcome
-          response={outcome}
-          onRepreview={() => {
-            if (gesture.status === 'committed') dispatch({ type: 'acknowledged' });
-            else {
-              dispatch({ type: 'submit-stage', stage: 'reviewing' });
-              setDetailsOpen(true);
-            }
-          }}
-        />
+      {gesture.status === 'completed' && (
+        <div className="sc-save-note" data-testid="save-sweep-results">
+          <ul>
+            {gesture.outcome.results.map((result) => (
+              <li
+                key={`${result.repositoryKey}\0${result.finalizationId}`}
+                data-testid="save-sweep-terminal-result"
+                data-kind={result.kind}
+              >
+                <strong>{result.packageId}</strong>: {terminalResultText(result)}
+              </li>
+            ))}
+          </ul>
+          <button
+            type="button"
+            className="ui-btn ui-btn-outline px-3 py-1 text-[12.5px]"
+            onClick={() => dispatch({ type: 'acknowledged' })}
+          >
+            Dismiss results
+          </button>
+        </div>
       )}
     </div>
   );

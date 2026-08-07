@@ -23,20 +23,22 @@ describe('save gesture state machine', () => {
     if (state.status === 'refused') expect(state.refusal.paths).toEqual(['package-b']);
   });
 
-  it('clears obsolete pins only after verified commit and retains the outcome until acknowledged', () => {
+  it('retains the server terminal results until acknowledged', () => {
     let state = saveGestureReducer(initialSaveGestureState, { type: 'pins-updated', pins: [pin('package-a')], complete: true });
     state = saveGestureReducer(state, {
-      type: 'committed',
+      type: 'completed',
       outcome: {
-        kind: 'saved',
-        outcome: { status: 'committed', commitOid: 'oid', attemptId: 'attempt', indexIntegrity: 'verified' },
-        finalizations: [],
+        halted: false, haltKind: null,
+        results: [{
+          kind: 'saved', repositoryKey: 'repo', finalizationId: 'fin-package-a',
+          packageId: 'package-a', packageRevision: 1, commitOid: 'oid', attemptId: 'attempt',
+        }],
       },
     });
-    expect(state.status).toBe('committed');
-    expect(state.pins).toEqual([]);
+    expect(state.status).toBe('completed');
+    expect(state.pins).toHaveLength(1);
+    if (state.status === 'completed') expect(state.outcome.results[0].kind).toBe('saved');
     state = saveGestureReducer(state, { type: 'acknowledged' });
     expect(state).toEqual(initialSaveGestureState);
   });
 });
-

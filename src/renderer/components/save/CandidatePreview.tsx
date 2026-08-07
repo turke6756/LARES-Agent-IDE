@@ -4,6 +4,7 @@ import type {
   CandidateMember,
   CommitEligibility,
   PackageVerificationState,
+  ReviewChallengeAtom,
 } from '../../../shared/commit-candidates';
 import { renderSaveRefusal } from './save-refusal-copy';
 
@@ -49,6 +50,13 @@ export interface CandidatePreviewProps {
 
 export interface CandidatePreviewDraft {
   response: SaveCardPreviewResponse;
+  /** Main-issued review identity. The renderer echoes it; it never computes or
+   * compares semantic equivalence. */
+  reviewedManifestDigest: string | null;
+  durableFinalizationIntent: NonNullable<SaveCardPreviewResponse['durableFinalizationIntent']>;
+  /** Exact challenge evidence acknowledged by the human. Both atom id and digest
+   * are retained, so a changed atom resets without disturbing unchanged atoms. */
+  acknowledgedChallengeAtoms: ReviewChallengeAtom[];
   previewedCandidateId: string | null;
   componentTopologyDigest: string;
   checkedUnattributedEntryIds: string[];
@@ -108,11 +116,37 @@ function firstReservedTrailerLine(userTrailers: string): string | null {
   return null;
 }
 
-function challengeIdentity(response: SaveCardPreviewResponse): string {
-  const candidateId = response.isCandidate && 'candidateId' in response.candidate
-    ? response.candidate.candidateId : '';
-  return [candidateId, response.requiresOverlapAck, response.componentTopologyDigest,
-    [...response.unacknowledgedUnattributedEntryIds].sort().join(',')].join('|');
+function challengeAtoms(response: SaveCardPreviewResponse): ReviewChallengeAtom[] {
+  return response.reviewedManifest?.challengeAtoms ?? [];
+}
+
+function atomKey(atom: Pick<ReviewChallengeAtom, 'atomId' | 'digest'>): string {
+  return `${atom.atomId}\0${atom.digest}`;
+}
+
+function retainAcknowledgedAtoms(
+  acknowledged: readonly ReviewChallengeAtom[],
+  response: SaveCardPreviewResponse,
+): ReviewChallengeAtom[] {
+  const retained = new Set(acknowledged.map(atomKey));
+  return challengeAtoms(response).filter((atom) => retained.has(atomKey(atom)));
+}
+
+function isAcknowledged(
+  acknowledged: readonly ReviewChallengeAtom[],
+  atom: ReviewChallengeAtom | undefined,
+): boolean {
+  return Boolean(atom && acknowledged.some((item) => atomKey(item) === atomKey(atom)));
+}
+
+function unattributedAtomForEntry(
+  response: SaveCardPreviewResponse,
+  entryId: string,
+): ReviewChallengeAtom | undefined {
+  const pathBytesBase64 = response.candidate.members.find((member) => member.entryId === entryId)
+    ?.path.pathBytesBase64;
+  return challengeAtoms(response).find((atom) =>
+    atom.kind === 'unattributed' && atom.pathBytesBase64 === pathBytesBase64);
 }
 
 export default function CandidatePreview({
@@ -128,8 +162,7 @@ export default function CandidatePreview({
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [messageBody, setMessageBody] = useState('');
   const [userTrailers, setUserTrailers] = useState('');
-  const [overlapAck, setOverlapAck] = useState(false);
-  const [unattributedAcks, setUnattributedAcks] = useState<Set<string>>(new Set());
+  const [acknowledgedAtoms, setAcknowledgedAtoms] = useState<ReviewChallengeAtom[]>([]);
 
   const request: SaveCardPreviewRequest = useMemo(
     () => ({
@@ -154,8 +187,7 @@ export default function CandidatePreview({
         if (!isCurrent()) return;
         setState({ status: 'ready', response });
         setMessageBody(response.defaultMessageBody);
-        setOverlapAck(false);
-        setUnattributedAcks(new Set());
+        setAcknowledgedAtoms((current) => retainAcknowledgedAtoms(current, response));
       } catch (err) {
         if (isCurrent()) setState({ status: 'error', message: `Preview verification stage failed unexpectedly: ${errorMessage(err)}` });
       }
@@ -172,41 +204,50 @@ export default function CandidatePreview({
     };
   }, [load, authoritativeResponse]);
 
-  const authIdentity = authoritativeResponse ? challengeIdentity(authoritativeResponse) : null;
   useEffect(() => {
     if (!authoritativeResponse) return;
     setState({ status: 'ready', response: authoritativeResponse });
-    setOverlapAck(false);
-    setUnattributedAcks(new Set());
-  }, [authIdentity]); // eslint-disable-line react-hooks/exhaustive-deps
+    setAcknowledgedAtoms((current) => retainAcknowledgedAtoms(current, authoritativeResponse));
+  }, [authoritativeResponse]);
 
   useEffect(() => {
     if (state.status !== 'ready' || !onDraftChange) return;
     const response = state.response;
     const eligible = response.candidate.eligibility.eligible === true;
     const reservedTrailer = firstReservedTrailerLine(userTrailers);
-    const overlapSatisfied = !response.requiresOverlapAck || overlapAck;
-    const unattributedSatisfied = response.unacknowledgedUnattributedEntryIds.every((id) =>
-      unattributedAcks.has(id),
-    );
+    const currentAtoms = challengeAtoms(response);
+    const currentOverlapAtoms = currentAtoms.filter((atom) => atom.kind === 'overlap');
+    const overlapSatisfied = !response.requiresOverlapAck
+      || (currentOverlapAtoms.length > 0
+        && currentOverlapAtoms.every((atom) => isAcknowledged(acknowledgedAtoms, atom)));
+    const unattributedSatisfied = currentAtoms
+      .filter((atom) => atom.kind === 'unattributed')
+      .every((atom) => isAcknowledged(acknowledgedAtoms, atom))
+      && response.unacknowledgedUnattributedEntryIds.every((id) =>
+        isAcknowledged(acknowledgedAtoms, unattributedAtomForEntry(response, id)));
     const checkedUnattributedEntryIds = response.unacknowledgedUnattributedEntryIds.filter((id) =>
-      unattributedAcks.has(id),
+      isAcknowledged(acknowledgedAtoms, unattributedAtomForEntry(response, id)),
     );
     onDraftChange({
       response,
+      reviewedManifestDigest: response.reviewedManifest?.reviewedManifestDigest ?? null,
+      durableFinalizationIntent: response.durableFinalizationIntent ?? [],
+      acknowledgedChallengeAtoms: acknowledgedAtoms,
       previewedCandidateId: response.isCandidate && 'candidateId' in response.candidate
         ? response.candidate.candidateId
         : null,
       componentTopologyDigest: response.componentTopologyDigest,
       checkedUnattributedEntryIds,
-      overlapAcknowledged: overlapAck,
+      overlapAcknowledged: overlapSatisfied,
       messageBody,
       userTrailers,
-      canSave: response.isCandidate && eligible && overlapSatisfied && unattributedSatisfied && !reservedTrailer,
+      canSave: response.isCandidate && eligible && overlapSatisfied && unattributedSatisfied
+        && Boolean(response.reviewedManifest?.reviewedManifestDigest)
+        && Boolean(response.durableFinalizationIntent?.length) && !reservedTrailer,
       reservedTrailer,
       acknowledgedUnattributedEntryIds: checkedUnattributedEntryIds,
     });
-  }, [state, onDraftChange, messageBody, userTrailers, overlapAck, unattributedAcks]);
+  }, [state, onDraftChange, messageBody, userTrailers, acknowledgedAtoms]);
 
   if (state.status === 'loading') {
     return (
@@ -243,24 +284,36 @@ export default function CandidatePreview({
     response.selectionDriftDisplayPaths[path] ?? path);
   const eligible = candidate.eligibility.eligible === true;
   const reservedTrailer = firstReservedTrailerLine(userTrailers);
-  const overlapSatisfied = !response.requiresOverlapAck || overlapAck;
-  const unattributedSatisfied = response.unacknowledgedUnattributedEntryIds.every((id) =>
-    unattributedAcks.has(id),
-  );
+  const currentAtoms = challengeAtoms(response);
+  const overlapAtoms = currentAtoms.filter((atom) => atom.kind === 'overlap');
+  const overlapSatisfied = !response.requiresOverlapAck
+    || (overlapAtoms.length > 0 && overlapAtoms.every((atom) => isAcknowledged(acknowledgedAtoms, atom)));
+  const unattributedSatisfied = currentAtoms
+    .filter((atom) => atom.kind === 'unattributed')
+    .every((atom) => isAcknowledged(acknowledgedAtoms, atom))
+    && response.unacknowledgedUnattributedEntryIds.every((id) =>
+      isAcknowledged(acknowledgedAtoms, unattributedAtomForEntry(response, id)));
   const acksSatisfied = overlapSatisfied && unattributedSatisfied;
   // One-click save is allowed ONLY for a finalization-backed candidate that the
   // server declared eligible, with every acknowledgement satisfied and no reserved
   // user trailer. Mismatch / degraded / unfinalized work is previewable, never
   // one-click.
-  const canSave = response.isCandidate && eligible && acksSatisfied && !reservedTrailer;
+  const canSave = response.isCandidate && eligible && acksSatisfied
+    && Boolean(response.reviewedManifest?.reviewedManifestDigest)
+    && Boolean(response.durableFinalizationIntent?.length) && !reservedTrailer;
+
+  const setAtomsAcknowledged = (atoms: readonly ReviewChallengeAtom[], checked: boolean) => {
+    const keys = new Set(atoms.map(atomKey));
+    setAcknowledgedAtoms((previous) => {
+      const retained = previous.filter((atom) => !keys.has(atomKey(atom)));
+      return checked ? [...retained, ...atoms] : retained;
+    });
+  };
 
   const toggleUnattributed = (entryId: string) => {
-    setUnattributedAcks((prev) => {
-      const next = new Set(prev);
-      if (next.has(entryId)) next.delete(entryId);
-      else next.add(entryId);
-      return next;
-    });
+    const atom = unattributedAtomForEntry(response, entryId);
+    if (!atom) return;
+    setAtomsAcknowledged([atom], !isAcknowledged(acknowledgedAtoms, atom));
   };
 
   return (
@@ -313,13 +366,15 @@ export default function CandidatePreview({
         <label className="sc-preview-ack" data-testid="candidate-preview-overlap-ack">
           <input
             type="checkbox"
-            checked={overlapAck}
-            onChange={(e) => setOverlapAck(e.target.checked)}
+            checked={overlapSatisfied}
+            onChange={(e) => setAtomsAcknowledged(overlapAtoms, e.target.checked)}
           />
           <span>This package fuses work from multiple agents or plans — I acknowledge the overlap.</span>
         </label>
       )}
-      {response.unacknowledgedUnattributedEntryIds.map((entryId) => (
+      {response.unacknowledgedUnattributedEntryIds.map((entryId) => {
+        const atom = unattributedAtomForEntry(response, entryId);
+        return (
         <label
           key={entryId}
           className="sc-preview-ack"
@@ -328,12 +383,14 @@ export default function CandidatePreview({
         >
           <input
             type="checkbox"
-            checked={unattributedAcks.has(entryId)}
+            checked={isAcknowledged(acknowledgedAtoms, atom)}
+            disabled={!atom}
             onChange={() => toggleUnattributed(entryId)}
           />
           <span>Include unattributed change {entryId} — I acknowledge no agent was seen touching it.</span>
         </label>
-      ))}
+        );
+      })}
 
       {/* Editable commit-message body. */}
       <label className="sc-preview-msg-label" htmlFor="candidate-preview-message">
@@ -396,7 +453,7 @@ export default function CandidatePreview({
           onClick={async () => {
             if (!canSave || !onCommit) return;
             const checkedUnattributedEntryIds = response.unacknowledgedUnattributedEntryIds.filter((id) =>
-              unattributedAcks.has(id),
+              isAcknowledged(acknowledgedAtoms, unattributedAtomForEntry(response, id)),
             );
             await onCommit(
               response,
@@ -404,12 +461,15 @@ export default function CandidatePreview({
               checkedUnattributedEntryIds,
               {
                 response,
+                reviewedManifestDigest: response.reviewedManifest?.reviewedManifestDigest ?? null,
+                durableFinalizationIntent: response.durableFinalizationIntent ?? [],
+                acknowledgedChallengeAtoms: acknowledgedAtoms,
                 previewedCandidateId: response.isCandidate && 'candidateId' in response.candidate
                   ? response.candidate.candidateId
                   : null,
                 componentTopologyDigest: response.componentTopologyDigest,
                 checkedUnattributedEntryIds,
-                overlapAcknowledged: overlapAck,
+                overlapAcknowledged: overlapSatisfied,
                 messageBody,
                 userTrailers,
                 canSave,
