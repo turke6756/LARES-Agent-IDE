@@ -117,6 +117,9 @@ test('live activity comes only from open, verified plan-stamped turns and carrie
     touched: [{ path: 'src/unbound.ts', op: 'create' }],
   });
   dbm.allocateAndInsertTurn(workspaceId, {
+    id: 'live-unverified', planId: 'plan-a', planStampSource: 'unbound-manual',
+  });
+  dbm.allocateAndInsertTurn(workspaceId, {
     id: 'terminal-accepted', planId: 'plan-a', planStampSource: 'explicit',
   });
   dbm.closeTurn('terminal-accepted', 'accepted', {
@@ -140,6 +143,7 @@ test('live activity comes only from open, verified plan-stamped turns and carrie
     { id: 'live-stamped', status: 'verified', source: 'explicit', isActive: true, touched: ['src/a.ts'] },
     { id: 'live-no-touch', status: 'verified', source: 'agent-default', isActive: true, touched: [] },
     { id: 'live-explicit-none', status: 'unstamped', source: 'explicit-none', isActive: false, touched: ['src/unbound.ts'] },
+    { id: 'live-unverified', status: 'unverified', source: 'unbound-manual', isActive: false, touched: [] },
     { id: 'live-legacy', status: 'unstamped', source: 'legacy-unstamped', isActive: false, touched: ['src/legacy.ts'] },
   ]);
   assert.equal(live.some((entry) => entry.turnId === 'terminal-accepted'), false);

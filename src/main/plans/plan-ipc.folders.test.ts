@@ -21,14 +21,35 @@ try {
     plan_artifact_id: 'plan_archived', plan_sku: 'Archived title', status: 'archived', updated_at: 10,
   }));
   resetWorkspaceStateDirCacheForTests();
-  const result = listPromotedPlanFolders('ws-1', root, 'windows', (_workspaceId, artifactId) => `db:${artifactId}`);
+  const result = listPromotedPlanFolders(
+    'ws-1',
+    root,
+    'windows',
+    (_workspaceId, artifactId) => artifactId === 'plan_active' ? 'db:plan_active' : null,
+    {
+      getPlan: (planId) => planId === 'db:plan_active' ? { runState: 'executing' } as any : null,
+      listPackages: (planId) => planId === 'db:plan_active' ? [
+        { id: 'done', workspaceId: 'ws-1', planId, state: 'done' },
+        { id: 'blocked', workspaceId: 'ws-1', planId, state: 'blocked' },
+        { id: 'archived', workspaceId: 'ws-1', planId, state: 'archived' },
+      ] as any : [],
+      listTurns: () => [],
+    },
+  );
   assert.equal(result.plans.length, 2);
   assert.deepEqual(result.plans[0], {
     planArtifactId: 'plan_active', planId: 'db:plan_active', folderName: 'active', title: 'Active title',
     status: 'ready', archived: false, updatedAt: 20,
     responsibleSupervisor: { display: 'Latest owner', agentId: 'latest', source: 'promotion-service' },
+    lifecycle: 'executing',
+    rollup: { total: 3, landed: 1, remaining: 1, archived: 1, completed: false },
+    activeVerifiedTurnCount: 0,
   });
-  assert.equal(result.plans[1].archived, true);
+  assert.deepEqual(result.plans[1], {
+    planArtifactId: 'plan_archived', planId: 'plan_archived', folderName: 'archived', title: 'Archived title',
+    status: 'archived', archived: true, updatedAt: 10, responsibleSupervisor: null,
+    lifecycle: 'unknown', rollup: null, activeVerifiedTurnCount: 0,
+  });
   console.log('  ok  maps plan-folder metadata and last assigned supervisor');
 } finally {
   const resolved = path.resolve(root);

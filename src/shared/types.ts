@@ -1,5 +1,6 @@
 import type { SessionEvent, ChatEventBatch } from './session-events';
 import type { PdfSelectionAnchorV1, SelectionAnchorType } from './pdf-annotations';
+import type { PackageRollup } from './package-rollup';
 import type {
   AccessHandoffResult,
   AccessRequest,
@@ -5476,6 +5477,9 @@ export interface PromotedPlanFolder {
   archived: boolean;
   updatedAt: string | number | null;
   responsibleSupervisor: PlanGalleryOwner | null;
+  lifecycle: 'hardening' | 'ready' | 'executing' | 'archived' | 'unknown';
+  rollup: PackageRollup | null;
+  activeVerifiedTurnCount: number;
 }
 
 export interface PromotedPlanFolderListResult {

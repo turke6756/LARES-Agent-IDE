@@ -1,7 +1,22 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as Icons from 'lucide-react';
-import type { PromotedPlanFolder } from '../../../shared/types';
+import type { PromotedPlanFolder, Workspace } from '../../../shared/types';
 import { useDashboardStore } from '../../stores/dashboard-store';
+
+const REFRESH_INTERVAL_MS = 10_000;
+const LIFECYCLE_LABELS: Record<Exclude<PromotedPlanFolder['lifecycle'], 'unknown'>, string> = {
+  hardening: 'Hardening',
+  ready: 'Ready',
+  executing: 'Executing',
+  archived: 'Archived',
+};
+
+type PromotedPlansWorkspace = Pick<Workspace, 'id' | 'path' | 'pathType'>;
+
+function planStatusLabel(plan: PromotedPlanFolder): string {
+  if (plan.rollup?.completed) return 'Completed';
+  return plan.lifecycle === 'unknown' ? plan.status : LIFECYCLE_LABELS[plan.lifecycle];
+}
 
 export default function PromotedPlansList(): React.ReactElement {
   const selectedWorkspaceId = useDashboardStore((state) => state.selectedWorkspaceId);
@@ -10,25 +25,57 @@ export default function PromotedPlansList(): React.ReactElement {
   const [plans, setPlans] = useState<PromotedPlanFolder[] | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const generationRef = useRef(0);
+  const inFlightGenerationRef = useRef<number | null>(null);
 
-  const load = useCallback(async () => {
-    setError(null);
-    setPlans(null);
-    if (!workspace) {
-      setPlans([]);
-      return;
+  const request = useCallback(async (
+    target: PromotedPlansWorkspace | undefined,
+    generation: number,
+    showLoading: boolean,
+  ) => {
+    if (generation !== generationRef.current || inFlightGenerationRef.current === generation) return;
+    inFlightGenerationRef.current = generation;
+    if (showLoading) {
+      setError(null);
+      setPlans(null);
     }
     try {
-      const result = await window.api.plans.listPromotedFolders(workspace.id, workspace.path, workspace.pathType);
+      if (!target) {
+        if (generation === generationRef.current) setPlans([]);
+        return;
+      }
+      const result = await window.api.plans.listPromotedFolders(target.id, target.path, target.pathType);
+      if (generation !== generationRef.current) return;
+      setError(null);
       setPlans(result.plans);
     } catch {
+      if (generation !== generationRef.current || !showLoading) return;
       setError('Could not load promoted plans.');
       setPlans([]);
+    } finally {
+      if (inFlightGenerationRef.current === generation) inFlightGenerationRef.current = null;
     }
-  }, [workspace]);
+  }, []);
 
-  useEffect(() => { void load(); }, [load]);
-  useEffect(() => { setShowArchived(false); }, [workspace?.id]);
+  const load = useCallback((target: PromotedPlansWorkspace | undefined, generation: number) =>
+    request(target, generation, true), [request]);
+  const refresh = useCallback((target: PromotedPlansWorkspace | undefined, generation: number) =>
+    request(target, generation, false), [request]);
+
+  useEffect(() => {
+    const generation = ++generationRef.current;
+    inFlightGenerationRef.current = null;
+    setShowArchived(false);
+    void load(workspace, generation);
+    const timer = workspace
+      ? window.setInterval(() => { void refresh(workspace, generation); }, REFRESH_INTERVAL_MS)
+      : null;
+    return () => {
+      if (generationRef.current === generation) generationRef.current++;
+      if (inFlightGenerationRef.current === generation) inFlightGenerationRef.current = null;
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [load, refresh, workspace?.id, workspace?.path, workspace?.pathType]);
 
   const archivedCount = plans?.filter((plan) => plan.archived).length ?? 0;
   const visiblePlans = useMemo(
@@ -45,7 +92,7 @@ export default function PromotedPlansList(): React.ReactElement {
           <input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.currentTarget.checked)} />
           Show archived{archivedCount ? ` (${archivedCount})` : ''}
         </label>
-        <button type="button" onClick={() => void load()} className="ui-btn p-1" aria-label="Refresh promoted plans">
+        <button type="button" onClick={() => void load(workspace, generationRef.current)} className="ui-btn p-1" aria-label="Refresh promoted plans">
           <Icons.RefreshCw className="h-3.5 w-3.5" />
         </button>
       </div>
@@ -68,15 +115,34 @@ export default function PromotedPlansList(): React.ReactElement {
               title="Double-click to open the full planning surface"
             >
               <div className="min-w-0 flex-1">
-                <div className="truncate text-[13px] font-medium text-gray-100">{plan.title}</div>
+                <div className="flex items-center gap-2">
+                  <div className="truncate text-[13px] font-medium text-gray-100">{plan.title}</div>
+                  {plan.activeVerifiedTurnCount > 0 && (
+                    <span
+                      className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-accent-green"
+                      data-testid="promoted-plan-active"
+                      aria-label="Open verified turn stamped to this plan"
+                    />
+                  )}
+                </div>
                 {plan.responsibleSupervisor && (
                   <div className="truncate text-[11px] text-gray-500" data-testid="promoted-plan-owner">
                     Responsible: {plan.responsibleSupervisor.display ?? plan.responsibleSupervisor.agentId ?? 'unknown'}
                   </div>
                 )}
+                {plan.rollup !== null && plan.rollup.archived > 0 && (
+                  <div className="text-[10px] text-gray-600" data-testid="promoted-plan-archived-count">
+                    {plan.rollup.archived} archived
+                  </div>
+                )}
               </div>
-              <span className="rounded bg-white/5 px-2 py-0.5 text-[10px] uppercase tracking-wide text-gray-400" data-testid="promoted-plan-status">
-                {plan.status}
+              <span
+                className="rounded bg-white/5 px-2 py-0.5 text-[10px] uppercase tracking-wide text-gray-400"
+                data-testid="promoted-plan-status"
+                data-lifecycle={plan.lifecycle}
+                data-completed={plan.rollup?.completed ? 'true' : 'false'}
+              >
+                {planStatusLabel(plan)}
               </span>
             </button>
           ))}

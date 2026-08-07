@@ -302,6 +302,7 @@ const TESTS = [
   'dist/main/main/git-checkpoints/commit-coordinator.hooks-outcomes.test.js',
   // Save-card SC-WP-W2a: preload/source contract smoke test for inventory,
   // preview, fleet-finalize, and coordinator bindings.
+  'dist/main/main/plans/promoted-lifecycle.test.js',
   'dist/main/preload/save-card-surface.test.js',
   'dist/main/main/supervisor/send-queue-checkpoint.test.js',
   'dist/main/main/supervisor/initial-user-prompt.test.js',

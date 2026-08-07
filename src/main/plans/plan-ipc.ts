@@ -95,9 +95,24 @@ import { observeOverviewSource, parsePlanHumanOverview,
   type OverviewSourceObservation } from './plan-human-overview';
 import { parseStrictJson } from './strict-json';
 import { reconcilePlanFolderProjections } from './plan-folder-reconciler';
+import { derivePromotedLifecycle } from './promoted-lifecycle';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
+
+export interface PromotedPlanFolderDeps {
+  getPlan: typeof dbGetPlan;
+  listPackages: typeof listPlanWorkPackagesOrdered;
+  listTurns: (workspaceId: string) => ReturnType<typeof listTurnRecords>;
+}
+
+function defaultPromotedPlanFolderDeps(): PromotedPlanFolderDeps {
+  return {
+    getPlan: dbGetPlan,
+    listPackages: listPlanWorkPackagesOrdered,
+    listTurns: (workspaceId) => listTurnRecords(workspaceId, { limit: 200 }),
+  };
+}
 
 function manifestString(manifest: Record<string, unknown>, ...keys: string[]): string | null {
   for (const key of keys) {
@@ -131,6 +146,7 @@ export function listPromotedPlanFolders(
   pathType: PathType = 'windows',
   resolvePlanId: (workspaceId: string, artifactId: string) => string | null =
     (wsId, artifactId) => dbGetPlanByWorkspaceArtifactId(wsId, artifactId)?.id ?? null,
+  deps: PromotedPlanFolderDeps = defaultPromotedPlanFolderDeps(),
 ): PromotedPlanFolderListResult {
   const plans: PromotedPlanFolder[] = [];
   const warnings: string[] = [];
@@ -142,6 +158,7 @@ export function listPromotedPlanFolders(
   } catch {
     return { plans, warnings };
   }
+  const turns = deps.listTurns(workspaceId);
   for (const folder of folders.filter((entry) => entry.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
     const manifestPath = path.join(plansRoot, folder.name, 'plan.json');
     try {
@@ -157,9 +174,19 @@ export function listPromotedPlanFolders(
         continue;
       }
       const status = manifestString(manifest, 'status', 'run_state', 'phase') ?? 'promoted';
+      const planId = resolvePlanId(workspaceId, planArtifactId) ?? planArtifactId;
+      const plan = deps.getPlan(planId);
+      const lifecycle = derivePromotedLifecycle({
+        planId,
+        runState: plan?.runState,
+        packages: deps.listPackages(planId).filter(
+          (pkg) => pkg.planId === planId && pkg.workspaceId === workspaceId,
+        ),
+        turns,
+      });
       plans.push({
         planArtifactId,
-        planId: resolvePlanId(workspaceId, planArtifactId) ?? planArtifactId,
+        planId,
         folderName: folder.name,
         title: manifestString(manifest, 'title', 'plan_title', 'plan_sku') ?? folder.name,
         status,
@@ -168,6 +195,7 @@ export function listPromotedPlanFolders(
           ? manifest.updated_at
           : null,
         responsibleSupervisor: manifestOwner(manifest),
+        ...lifecycle,
       });
     } catch {
       warnings.push(`skipped ${folder.name}: unreadable plan.json`);
