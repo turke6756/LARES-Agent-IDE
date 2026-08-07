@@ -12,6 +12,7 @@ import path from 'node:path'
 
 const TESTS = [
   'dist/main/shared/notification-classify.test.js',
+  'dist/main/shared/package-rollup.test.js',
   // Edit-loss §4.0/§4.1: shared content-identity hash vectors + the
   // conditional-write (CAS) contract of writeFileContents.
   'dist/main/shared/content-hash.test.js',
