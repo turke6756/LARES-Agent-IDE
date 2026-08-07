@@ -30,6 +30,7 @@ for (const binding of [
   'getInventory: (req) => ipcRenderer.invoke(SAVECARD_CHANNELS.getInventory, req)',
   'preview: (req) => ipcRenderer.invoke(SAVECARD_PREVIEW_CHANNEL, req)',
   'markDone: (req) => ipcRenderer.invoke(SAVECARD_FINALIZE_CHANNEL, req)',
+  'sweep: (req) => ipcRenderer.invoke(SAVE_SWEEP_CHANNEL, req)',
   'mint: (req) => ipcRenderer.invoke(COMMIT_CANDIDATE_MINT_CHANNEL, req)',
   'commit: (req) => ipcRenderer.invoke(COMMIT_COORDINATOR_CHANNEL, req)',
 ]) {

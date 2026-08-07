@@ -33,12 +33,14 @@ import { startContinuationWatcher } from './supervisor/continuation-watcher-wiri
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
-import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardMintRoutes, setSaveCardFinalizeRoutes, setCommitCoordinatorRoutes, setSaveCardAttentionProvider } from './ipc-handlers';
+import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardMintRoutes, setSaveCardFinalizeRoutes, setCommitCoordinatorRoutes, setSaveSweepService, setSaveCardAttentionProvider } from './ipc-handlers';
 import { createSaveCardRoutes } from './commit-candidates/save-card-routes';
 import { createPreviewRoutes } from './commit-candidates/preview-routes';
 import { CommitCoordinator } from './git-checkpoints/commit-coordinator';
 import { runGit, runGitBytes } from './git-checkpoints/git-command';
 import { broadcastSaveCardAttention } from './commit-candidates/save-card-ipc';
+import { consumeCommitCoordinatorForSweep, type CommitCoordinatorRoutes } from './commit-candidates/commit-coordinator-ipc';
+import { SaveSweepService } from './commit-candidates/save-sweep-service';
 import type { SaveCardQuotaWeakening } from '../shared/commit-candidates';
 import type { SaveCardCheckpointExpiryNotice } from '../shared/types';
 import { installExternalNavHandlers, forceCloseAllDetached, getDetachedEntries, type DetachedWindowDeps } from './detached-windows';
@@ -879,11 +881,18 @@ app.whenReady().then(async () => {
             locateRepository: previewRoutes.productionSeams.locateRepository,
             deriveTrailers: previewRoutes.productionSeams.deriveTrailers,
           });
-          setCommitCoordinatorRoutes({
+          const coordinatorRoutes: CommitCoordinatorRoutes = {
             coordinator,
             resolveCandidateToken: candidateService.resolveCandidateToken.bind(candidateService),
             locateRepository: previewRoutes.productionSeams.locateRepository,
-          });
+          };
+          setCommitCoordinatorRoutes(coordinatorRoutes);
+          setSaveSweepService(new SaveSweepService({
+            candidateService,
+            resolveIntent: previewRoutes.productionSeams.resolveSweepIntent,
+            consume: (request) => consumeCommitCoordinatorForSweep(request, coordinatorRoutes),
+            refreshInventory: previewRoutes.productionSeams.refreshSweepInventory,
+          }));
           await engine.runStartupMaintenance();
           // WP-G3.3 — schedule the periodic retention cycle (distill-before-prune +
           // triggered loose-object maintenance + storage report) on the shared engine

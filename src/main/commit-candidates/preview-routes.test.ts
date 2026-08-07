@@ -15,6 +15,7 @@
 //     them, so the reps it resolves match the members the assembler verifies.
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 
 import { createPreviewRoutes, type PreviewRoutesDeps } from './preview-routes';
 import { buildCandidate, computeCandidateTopologyDigest } from './candidate-service';
@@ -31,6 +32,7 @@ import type {
 import type { PackageFinalization } from '../database';
 import type { GitCapability } from '../../shared/types';
 import type { FrozenManifestMember } from './finalization-service';
+import { canonicalize } from './jcs';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -533,6 +535,41 @@ test('production coordinator seams reassemble a minted snapshot from the shared 
     'Lares-Turn: t1',
     'Lares-Plan: plan-A',
   ]);
+});
+
+test('production sweep seam reconstructs a durable intent from fresh route state', async () => {
+  const row = finalization({
+    packageId: 'component:c1',
+    memberManifestJson: JSON.stringify([{ ...frozen('e1'), commitBlobOid: OID }]),
+    createdFromWorkspaceId: 'ws-1',
+  });
+  const routes = createPreviewRoutes(baseDeps({
+    getPackageFinalization: (id) => id === row.id ? row : null,
+  }));
+  const frozenMemberManifestDigest = createHash('sha256').update(canonicalize([{
+    ...frozen('e1'),
+    commitBlobOid: OID,
+  }])).digest('hex');
+
+  const resolved = await routes.productionSeams.resolveSweepIntent({
+    repositoryKey: REPO_KEY,
+    finalizationId: row.id,
+    packageId: row.packageId,
+    packageRevision: row.packageRevision,
+    frozenMemberManifestDigest,
+    reviewedManifestDigest: 'd'.repeat(64),
+    message: 'Save package',
+  });
+  assert.equal(resolved.kind, 'candidate');
+  if (resolved.kind !== 'candidate') return;
+  assert.deepEqual(resolved.selection, {
+    selectedComponentIds: ['c1'],
+    selectedUnattributedEntryIds: [],
+    finalizationIds: ['fin-1'],
+  });
+  assert.equal(resolved.context.repository.repositoryKey, REPO_KEY);
+  assert.equal(resolved.context.indexFingerprint.hasUnmerged, false);
+  await routes.productionSeams.refreshSweepInventory(REPO_KEY);
 });
 
 test('save-card mint route purely forwards reviewed digest and acknowledged atoms', async () => {

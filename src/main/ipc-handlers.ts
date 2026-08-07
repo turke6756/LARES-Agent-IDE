@@ -3,8 +3,9 @@ import type { WebContents } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import { persistTheme } from './theme-persistence';
-import type { ContinuationPhaseSignal, PathType, WslStatus, HealthCheck, RuntimePrerequisiteReport, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult } from '../shared/types';
+import type { ContinuationPhaseSignal, PathType, WslStatus, HealthCheck, RuntimePrerequisiteReport, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult, SaveSweepRequest } from '../shared/types';
 import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
+import { SAVE_SWEEP_CHANNEL } from '../shared/types';
 import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedViews, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { handleFlushReply } from './close-flush';
 import type { FlushReplyPayload, SelectionComment } from '../shared/types';
@@ -83,6 +84,7 @@ import {
   type CommitCoordinatorRoutes,
 } from './commit-candidates/commit-coordinator-ipc';
 import type { RequestedPlanBinding } from '../shared/commit-candidates';
+import type { SaveSweepService } from './commit-candidates/save-sweep-service';
 import {
   ORCHESTRATION_PROVIDER_SETTINGS_CHANNELS,
   onOrchestrationProviderSettingsChanged,
@@ -141,6 +143,28 @@ export function setSaveCardFinalizeRoutes(routes: SaveCardFinalizeRoutes | null)
 let commitCoordinatorRoutes: CommitCoordinatorRoutes | null = null;
 export function setCommitCoordinatorRoutes(routes: CommitCoordinatorRoutes | null): void {
   commitCoordinatorRoutes = routes;
+}
+
+// SC-WP-6b — the durable multi-package service shares the asynchronous checkpoint
+// bootstrap used by every neighbouring Save-card route. The channel itself is
+// registered synchronously below, so early calls fail honestly instead of seeing
+// Electron's "No handler registered" error.
+let saveSweepService: SaveSweepService | null = null;
+export function setSaveSweepService(service: SaveSweepService | null): void {
+  saveSweepService = service;
+}
+
+export function registerSaveSweepIpc(
+  ipc: Pick<typeof ipcMain, 'handle'>,
+  getService: () => SaveSweepService | null,
+): void {
+  ipc.handle(SAVE_SWEEP_CHANNEL, (_event, request: SaveSweepRequest) => {
+    const service = getService();
+    if (!service) {
+      throw new Error('save sweep unavailable (the engine has not finished bootstrapping)');
+    }
+    return service.sweep(request);
+  });
 }
 
 // SC-WP-N2 — the checkpoint-expiry attention provider, injected by the same async
@@ -262,6 +286,7 @@ export function registerIpcHandlers(
   registerSaveCardMintIpc(ipcMain, () => saveCardMintRoutes);
   registerSaveCardFinalizeIpc(ipcMain, () => saveCardFinalizeRoutes);
   registerCommitCoordinatorIpc(ipcMain, () => commitCoordinatorRoutes);
+  registerSaveSweepIpc(ipcMain, () => saveSweepService);
   // SC-WP-N2 — the lightweight checkpoint-expiry attention read. Registered here
   // (lazy provider getter) so `savecard:getAttention` exists before the async
   // engine bootstrap starts publishing notices; a missing provider answers null.

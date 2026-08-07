@@ -3367,6 +3367,9 @@ export interface IpcApi {
     markDone: (
       req: SaveCardFleetAdhocMarkDoneRequest,
     ) => Promise<SaveCardFleetAdhocMarkDoneResponse>;
+    /** One reviewed, durable multi-package Save gesture. Main refreshes and
+     *  re-verifies every intent immediately before its just-in-time mint. */
+    sweep: (req: SaveSweepRequest) => Promise<SaveSweepResponse>;
     /** SC-WP-N2 — lightweight checkpoint-expiry attention read (no full inventory
      *  probe). Resolves the freshest notice for the workspace, or null. */
     getAttention: (req: SaveCardAttentionRequest) => Promise<SaveCardCheckpointExpiryNotice | null>;

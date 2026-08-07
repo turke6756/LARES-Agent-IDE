@@ -492,6 +492,73 @@ test('post-save inventory refresh failure halts and preserves the known commit O
   assert.equal(result.results[0].kind === 'halted-uncertain' && result.results[0].commitOid, COMMIT);
 });
 
+test('production IPC registration invokes savecard:sweep on a real SaveSweepService', async () => {
+  type RegisteredHandler = (event: unknown, ...args: unknown[]) => unknown;
+  const handlers = new Map<string, RegisteredHandler>();
+  const ipcMain = {
+    handle(channel: string, handler: RegisteredHandler) { handlers.set(channel, handler); },
+    on() { /* registration-only fake */ },
+  };
+  const noop = () => undefined;
+  const electronPath = require.resolve('electron');
+  const priorElectron = require.cache[electronPath];
+  const ipcHandlersPath = require.resolve('../ipc-handlers');
+  const priorIpcHandlers = require.cache[ipcHandlersPath];
+  require.cache[electronPath] = {
+    id: electronPath,
+    filename: electronPath,
+    loaded: true,
+    exports: {
+      ipcMain,
+      app: { getPath: () => process.cwd(), isPackaged: false, on: noop },
+      dialog: { showOpenDialog: noop, showMessageBox: noop },
+      shell: { openExternal: noop, trashItem: noop },
+      BrowserWindow: class {},
+      nativeTheme: { on: noop, themeSource: 'system', shouldUseDarkColors: false },
+    },
+    children: [],
+    paths: [],
+  } as unknown as NodeModule;
+  delete require.cache[ipcHandlersPath];
+
+  try {
+    const bridge = require('../ipc-handlers') as typeof import('../ipc-handlers');
+    const service = new SaveSweepService({
+      candidateService: candidateService(),
+      resolveIntent: async () => { throw new Error('empty sweep must not resolve an intent'); },
+      consume: async () => { throw new Error('empty sweep must not consume'); },
+      refreshInventory: async () => { throw new Error('empty sweep must not refresh'); },
+    });
+    bridge.setSaveSweepService(service);
+    const supervisor = new Proxy({}, { get: () => noop });
+    const mainWindow = new Proxy({
+      isDestroyed: () => false,
+      webContents: new Proxy({ send: noop }, { get: () => noop }),
+    }, { get: (target, property) => property in target
+      ? target[property as keyof typeof target]
+      : noop });
+    bridge.registerIpcHandlers(
+      supervisor as Parameters<typeof bridge.registerIpcHandlers>[0],
+      mainWindow as unknown as Parameters<typeof bridge.registerIpcHandlers>[1],
+      {} as Parameters<typeof bridge.registerIpcHandlers>[2],
+    );
+
+    const handler = handlers.get('savecard:sweep');
+    assert.ok(handler, 'the production registerIpcHandlers path must register savecard:sweep');
+    const result = await handler({}, {
+      intents: [],
+      reviewedManifestDigests: [],
+      acknowledgedChallengeAtoms: [],
+    });
+    assert.deepEqual(result, { results: [], halted: false, haltKind: null });
+  } finally {
+    if (priorElectron) require.cache[electronPath] = priorElectron;
+    else delete require.cache[electronPath];
+    if (priorIpcHandlers) require.cache[ipcHandlersPath] = priorIpcHandlers;
+    else delete require.cache[ipcHandlersPath];
+  }
+});
+
 (async () => {
   let failures = 0;
   let executed = 0;

@@ -25,8 +25,9 @@
 // lane's dirty file in the same folder is never silently dropped from the preview.
 
 import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
 
-import type { GitCapability, SaveCardMintRequest, SaveCardPreviewRequest } from '../../shared/types';
+import type { GitCapability, SaveCardMintRequest, SaveCardPreviewRequest, SaveSweepIntent } from '../../shared/types';
 import type { PlanCandidatePreviewRequest } from '../../shared/types';
 import type { DirtyEntry } from '../../shared/commit-candidates';
 import { BUNDLE_CONTRACT_VERSION } from '../../shared/constants';
@@ -57,6 +58,7 @@ import {
   type CandidateReadRequest,
   type CandidateWorkspaceInput,
   type CaptureTurnReader,
+  type FreshHeadEntry,
 } from './candidate-service';
 import { ComposeLockRegistry } from './compose-lock-registry';
 import type {
@@ -82,7 +84,10 @@ import type {
   SaveCardPreviewRoutes,
   SaveCardMintRoutes,
 } from './save-card-ipc';
-import { resolvePinnedSelectionDrift } from './pinned-selection-drift';
+import { parseFinalizationManifest, resolvePinnedSelectionDrift } from './pinned-selection-drift';
+import { readCheckpointTree } from './protection-read';
+import { canonicalize } from './jcs';
+import type { FreshSaveSweepResolution } from './save-sweep-service';
 import type {
   FinalizePlanItemDoneRequest,
   PlanCandidatePreviewRoutes,
@@ -154,6 +159,8 @@ export interface PreviewProductionSeams {
   readMemberRepresentation(input: ReadMemberRepresentationInput): Promise<MemberRepresentation>;
   locateRepository(snapshot: CandidateTokenSnapshot): { repoRoot: string; gitExe?: string };
   deriveTrailers(snapshot: CandidateTokenSnapshot): string[];
+  resolveSweepIntent(intent: Readonly<SaveSweepIntent>): Promise<FreshSaveSweepResolution>;
+  refreshSweepInventory(repositoryKey: string): Promise<void>;
 }
 
 function canonicalDir(realpath: (p: string) => string, p: string): string {
@@ -628,6 +635,191 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     return trailers;
   }
 
+  async function assembleRepositoryScope(
+    repositoryKey: string,
+    preferredWorkspaceId?: string | null,
+  ): Promise<PreviewScope> {
+    const workspaceIds = [
+      ...(preferredWorkspaceId ? [preferredWorkspaceId] : []),
+      ...getWorkspaces().map((workspace) => workspace.id),
+    ].filter((workspaceId, index, all) => all.indexOf(workspaceId) === index);
+    let lastError: unknown = null;
+    for (const workspaceId of workspaceIds) {
+      try {
+        const scope = await assembleScope(workspaceId);
+        if (scope.context.repository.repositoryKey === repositoryKey) return scope;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    const suffix = lastError instanceof Error ? `: ${lastError.message}` : '';
+    throw new Error(`Save sweep repository is unavailable: ${repositoryKey}${suffix}`);
+  }
+
+  function frozenManifestDigest(finalization: PackageFinalization): string {
+    const frozenMembers = parseFinalizationManifest(finalization)
+      .map((member) => ({
+        pathBytesBase64: member.pathBytesBase64,
+        expectedState: member.expectedState,
+        rawBlobOid: member.rawBlobOid,
+        commitBlobOid: member.commitBlobOid,
+        commitMode: member.commitMode,
+      }))
+      .sort((left, right) => left.pathBytesBase64 < right.pathBytesBase64
+        ? -1
+        : left.pathBytesBase64 > right.pathBytesBase64 ? 1 : 0);
+    return createHash('sha256').update(canonicalize(frozenMembers)).digest('hex');
+  }
+
+  function sweepSelection(scope: PreviewScope, finalization: PackageFinalization) {
+    const frozenPaths = new Set(
+      parseFinalizationManifest(finalization).map((member) => member.pathBytesBase64),
+    );
+    const entriesById = new Map(scope.context.inventory.entries.map((entry) => [entry.entryId, entry]));
+    const selectedComponentIds = scope.context.components
+      .filter((component) => component.dirtyEntryIds.some((entryId) => {
+        const entry = entriesById.get(entryId);
+        return entry ? frozenPaths.has(entry.path.pathBytesBase64) : false;
+      }))
+      .map((component) => component.componentId);
+    const selectedComponentEntryIds = new Set(
+      scope.context.components
+        .filter((component) => selectedComponentIds.includes(component.componentId))
+        .flatMap((component) => component.dirtyEntryIds),
+    );
+    const selectedUnattributedEntryIds = scope.context.inventory.entries
+      .filter((entry) => frozenPaths.has(entry.path.pathBytesBase64)
+        && !selectedComponentEntryIds.has(entry.entryId))
+      .map((entry) => entry.entryId);
+    return {
+      selectedComponentIds,
+      selectedUnattributedEntryIds,
+      finalizationIds: [finalization.id],
+    };
+  }
+
+  async function addSweepProofs(
+    scope: PreviewScope,
+    context: CandidateBuildContext,
+    finalization: PackageFinalization,
+  ): Promise<CandidateBuildContext> {
+    const reachableCommitOids = new Set<string>();
+    const commitOids = [...new Set(context.ledger
+      .map((link) => link.commitOid)
+      .filter((oid): oid is string => typeof oid === 'string' && OID_RE.test(oid)))];
+    if (context.pinnedHeadOid) {
+      await Promise.all(commitOids.map(async (commitOid) => {
+        if (commitOid === context.pinnedHeadOid) {
+          reachableCommitOids.add(commitOid);
+          return;
+        }
+        const ancestry = await runGit(
+          scope.repoRoot,
+          ['merge-base', '--is-ancestor', commitOid, context.pinnedHeadOid!],
+          { gitExe, allowNonzero: true, timeoutMs: HEAD_TIMEOUT_MS, maxBytes: 4096 },
+        );
+        if (ancestry.code === 0) reachableCommitOids.add(commitOid);
+      }));
+    }
+
+    const currentHeadEntriesByPath = new Map<string, FreshHeadEntry>();
+    if (context.pinnedHeadOid) {
+      const paths = parseFinalizationManifest(finalization).flatMap((member) => {
+        const bytes = Buffer.from(member.pathBytesBase64, 'base64');
+        const displayPath = bytes.toString('utf8');
+        const utf8Clean = Buffer.compare(Buffer.from(displayPath, 'utf8'), bytes) === 0;
+        return utf8Clean ? [{ pathBytesBase64: member.pathBytesBase64, displayPath, utf8Clean }] : [];
+      });
+      const headTree = await readCheckpointTree({
+        repoRoot: scope.repoRoot,
+        checkpointOid: context.pinnedHeadOid,
+        paths,
+        runGitBytes,
+        gitExe,
+      });
+      if (headTree) {
+        for (const path of paths) {
+          const present = headTree.get(path.pathBytesBase64);
+          currentHeadEntriesByPath.set(path.pathBytesBase64, present
+            ? { expectedState: 'present', commitBlobOid: present.rawBlobOid, commitMode: present.mode }
+            : { expectedState: 'absent', commitBlobOid: null, commitMode: null });
+        }
+      }
+    }
+    return { ...context, reachableCommitOids, currentHeadEntriesByPath };
+  }
+
+  async function resolveSweepIntent(
+    intent: Readonly<SaveSweepIntent>,
+  ): Promise<FreshSaveSweepResolution> {
+    const finalization = getPackageFinalization(intent.finalizationId);
+    const scope = await assembleRepositoryScope(
+      intent.repositoryKey,
+      finalization?.createdFromWorkspaceId,
+    );
+    const attention = (code: string, message: string): FreshSaveSweepResolution => ({
+      kind: 'needs-attention',
+      indexFingerprint: scope.context.indexFingerprint,
+      code,
+      message,
+    });
+    if (!finalization) {
+      return attention('finalization-missing', 'The reviewed package finalization no longer exists.');
+    }
+    if (finalization.repositoryKey !== intent.repositoryKey
+        || finalization.packageId !== intent.packageId
+        || finalization.packageRevision !== intent.packageRevision
+        || frozenManifestDigest(finalization) !== intent.frozenMemberManifestDigest) {
+      return attention('durable-intent-changed', 'The durable package intent changed after review.');
+    }
+
+    const selection = sweepSelection(scope, finalization);
+    const context = await addSweepProofs(
+      scope,
+      await buildContext(
+        scope,
+        selection.selectedComponentIds,
+        selection.selectedUnattributedEntryIds,
+        selection.finalizationIds,
+      ),
+      finalization,
+    );
+    if (finalization.lifecycleStatus === 'committed' || finalization.lifecycleStatus === 'active') {
+      const provingCommitOids = new Set<string>();
+      const frozenMembers = parseFinalizationManifest(finalization);
+      const proven = frozenMembers.length > 0 && frozenMembers.every((member) => {
+        const link = context.ledger.find((candidate) =>
+          typeof candidate.commitOid === 'string'
+          && context.reachableCommitOids?.has(candidate.commitOid)
+          && candidate.pathBytesBase64 === member.pathBytesBase64
+          && candidate.expectedState === member.expectedState
+          && candidate.commitBlobOid === member.commitBlobOid
+          && candidate.commitMode === member.commitMode
+          && (candidate.rawBlobOidAtCommit === undefined
+            || candidate.rawBlobOidAtCommit === member.rawBlobOid));
+        if (link?.commitOid) provingCommitOids.add(link.commitOid);
+        return !!link;
+      });
+      if (proven) {
+        return {
+          kind: 'already-saved',
+          indexFingerprint: context.indexFingerprint,
+          provingCommitOids: [...provingCommitOids].sort(),
+        };
+      }
+      if (finalization.lifecycleStatus === 'committed') {
+        return attention('committed-proof-unavailable', 'The committed package lacks a fresh reachable ledger proof.');
+      }
+    }
+    if (finalization.lifecycleStatus !== 'active' || finalization.boundaryStatus !== 'ready') {
+      return attention(
+        'finalization-not-active',
+        `The reviewed package finalization is ${finalization.lifecycleStatus}/${finalization.boundaryStatus}.`,
+      );
+    }
+    return { kind: 'candidate', indexFingerprint: context.indexFingerprint, context, selection };
+  }
+
   // Route a fleet-adhoc mark-done by the REPOSITORY THE PANE IS SCOPED TO — the
   // same repository scope the inventory already used — NOT by scanning every
   // registered workspace. The package's files physically live in the pane's repo;
@@ -724,6 +916,10 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     readMemberRepresentation,
     locateRepository,
     deriveTrailers,
+    resolveSweepIntent,
+    refreshSweepInventory: async (repositoryKey) => {
+      await assembleRepositoryScope(repositoryKey);
+    },
   };
 
   return { saveCardPreviewRoutes, saveCardMintRoutes, planPreviewRoutes, saveCardFinalizeRoutes, productionSeams };
