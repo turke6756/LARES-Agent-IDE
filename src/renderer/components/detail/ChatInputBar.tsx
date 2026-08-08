@@ -16,6 +16,9 @@ import AtMentionDropdown from './AtMentionDropdown';
 
 const ACCEPTING_INPUT: AgentStatus[] = ['idle', 'waiting', 'done', 'crashed'];
 
+export const DONE_AGENT_SEND_ERROR =
+  'This agent is done, so the message was not sent. Restart the agent with the yellow Restart button, then send it again.';
+
 export interface ChatInputBarProps {
   agentId: string;
   agentStatus: AgentStatus;
@@ -309,6 +312,16 @@ export default function ChatInputBar({
     const text = input.trim();
     if (!text || !canSend) return;
 
+    // A terminal row can still have a writable-looking chat draft, but it no
+    // longer has a runner that can receive the message. Keep the draft intact
+    // and explain the exact recovery action instead of letting the eventual
+    // no-runner outcome collapse into a generic delivery failure.
+    if (agentStatus === 'done') {
+      setSendOutcome(null);
+      setSendError(DONE_AGENT_SEND_ERROR);
+      return;
+    }
+
     setSending(true);
     setSendError(null);
     setSendOutcome(null); // clear a stale banner; the eventual result replaces it
@@ -324,7 +337,7 @@ export default function ChatInputBar({
       setSending(false);
       inputRef.current?.focus();
     }
-  }, [agentId, input, canSend, updateInput]);
+  }, [agentId, agentStatus, input, canSend, updateInput]);
 
   // Replace the in-progress "@…" run with the agent's full token + a trailing
   // space, then drop the caret just past it. atIndex marks where the '@' began;

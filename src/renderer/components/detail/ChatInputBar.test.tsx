@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import ChatInputBar from './ChatInputBar';
+import ChatInputBar, { DONE_AGENT_SEND_ERROR } from './ChatInputBar';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import { formatAgentToken } from '../../lib/agent-mention';
 import type { Agent, SendOutcome, Workspace } from '../../../shared/types';
@@ -277,5 +277,17 @@ describe('ChatInputBar WP8 send-outcome banner', () => {
     render('me');
     fire({ disposition: 'failed', agentId: 'someone-else', delivered: false, reason: 'delivery-failed', completedAt: 0 });
     expect(container.textContent).not.toContain(TERMINAL_CHECK_SENTENCE);
+  });
+});
+
+describe('ChatInputBar terminal-agent guidance', () => {
+  it('keeps a done agent message as a draft and directs the user to Restart', () => {
+    render('me', 'done');
+    type('one more thing');
+    key('Enter');
+
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(textarea().value).toBe('one more thing');
+    expect(container.textContent).toContain(`Send failed: ${DONE_AGENT_SEND_ERROR}`);
   });
 });
