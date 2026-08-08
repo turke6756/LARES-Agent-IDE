@@ -35,10 +35,10 @@ can be run again later and compared.
 
 # Planning Surface Audit — Rubric and Method
 
-**Audience:** a single auditing agent, dispatched read-only.
-**Produces:** one markdown report (format in §7).
-**Expected cost:** this is a multi-hour read-heavy job. Budget context
-deliberately; §3.4 tells you how to sample rather than read everything.
+**Audience:** a three-agent audit team dispatched under the read-only controls in §2.
+**Produces:** two evidence packets and one lead-authored markdown report (format in §7).
+**Expected cost:** this is a bounded, read-heavy job. The ceilings in §2.11 and
+the deterministic rule in §3.4 control cost without silently narrowing the population.
 
 ---
 
@@ -46,9 +46,15 @@ deliberately; §3.4 tells you how to sample rather than read everything.
 
 The **planning surface** is the whole path from an idea to gated work:
 
-<br />
+This is a whole-surface audit applied through one bounded case study. The case-study
+agent is `229530a1-04f9-4781-9c8d-a92cae9b7e18`; its plan is `plan_5b3ea7d1`.
+Establish and follow every renewed session belonging to that agent's proposal-to-plan
+execution rather than assuming one session per agent.
 
-So you will be examining and agent that actually ran the new updated pipiline the agnet is new proposal in the AgentDashabord workspace, you are to look closly at this agnets chat it got renewed a couple times during the process so there are multiple sessions assocated with this agent and its execution or the propsoal to plan pipline. Think of it as a profomance review audit on this agent. 
+The calibration set describes a **different run**. It applies only to the
+whole-surface population, never as expected findings for the case-study trace.
+Failure to reproduce a calibration claim inside the case study is expected and is
+not a finding.
 
 ```
 idea → proposal (.lares/proposals/) → scope (intents) → promote (plan folder)
@@ -94,9 +100,17 @@ Do not reward completeness of paperwork.
 destroys the measurement and contaminates every later audit. The only writes you
 make are to your own report file.
 
-**2.2 Do not dispatch agents or send messages.** You are measuring a system, not
-operating it. If you believe a question can only be answered by asking a
-participant, record it as an open question in your report.
+**2.2 Participant interviews are a controlled exception, not a collection tool.**
+Auditors do not dispatch agents or message participants during evidence collection.
+Only after both collection packets are complete and the lead's independent baseline
+is hashed may the lead submit an inert question for the audit supervisor to relay to
+the case-study participant. Ask what happened or why; never ask the participant to
+check, verify, refresh, re-derive, fix, or look at anything. Label the response
+`[participant testimony]` at tier 3, quote the exact question, and never use testimony
+as the sole basis for a finding or to override tier-1 evidence. A disagreement with
+tier 1 is itself a finding. Disclose every interview in Method and Coverage: who was
+asked, when relative to the baseline hash, the verbatim question, and what changed
+as a result. Questions that would induce a read or write remain open questions.
 
 **2.3 Evidence tiers.** When sources disagree, prefer higher tiers, and say
 explicitly which tier a claim rests on:
@@ -138,10 +152,81 @@ looked in a place where X would have appeared, and that the capture mechanism wa
 healthy. State the search you ran. Most false audit findings are absence claims
 from an incomplete search.
 
-**2.9 Read cheap before expensive.** `read_agent_chat` before `read_agent_log`
-(10–50× cheaper). `read_plan_section` in `outline` mode before `text`/`raw`.
-`list_checkpoints` paths-only before `diff_turn`. Escalate only where a cheap
-read already implicated something.
+**2.9 Read cheap before expensive, in this order.**
+
+1. Enumerate `.lares/plans/`, then `.dashboard/plans/` when present.
+2. Read `plan.md`, `plan.json`, and `ARC.md` directly from disk.
+3. Read linked `supplements/`, `deliberations/`, and `research/` files.
+4. Read `OVERVIEW.md` only when present; absence is not itself a defect.
+5. Use `read_agent_chat` before `read_agent_log`.
+6. Use `read_agent_files_touched` to locate evidence.
+7. Use `get_orchestration_run` for membership, timing, and relay structure.
+8. Use capture-health-validated `list_checkpoints`, then bounded `diff_turn` for
+   implicated turns; cap each result at 300 diff lines.
+
+**2.10 Topology and ownership.** Use exactly three fresh agents: one Lead Auditor
+(Codex), one Agent-Evidence Collector (Codex), and one Surface-Evidence Collector
+(AGY). Collectors gather
+standardized evidence packets but do not score, assign moral labels, rank findings,
+or construct Part C. The lead alone applies evidence tiers and temporal normalization,
+owns the A/B scorecard, constructs C1 and C4, and writes the verdict and recommendations.
+Collector assertions are leads, not evidence: the lead must re-read the primary
+artifact for every C1 hop, every A/B score citation, every C4 candidate, every reported
+anomaly or tier conflict, and every checkpoint-dependent capture-health conclusion.
+
+The Agent-Evidence Collector writes only
+`.lares/research/inbox/packet-agent-evidence.md`; the Surface-Evidence Collector writes
+only `.lares/research/inbox/packet-surface-evidence.md`; the lead writes only
+`.lares/research/inbox/planning-surface-audit-report.md`.
+
+**2.11 Budgets.** Each collector gets one working turn, at most 40,000 retrieved-source
+tokens, and at most 5,000 output tokens. The Agent-Evidence Collector may retrieve at
+most 4,000 raw-log tokens across no more than two escalations. The Surface-Evidence
+Collector uses no raw log unless the agent packet identifies a specific unresolved
+need; any such use shares that 4,000-token/two-escalation cap. Estimate tokens as
+`ceil(characters / 4)` when tools do not report them.
+
+The lead gets one independent turn with at most 80,000 retrieved-source tokens, one
+resumed calibration turn with at most 20,000 additional retrieved tokens, at most
+12,000 output tokens for the report, and at most 6,000 raw-log tokens across no more
+than three escalations. The total ceiling is four agent turns and approximately
+180,000 retrieved-source tokens. If mandatory coverage exceeds a ceiling, stop
+discretionary reading, record the shortfall, and return the partial packet or report;
+never silently truncate the population.
+
+**2.12 Independence and sealed calibration.** Independence is agent-level, not
+provider-level. Before dispatch, compare every proposed auditor ID against orchestration
+membership, participant and terminal listings, plan assignment and gate events,
+artifact author metadata, and calibration authorship. Disqualify any agent that
+authored the rubric or calibration set, scoped or promoted this plan, participated in
+the audited run, dispatched its workers, or gated its results. This includes
+`ae889b24` and `c30eb66f`. If participation is discovered after collection begins,
+mark the packet compromised and replace it.
+
+Keep the calibration supplement outside every auditor's independent-phase tool
+boundary. Record its SHA-256 before dispatch. After the lead completes its independent
+pass, capture and hash the provisional scorecard, findings, C1, and C4 before unsealing
+the supplement for the single resumed turn. Calibration claims are hypotheses, not
+answer keys; a mismatch alone cannot change a score. Label every unseal-triggered
+investigation or score change `[post-calibration lead]` and explain why it was absent
+from the independent pass.
+
+**2.13 Read-only enforcement.** Use the existing three achievable layers:
+
+1. **Tool boundary:** allow file reads, list/glob/search, read-only git, the named
+   evidence reads in §2.9, and writing only to each role's exact outbox in §2.10.
+2. **Explicit denials:** deny every other file write or edit; plan create, update, or
+   delete; planning-event recording; checkpoint prune or revert; restore or revert
+   operations; agent dispatch; orchestration launch; participant messaging; browser
+   actions; notebook mutation; and network access.
+3. **Integrity checks:** record source commit and pre-run `git status`; verify after
+   completion with `git status` plus `list_checkpoints` over the audit window. Any
+   audit-caused mutation invalidates the audit and is itself a finding.
+
+The audited plan folder must remain frozen—no `orient`, ARC refresh, or
+`record_planning_event`—until both packets return and the lead's independent baseline
+is hashed. The report must state the residual gap: the read-only mandate was enforced
+by lane restriction and verified after the fact, not sandboxed.
 
 ---
 
@@ -170,31 +255,62 @@ Establish, and record in your report:
 
 ### 3.3 Surface-side sources
 
-- `plan.json` — intents, events, `assigned` (ownership), lifecycle.
-- `ARC.md` + `ARC-META` — supervisor's summary and its freshness.
-- `supplements/` — work packages, contracts.
-- `deliberations/`, `research/` — inputs and their provenance.
-- `OVERVIEW.md` — human overview and its parsed projection.
-- `read_plan_projection` / `read_plan_section` — trusted per-section roll-up.
-- `list_checkpoints` / `diff_turn` — witnessed turn/file attribution.
-- The `read-planning-surface` skill — the read-only reporting lane. Use it; it
-  is also *itself* under audit (does it answer the questions it claims to?).
+Use the same disk-and-tool order for every plan in the population:
+
+1. Enumerate `.lares/plans/`, then `.dashboard/plans/` when present.
+2. Read `plan.md`, `plan.json`, and `ARC.md` directly from disk.
+3. Read linked `supplements/`, `deliberations/`, and `research/` files.
+4. Read `OVERVIEW.md` only when present; absence is not itself a defect.
+5. Use `read_agent_chat` before `read_agent_log`.
+6. Use `read_agent_files_touched` to locate evidence.
+7. Use `get_orchestration_run` for membership, timing, and relay structure.
+8. Use capture-health-validated `list_checkpoints`, then bounded `diff_turn` for
+   implicated turns; cap each result at 300 diff lines.
+
+The disk reads establish intents, assignment and lifecycle, ARC freshness, work
+packages and contracts, decision provenance, and the rendered human surface. Use the
+`read-planning-surface` skill as a read-only reporting lane and audit whether its
+report agrees with those primary sources.
 
 ### 3.4 Sampling
 
-Do not read every transcript end to end. Sample deliberately and disclose it:
+Mandatory coverage comes first:
 
-1. **Every gate boundary** — the final assistant message of each dispatched
-   worker, plus the supervisor turn that gated it. (Highest value per token.)
-2. **Every brief** (the `user` message that launched each worker).
-3. **Full transcripts only for outliers**: an agent that stopped without
-   committing, crashed, was re-dispatched, hit a contradiction, or produced a
-   finding that contradicts the surface.
-4. **One full end-to-end trace** — pick a single proposal and follow it to
-   landed commits, reading everything on that path (§6, C1).
+1. Every participant's launching brief.
+2. Every worker's final assistant message and corresponding supervisor gate.
+3. Every case-study-agent session, including renewals.
+4. Every outlier: crash, uncommitted stop, re-dispatch, contradiction, capture
+   gap, or claim conflicting with a higher tier.
+5. Every hop in C1.
+6. Every source used for a C4 entry.
 
-**Disclose your sampling.** If you read 12 of 40 transcripts, say which 12 and
-why. An audit that silently samples reads as comprehensive and is not.
+For remaining middle transcript material, order sessions by start time within
+`(provider, package)` strata. Include the first and last session per stratum,
+then every `ceil(remaining_sessions / remaining_slots)`th session until the
+budget is exhausted. Record the divisor and selected session IDs.
+
+**Disclose the calculation and the omissions.** Method and Coverage must state the
+total population, mandatory items read, full transcripts and reasons, deterministic
+calculation, every skipped or partial source, ceilings reached, raw-log and diff
+escalations, and capture-health gaps. An audit that silently samples reads as
+comprehensive and is not.
+
+### 3.5 Scoring clean runs
+
+The following rule governs every row in Parts A and B. Incident-dependent examples
+are corroborating evidence, not prerequisites for a 4. Score observed opportunities
+and inspectable, load-bearing mechanisms. A 4 means every applicable observed
+opportunity was handled correctly and the controlling mechanism is independently
+verifiable. If the triggering condition never occurred and no mechanism is
+inspectable, record `N/O`, explain why, and exclude the row from the numeric
+denominator. Do not award or deny points for an incident the run never had.
+
+```text
+Adjusted percentage = points earned / (4 × (total rows - N/O rows)) × 100
+```
+
+The scorecard displays points earned, maximum applicable points, `N/O` count, and
+adjusted percentage.
 
 ---
 
@@ -229,8 +345,10 @@ needs at least one citation (`agent_id` + quoted line, or `file:line`, or commit
   numbers passed forward. For each, did the receiving agent verify it? Was any
   stale value acted on? Did any *correct* re-derivation get overruled?
 - **0:** Stale values acted on, producing wrong work. **2:** Verified sometimes,
-  by habit not instruction. **4:** Re-derivation was instructed and performed,
-  and at least one stale value was caught.
+  by habit not instruction. **4:** Every applicable inherited value was re-derived
+  through an inspectable method, and the instruction or guard requiring that check
+  is independently verifiable; catching a stale value is corroboration, not a
+  prerequisite.
 
 ### A4. Scope discipline
 *Did agents stay inside their package, and refuse work that wasn't theirs?*
@@ -238,8 +356,9 @@ needs at least one citation (`agent_id` + quoted line, or `file:line`, or commit
   Did any agent edit another package's files? Did any agent *correctly refuse*
   and report instead? Did anyone "helpfully" fix a foreign failing test?
 - **0:** Agents freely edited outside scope. **2:** Mostly in-scope; drift
-  unremarked. **4:** In-scope, with at least one documented correct refusal
-  routed to the right owner.
+  unremarked. **4:** Every applicable touch stayed in scope, the controlling scope
+  boundary was inspectable, and any encountered out-of-scope request was refused
+  and routed correctly; an actual refusal is not required if no such request occurred.
 
 ### A5. Honesty and claim calibration
 *Did agents distinguish what they proved from what they assumed?*
@@ -255,10 +374,14 @@ needs at least one citation (`agent_id` + quoted line, or `file:line`, or commit
 *When blocked, did agents stop cleanly or improvise?*
 - **Probes:** Find every blocked/stalled/crashed agent. Did it stop **without
   committing** and report, or partially commit? Was the block a real
-  spec/tree contradiction, or misreading? Was recovery cheap?
+  spec/tree contradiction, or misreading? Was recovery cheap? If no failure
+  occurred, is there an inspectable mechanism that requires a clean stop and
+  bounded recovery?
 - **0:** Blocked agents committed partial work or thrashed. **2:** Stopped, but
-  the reason needed reconstruction. **4:** Stopped cleanly, named the
-  contradiction, left the tree clean, recovery was a single re-dispatch.
+  the reason needed reconstruction. **4:** Every observed failure stopped cleanly,
+  named the contradiction, preserved the tree, and recovered within the documented
+  mechanism. If no failure occurred, score 4 only when that mechanism is inspectable;
+  otherwise record `N/O`.
 
 ### A7. Gating rigor (the supervisor's own performance)
 *Was returned work checked against the tree, or accepted on its summary?*
@@ -267,18 +390,27 @@ needs at least one citation (`agent_id` + quoted line, or `file:line`, or commit
   tier-1 evidence contradicts? Were cross-plan/boundary constraints actually
   re-checked, not assumed?
 - **0:** Gates were restatements of worker summaries. **2:** Spot-checked.
-  **4:** Every gate cited independent tier-1 evidence; at least one caught
-  something.
+  **4:** Every gate cited independent tier-1 evidence and applied an inspectable
+  acceptance mechanism; catching a defect is corroboration, not a prerequisite.
 
-### A8. Plan-bound writeback discipline
-*Did plan-dispatched agents produce the durable trail the surface needs?*
-- **Probes:** Did plan-bound workers flip their checkboxes and emit the
-  `PLAN-EVENT` sentinel? Were `writeCounts` non-zero for sections that were
-  actually worked? **Critically:** was any worker ever pointed at the
-  system-owned Execution Trail (`sec_exectr`)? That yields intent-only turns —
-  nothing materializes. Was the one-writer policy respected (or 409-enforced)?
-- **0:** No writeback; trail empty despite real work. **2:** Inconsistent.
-  **4:** Every plan-bound turn produced trail lines and visible checkmarks.
+### A8. Durable lifecycle and handoff discipline
+*Did plan-bound work leave a reconstructable trail through supported surfaces
+while respecting ownership boundaries?*
+- **Probes:** Did `plan.json` record assignment and lifecycle through the manifest
+  helper? Do PLAN-INTENT and PLAN-INTEGRATION markers link active decisions to
+  outputs? Did workers return evidence without mutating supervisor-owned plan state?
+  Did the responsible supervisor perform integration and ARC freshness updates?
+  Can worker turns and gates connect to packages and commits through supported,
+  server-witnessed records? Were ownership conflicts refused or system-enforced?
+- **0:** Ownership or lifecycle state is missing or misleading, and the work cannot
+  be connected to its plan without participant explanation. **2:** The chain is
+  reconstructable, but some handoffs, integrations, or freshness signals require
+  inference. **4:** Assignment, intent, returned output, integration, gate, and
+  commit linkage are explicit for every applicable hop; ownership boundaries are
+  respected; gaps are visibly signaled.
+
+Do not score `PLAN-EVENT` emission, `writeCounts`, `sec_exectr`, generated Execution
+Trail lines, or per-turn checkmarks. They belong to the retired section surface.
 
 ---
 
@@ -358,8 +490,9 @@ needs at least one citation (`agent_id` + quoted line, or `file:line`, or commit
   collision it caught, a package it re-cut? Or did the output restate the input
   in more words? Compare its cost (agents, turns, tokens) against that delta.
 - **0:** Deliberation produced no traceable change — pure ceremony. **2:**
-  Refinements only. **4:** Demonstrably changed the plan in a way that prevented
-  a real defect.
+  Refinements only. **4:** Demonstrably changed the plan through an inspectable
+  decision or guard that materially improved the outcome; a defect need not have
+  occurred for the mechanism's value to be shown.
 
 ### B9. Guard durability
 *Do the rules the surface installed survive contact with future agents?*
@@ -408,9 +541,12 @@ producing a report, not a ruling) named
 `YYYY-MM-DD-planning-surface-audit.md`, containing:
 
 1. **Verdict** — ≤10 lines. Did the surface earn its cost? Top three defects.
-2. **Method and coverage** — what you read, what you sampled, what you skipped,
-   and what you could not determine (including capture-health gaps).
-3. **Scorecard** — table of A1–A8, B1–B9 with score and one-line justification.
+2. **Method and coverage** — what you read, the deterministic sampling calculation,
+   what you skipped, ceilings and escalations reached, capture-health gaps, and every
+   participant interview required by §2.2.
+3. **Scorecard** — table of A1–A8, B1–B9 with score or `N/O`, one-line
+   justification, points earned, maximum applicable points, `N/O` count, and adjusted
+   percentage from §3.5.
 4. **Findings** — each with: severity (critical/major/minor), evidence tier,
    citations (`agent_id`, `file:line`, commit sha), and what it would take to
    confirm or refute. **Rank most severe first.**
@@ -420,6 +556,13 @@ producing a report, not a ruling) named
    *fix the surface* from *fix the briefs* from *fix the agents' instructions*.
 8. **Open questions** — what you would need to ask a participant, and why the
    record could not answer it.
+9. **Conflict of Interest** — the rubric and calibration author and that author's
+   audited-run role; every auditor ID/provider and eligibility result; any prior
+   exposure to expected findings; and any compromised/replaced packet or accepted
+   exception. State the residual enforcement gap from §2.13.
+10. **Calibration seal/unseal record** — calibration-file SHA-256, seal and unseal
+    timestamps, the independent baseline hash, and every `[post-calibration lead]`
+    investigation or score change with why it was absent from the independent pass.
 
 **Every score needs at least one citation.** An uncited score is an opinion, and
 opinions do not survive the next disagreement.
@@ -449,35 +592,13 @@ These make an audit worthless. Check yourself against them before submitting:
 
 ## Appendix — Calibration set (verify independently; do NOT treat as answers)
 
-Claims from the 2026-08-06 two-plan run, recorded by a participant supervisor
-(`ae889b24`) and therefore **not disinterested**. Use them to check your method
-is sensitive enough to find real events. **If you cannot independently reproduce
-one, that discrepancy is itself a finding — including the possibility that the
-claim is wrong.**
+This is the calibration set of participant-recorded claims from the 2026-08-06
+two-plan run, retained only to calibrate the audit method's sensitivity. Under the
+**sealed-calibration protocol**, it is withheld until the lead auditor's independent
+baseline is locked and hashed.
 
-- Two packages were mis-scoped by dispatching from a machine block when the prose
-  Files list was authoritative; the document itself said the block was
-  provisional. (Tests B5, A2.)
-- A brief carried a stale inherited count — "~10 call sites in four named files"
-  — where the real number was zero in all four. Re-derivation caught it.
-  (Tests A3.)
-- One brief contained mutually exclusive instructions about deleting a function;
-  the worker chose one reading, leaving two identity derivations live in the tree
-  for a period. (Tests A2, B1.)
-- Four separate workers encountered the same failing foreign test and each
-  correctly refused to fix it, until it was formally assigned. (Tests A4.)
-- A final gate package reported three of its fifteen items as "fixture-proven
-  only; deployment unproven until human restart" rather than claiming them.
-  (Tests A5.)
-- A proposal sat untracked on disk for days before being committed, and at the
-  time of writing at least one proposal in `.lares/proposals/` has **no
-  `artifact_id`**, so the promote gesture refuses it. Several existing
-  `artifact_id` values do not match the stated `prop_` + 8-hex contract.
-  (Tests B1, B7.)
-- Memory index cap pressure caused two supervisors to edit one shared file
-  concurrently. (Tests B4, B7.)
-
-Treat every line above as a claim to be checked, not a conclusion to be repeated.
+- **Sealed file:** `supplements/audit-calibration-set.md`
+- **Recorded SHA-256:** `eb63a67336e0c73852a5c110e1a75de295c82e7d4cef9dbf509b4be047b39f9f`
 
 ---
 
