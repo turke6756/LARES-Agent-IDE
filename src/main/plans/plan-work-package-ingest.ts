@@ -17,11 +17,22 @@ export const PLAN_WORK_PACKAGE_MAX_BYTES = 1_000_000;
 
 const TOP_LEVEL_KEYS = new Set(['schema_version', 'plan_artifact_id', 'packages']);
 const PACKAGE_KEYS = new Set([
-  'id', 'order', 'title', 'initial_state', 'acceptance_conditions', 'paths', 'depends_on',
+  'id', 'order', 'title', 'initial_state', 'acceptance_conditions', 'paths', 'depends_on', 'reachability',
 ]);
 const PATH_KEYS = new Set(['path', 'intent_kind']);
 const INTENT_KINDS = new Set(['create', 'edit', 'delete', 'verify']);
+const REACHABILITY_NONE_KEYS = new Set(['kind', 'rationale']);
+const REACHABILITY_BEHAVIOR_KEYS = new Set(['kind', 'entry_seam_links', 'production_constructs']);
+const ENTRY_SEAM_LINK_KEYS = new Set([
+  'seam_kind', 'path', 'symbol', 'entering_test', 'mutation', 'verification',
+]);
+const PRODUCTION_CONSTRUCT_KEYS = new Set([
+  'name', 'producer_path', 'producer_symbol', 'consumer_path', 'entering_test', 'mutation', 'verification',
+]);
+const VERIFICATION_KEYS = new Set(['target', 'expect_failure']);
+const SEAM_KINDS = new Set(['ipc', 'preload', 'route', 'ui-caller', 'job', 'other']);
 const PACKAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const REACHABILITY_STRING_MAX_LENGTH = 300;
 
 export type PlanWorkPackageDiagnosticCode =
   | 'manifest-invalid'
@@ -39,6 +50,7 @@ export type PlanWorkPackageDiagnosticCode =
   | 'json-invalid'
   | 'schema-invalid'
   | 'package-invalid'
+  | 'reachability-invalid'
   | 'dependency-invalid'
   | 'prose-mismatch'
   | 'apply-conflict'
@@ -51,10 +63,52 @@ export interface PlanWorkPackageDiagnostic {
   packageId?: string;
 }
 
+export interface PlanWorkPackageReachabilityVerification {
+  target: string;
+  expect_failure: string;
+}
+
+export interface PlanWorkPackageEntrySeamLink {
+  seam_kind: 'ipc' | 'preload' | 'route' | 'ui-caller' | 'job' | 'other';
+  path: string;
+  symbol: string;
+  entering_test: string;
+  mutation: string;
+  verification: PlanWorkPackageReachabilityVerification;
+}
+
+export interface PlanWorkPackageProductionConstruct {
+  name: string;
+  producer_path: string;
+  producer_symbol: string;
+  consumer_path: string;
+  entering_test: string;
+  mutation: string;
+  verification: PlanWorkPackageReachabilityVerification;
+}
+
+export type PlanWorkPackageReachability =
+  | { kind: 'none'; rationale: string }
+  | {
+    kind: 'behavior';
+    entry_seam_links: PlanWorkPackageEntrySeamLink[];
+    production_constructs: PlanWorkPackageProductionConstruct[];
+  };
+
+export type PlanWorkPackageReachabilityValidationResult =
+  | { ok: true; value: PlanWorkPackageReachability }
+  | { ok: false; detail: string };
+
+export interface ParsedPlanWorkPackageInput extends ReconciledPlanWorkPackageInput {
+  schemaVersion: 1 | 2;
+  reachability?: PlanWorkPackageReachability;
+}
+
 export interface ParsedPlanWorkPackageProjection {
   planArtifactId: string;
+  schemaVersion: 1 | 2;
   projectionHash: string;
-  packages: ReconciledPlanWorkPackageInput[];
+  packages: ParsedPlanWorkPackageInput[];
 }
 
 export type ParsePlanWorkPackageDocumentResult =
@@ -115,6 +169,94 @@ function exactKeys(value: Record<string, unknown>, allowed: Set<string>): string
   return Object.keys(value).find((key) => !allowed.has(key)) ?? null;
 }
 
+function boundedTrimmedString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+    && value.length <= REACHABILITY_STRING_MAX_LENGTH && value.trim() === value;
+}
+
+function validateVerification(value: unknown): PlanWorkPackageReachabilityVerification | null {
+  if (!isRecord(value) || exactKeys(value, VERIFICATION_KEYS)
+      || !boundedTrimmedString(value.target) || !boundedTrimmedString(value.expect_failure)) return null;
+  return { target: value.target, expect_failure: value.expect_failure };
+}
+
+/** Shared normalizer for the PLAN-WORK-PACKAGES:v2 reachability contract. */
+export function validatePlanWorkPackageReachability(
+  value: unknown,
+): PlanWorkPackageReachabilityValidationResult {
+  if (!isRecord(value)) return { ok: false, detail: 'reachability must be an object' };
+  if (value.kind === 'none') {
+    const unknown = exactKeys(value, REACHABILITY_NONE_KEYS);
+    if (unknown) return { ok: false, detail: `unknown reachability key ${unknown} for kind none` };
+    if (!boundedTrimmedString(value.rationale)) {
+      return { ok: false, detail: 'reachability kind none requires a non-empty rationale of at most 300 characters' };
+    }
+    return { ok: true, value: { kind: 'none', rationale: value.rationale } };
+  }
+  if (value.kind !== 'behavior') return { ok: false, detail: 'reachability kind must be behavior or none' };
+  const unknown = exactKeys(value, REACHABILITY_BEHAVIOR_KEYS);
+  if (unknown) return { ok: false, detail: `unknown reachability key ${unknown} for kind behavior` };
+  if (!Array.isArray(value.entry_seam_links) || value.entry_seam_links.length === 0) {
+    return { ok: false, detail: 'behavior reachability requires a non-empty entry_seam_links array' };
+  }
+  if (!Array.isArray(value.production_constructs)) {
+    return { ok: false, detail: 'behavior reachability requires a production_constructs array' };
+  }
+
+  const entrySeamLinks: PlanWorkPackageEntrySeamLink[] = [];
+  for (const link of value.entry_seam_links) {
+    if (!isRecord(link) || exactKeys(link, ENTRY_SEAM_LINK_KEYS)) {
+      return { ok: false, detail: 'invalid entry_seam_links entry' };
+    }
+    const normalizedPath = normalizedPlanPath(link.path);
+    const enteringTest = normalizedPlanPath(link.entering_test);
+    const mutation = normalizedPlanPath(link.mutation);
+    const verification = validateVerification(link.verification);
+    if (typeof link.seam_kind !== 'string' || !SEAM_KINDS.has(link.seam_kind)
+        || normalizedPath === null || enteringTest === null || mutation === null
+        || !boundedTrimmedString(link.symbol) || verification === null) {
+      return { ok: false, detail: 'invalid entry_seam_links entry' };
+    }
+    entrySeamLinks.push({
+      seam_kind: link.seam_kind as PlanWorkPackageEntrySeamLink['seam_kind'],
+      path: normalizedPath,
+      symbol: link.symbol,
+      entering_test: enteringTest,
+      mutation,
+      verification,
+    });
+  }
+
+  const productionConstructs: PlanWorkPackageProductionConstruct[] = [];
+  for (const construct of value.production_constructs) {
+    if (!isRecord(construct) || exactKeys(construct, PRODUCTION_CONSTRUCT_KEYS)) {
+      return { ok: false, detail: 'invalid production_constructs entry' };
+    }
+    const producerPath = normalizedPlanPath(construct.producer_path);
+    const consumerPath = normalizedPlanPath(construct.consumer_path);
+    const enteringTest = normalizedPlanPath(construct.entering_test);
+    const mutation = normalizedPlanPath(construct.mutation);
+    const verification = validateVerification(construct.verification);
+    if (producerPath === null || consumerPath === null || enteringTest === null || mutation === null
+        || !boundedTrimmedString(construct.name) || !boundedTrimmedString(construct.producer_symbol)
+        || verification === null) {
+      return { ok: false, detail: 'invalid production_constructs entry' };
+    }
+    productionConstructs.push({
+      name: construct.name,
+      producer_path: producerPath,
+      producer_symbol: construct.producer_symbol,
+      consumer_path: consumerPath,
+      entering_test: enteringTest,
+      mutation,
+      verification,
+    });
+  }
+  return { ok: true, value: {
+    kind: 'behavior', entry_seam_links: entrySeamLinks, production_constructs: productionConstructs,
+  } };
+}
+
 function parseFrontmatter(body: string): Record<string, string> | null {
   const normalized = body.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
   if (!normalized.startsWith('---\n')) return null;
@@ -144,7 +286,7 @@ function normalizedPlanPath(value: unknown): string | null {
 }
 
 function visiblePackageProse(body: string): string {
-  return body.replace(/<!--PLAN-WORK-PACKAGES:v1[\s\S]*?-->/g, '').replace(/\r\n/g, '\n');
+  return body.replace(/<!--PLAN-WORK-PACKAGES:v[12][\s\S]*?-->/g, '').replace(/\r\n/g, '\n');
 }
 
 function recognizedProsePackageHeadings(visible: string): RegExpMatchArray[] {
@@ -227,13 +369,14 @@ export function parsePlanWorkPackageDocument(
     return invalid('identity-mismatch', 'frontmatter plan_artifact_id does not match plan.json', sourceRelPath);
   }
 
-  const starts = [...body.matchAll(/<!--PLAN-WORK-PACKAGES:v1\b/g)];
-  const blocks = [...body.matchAll(/<!--PLAN-WORK-PACKAGES:v1\s*([\s\S]*?)-->/g)];
-  if (starts.length === 0) return invalid('block-missing', 'PLAN-WORK-PACKAGES:v1 block is missing', sourceRelPath);
+  const starts = [...body.matchAll(/<!--PLAN-WORK-PACKAGES:v([12])\b/g)];
+  const blocks = [...body.matchAll(/<!--PLAN-WORK-PACKAGES:v([12])\s*([\s\S]*?)-->/g)];
+  if (starts.length === 0) return invalid('block-missing', 'PLAN-WORK-PACKAGES block is missing', sourceRelPath);
   if (starts.length !== 1 || blocks.length !== 1) {
-    return invalid('block-ambiguous', 'exactly one complete PLAN-WORK-PACKAGES:v1 block is required', sourceRelPath);
+    return invalid('block-ambiguous', 'exactly one complete PLAN-WORK-PACKAGES:v1 or v2 block is required', sourceRelPath);
   }
-  const block = blocks[0][1];
+  const sentinelVersion = Number(blocks[0][1]) as 1 | 2;
+  const block = blocks[0][2];
   if (Buffer.byteLength(block, 'utf8') > PLAN_WORK_PACKAGE_MAX_BYTES) {
     return invalid('block-oversized', `machine block exceeds ${PLAN_WORK_PACKAGE_MAX_BYTES} bytes`, sourceRelPath);
   }
@@ -247,7 +390,8 @@ export function parsePlanWorkPackageDocument(
   const unknownTop = exactKeys(raw, TOP_LEVEL_KEYS);
   if (unknownTop) return invalid('schema-invalid', `unknown top-level key ${unknownTop}`, sourceRelPath);
   if (rejectArrowStrings(raw)) return invalid('schema-invalid', 'strings may not contain -->', sourceRelPath);
-  if (raw.schema_version !== 1 || raw.plan_artifact_id !== expectedPlanArtifactId
+  if ((raw.schema_version !== 1 && raw.schema_version !== 2)
+      || raw.schema_version !== sentinelVersion || raw.plan_artifact_id !== expectedPlanArtifactId
       || raw.plan_artifact_id !== frontmatter.plan_artifact_id) {
     return invalid('identity-mismatch', 'schema version or block/frontmatter/manifest identity does not match', sourceRelPath);
   }
@@ -255,7 +399,8 @@ export function parsePlanWorkPackageDocument(
     return invalid('schema-invalid', 'packages must be a non-empty array', sourceRelPath);
   }
 
-  type Validated = ReconciledPlanWorkPackageInput & { dependsOn: string[] };
+  const schemaVersion = raw.schema_version;
+  type Validated = ParsedPlanWorkPackageInput & { dependsOn: string[] };
   const packages: Validated[] = [];
   const ids = new Set<string>();
   const orders = new Set<number>();
@@ -303,12 +448,21 @@ export function parsePlanWorkPackageDocument(
     if (new Set(dependsOn).size !== dependsOn.length || dependsOn.includes(folded)) {
       return invalid('dependency-invalid', `duplicate or self dependency for ${localId}`, sourceRelPath, localId);
     }
+    let reachability: PlanWorkPackageReachability | undefined;
+    if (schemaVersion === 2) {
+      const validation = validatePlanWorkPackageReachability(item.reachability);
+      if (!validation.ok) {
+        return invalid('reachability-invalid', validation.detail, sourceRelPath, localId);
+      }
+      reachability = validation.value;
+    }
     const canonicalContent = {
       acceptance_conditions: item.acceptance_conditions,
       depends_on: dependsOn,
       id: folded,
       initial_state: item.initial_state,
       paths: paths.map((entry) => ({ intent_kind: entry.intentKind ?? null, path: entry.path })),
+      ...(schemaVersion === 2 ? { reachability } : {}),
       title: item.title,
     };
     packages.push({
@@ -320,6 +474,8 @@ export function parsePlanWorkPackageDocument(
       contentHash: sha256(canonicalJson(canonicalContent)),
       sortOrder: item.order as number,
       paths,
+      schemaVersion,
+      ...(reachability ? { reachability } : {}),
       dependsOn,
     });
     ids.add(folded);
@@ -367,7 +523,9 @@ export function parsePlanWorkPackageDocument(
     paths: pkg.paths,
     title: pkg.title,
   }))));
-  return { ok: true, projection: { planArtifactId: expectedPlanArtifactId, projectionHash, packages: ordered } };
+  return { ok: true, projection: {
+    planArtifactId: expectedPlanArtifactId, schemaVersion, projectionHash, packages: ordered,
+  } };
 }
 
 function statToken(stat: fs.Stats): string {
@@ -407,7 +565,7 @@ function locateSource(folderAbs: string): LocatedSource {
     // what keeps malformed replacements fail-closed after an earlier apply.
     const claimsWorkPackages = frontmatter?.kind === 'work-packages'
       || /^kind:\s*work-packages\s*$/m.test(body.replace(/\r\n/g, '\n'))
-      || body.includes('<!--PLAN-WORK-PACKAGES:v1');
+      || /<!--PLAN-WORK-PACKAGES:v[12]\b/.test(body);
     if (claimsWorkPackages) candidates.push({ absPath, sourceRelPath, body, token: statToken(stat) });
   }
   if (candidates.length === 0) return { ok: false, absent: true, diagnostics: [{ code: 'source-absent', detail: 'no work-packages supplement is present' }] };

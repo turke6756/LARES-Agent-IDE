@@ -75,6 +75,7 @@ type PackageSpec = {
   acceptance_conditions: string[];
   paths: Array<{ path: string; intent_kind?: 'create' | 'edit' | 'delete' | 'verify' }>;
   depends_on: string[];
+  reachability?: import('./plan-work-package-ingest').PlanWorkPackageReachability;
 };
 
 function spec(over: Partial<PackageSpec> = {}): PackageSpec {
@@ -86,15 +87,40 @@ function spec(over: Partial<PackageSpec> = {}): PackageSpec {
 }
 
 function document(packages: PackageSpec[], over: {
-  artifactId?: string; jsonText?: string; prose?: string;
+  artifactId?: string; jsonText?: string; prose?: string; schemaVersion?: 1 | 2;
 } = {}): string {
   const artifactId = over.artifactId ?? 'plan_fixture';
-  const projection = over.jsonText ?? JSON.stringify({ schema_version: 1,
+  const schemaVersion = over.schemaVersion ?? 1;
+  const projection = over.jsonText ?? JSON.stringify({ schema_version: schemaVersion,
     plan_artifact_id: artifactId, packages }, null, 2);
   const prose = over.prose
     ?? packages.map((pkg) => `## ${pkg.id} - ${pkg.title}\n\n**Accept**\n- fixture`).join('\n\n');
   return `---\nplan_artifact_id: ${artifactId}\nkind: work-packages\n---\n\n`
-    + `<!--PLAN-WORK-PACKAGES:v1\n${projection}\n-->\n\n${prose}\n`;
+    + `<!--PLAN-WORK-PACKAGES:v${schemaVersion}\n${projection}\n-->\n\n${prose}\n`;
+}
+
+function behaviorReachability(over: Record<string, unknown> = {}) {
+  return {
+    kind: 'behavior' as const,
+    entry_seam_links: [{
+      seam_kind: 'ipc' as const,
+      path: 'src/main/ipc.ts',
+      symbol: 'registerHandler',
+      entering_test: 'src/main/ipc.test.ts',
+      mutation: 'reachability-mutations/ipc.patch',
+      verification: { target: 'ipc-registration', expect_failure: 'REACHABILITY:ipc' },
+    }],
+    production_constructs: [{
+      name: 'candidate token',
+      producer_path: 'src/main/candidate-service.ts',
+      producer_symbol: 'mintCandidateToken',
+      consumer_path: 'src/main/coordinator.ts',
+      entering_test: 'src/main/production-chain.test.ts',
+      mutation: 'reachability-mutations/token.patch',
+      verification: { target: 'candidate-token-mint', expect_failure: 'REACHABILITY:token' },
+    }],
+    ...over,
+  };
 }
 
 function context() {
@@ -187,6 +213,50 @@ test('valid projection has casing-stable ids and distinct content/projection has
   assert.equal(firstA.contentHash, reorderedA.contentHash, 'order is excluded from content digest');
   assert.notEqual(first.projection.projectionHash, reordered.projection.projectionHash,
     'order is included in projection digest');
+});
+
+test('v2 requires reachability and reports reachability-invalid when it is missing', () => {
+  const result = ingest.parsePlanWorkPackageDocument(
+    document([spec()], { schemaVersion: 2 }), 'plan_fixture');
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostics[0].code, 'reachability-invalid');
+    assert.equal(result.diagnostics[0].packageId, 'WP-A');
+  }
+});
+
+test('well-formed v2 behavior reachability is normalized and projected', () => {
+  const result = ingest.parsePlanWorkPackageDocument(document([
+    spec({ reachability: behaviorReachability() }),
+  ], { schemaVersion: 2 }), 'plan_fixture');
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.projection.schemaVersion, 2);
+  assert.equal(result.projection.packages[0].schemaVersion, 2);
+  assert.deepEqual(result.projection.packages[0].reachability, behaviorReachability());
+});
+
+test('v2 reachability participates in the package content hash', () => {
+  const first = ingest.parsePlanWorkPackageDocument(document([
+    spec({ reachability: behaviorReachability() }),
+  ], { schemaVersion: 2 }), 'plan_fixture');
+  const edited = ingest.parsePlanWorkPackageDocument(document([
+    spec({ reachability: behaviorReachability({ production_constructs: [] }) }),
+  ], { schemaVersion: 2 }), 'plan_fixture');
+  assert.equal(first.ok, true);
+  assert.equal(edited.ok, true);
+  if (!first.ok || !edited.ok) return;
+  assert.notEqual(first.projection.packages[0].contentHash, edited.projection.packages[0].contentHash);
+});
+
+test('v2 none reachability requires only a bounded non-empty rationale', () => {
+  const valid = ingest.validatePlanWorkPackageReachability({ kind: 'none', rationale: 'Documentation-only change.' });
+  assert.equal(valid.ok, true);
+  for (const value of [
+    { kind: 'none' },
+    { kind: 'none', rationale: ' ' },
+    { kind: 'none', rationale: 'reason', entry_seam_links: [] },
+  ]) assert.equal(ingest.validatePlanWorkPackageReachability(value).ok, false);
 });
 
 test('Outcome validation accepts a legacy package with no Outcome label', () => {
