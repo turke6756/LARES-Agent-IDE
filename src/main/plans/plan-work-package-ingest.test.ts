@@ -99,6 +99,12 @@ function document(packages: PackageSpec[], over: {
     + `<!--PLAN-WORK-PACKAGES:v${schemaVersion}\n${projection}\n-->\n\n${prose}\n`;
 }
 
+function reconciledDocument(packages: PackageSpec[], artifactId: string): string {
+  return document(packages.map((pkg) => ({ ...pkg, reachability: pkg.reachability
+    ?? { kind: 'none', rationale: 'Fixture changes no independently reachable behavior.' } })),
+  { artifactId, schemaVersion: 2 });
+}
+
 function behaviorReachability(over: Record<string, unknown> = {}) {
   return {
     kind: 'behavior' as const,
@@ -144,7 +150,7 @@ function writeManifest(ctx: ReturnType<typeof context>, events: unknown[] = []):
 
 function writePackages(ctx: ReturnType<typeof context>, packages: PackageSpec[], suffix = ''): string {
   const abs = path.join(ctx.folderAbs, 'supplements', 'work-packages.md');
-  fs.writeFileSync(abs, document(packages, { artifactId: ctx.artifactId }) + suffix);
+  fs.writeFileSync(abs, reconciledDocument(packages, ctx.artifactId) + suffix);
   return abs;
 }
 
@@ -392,7 +398,8 @@ test('one source race retries and a second race fails closed without applying', 
   let calls = 0;
   const result = reconcile(ctx, { beforeSourceRestat: (attempt: number) => {
     calls += 1;
-    if (attempt === 0) fs.writeFileSync(source, document([spec({ title: 'Retried package' })], { artifactId: ctx.artifactId }) + '\nchanged');
+    if (attempt === 0) fs.writeFileSync(source,
+      reconciledDocument([spec({ title: 'Retried package' })], ctx.artifactId) + '\nchanged');
   } });
   assert.equal(result.workPackages.status, 'synced');
   assert.equal(calls, 2);
@@ -601,7 +608,7 @@ test('watcher boot/change and explicit single-folder refresh share one projectio
   }));
   fs.writeFileSync(path.join(folderAbs, 'plan.md'), '# watcher\n');
   const source = path.join(folderAbs, 'supplements', 'work-packages.md');
-  fs.writeFileSync(source, document([spec()], { artifactId }));
+  fs.writeFileSync(source, reconciledDocument([spec()], artifactId));
 
   let bootSettled!: () => void;
   const bootCompletion = new Promise<void>((resolve) => { bootSettled = resolve; });
@@ -612,7 +619,8 @@ test('watcher boot/change and explicit single-folder refresh share one projectio
   assert.equal(dbm.getPlanFolderProjectionState(planId)?.wpStatus, 'synced');
   assert.equal(dbm.getPlanWorkPackage(`wp:${artifactId}:wp-a`)?.revision, 1);
 
-  fs.writeFileSync(source, document([spec({ title: 'Changed through watcher' })], { artifactId }) + '\nchanged');
+  fs.writeFileSync(source,
+    reconciledDocument([spec({ title: 'Changed through watcher' })], artifactId) + '\nchanged');
   await bootWatcher.reconcileWorkspace(workspace, false);
   assert.equal(dbm.getPlanWorkPackage(`wp:${artifactId}:wp-a`)?.title, 'Changed through watcher');
   assert.equal(dbm.getPlanWorkPackage(`wp:${artifactId}:wp-a`)?.revision, 2);
@@ -644,7 +652,8 @@ test('composite watcher signature converges overview creation, lower-mtime repla
   }));
   fs.writeFileSync(path.join(folderAbs, 'plan.md'), '# watcher\n');
   fs.writeFileSync(path.join(folderAbs, 'ARC.md'), '# newest managed file\n');
-  fs.writeFileSync(path.join(folderAbs, 'supplements', 'work-packages.md'), document([spec()], { artifactId }));
+  fs.writeFileSync(path.join(folderAbs, 'supplements', 'work-packages.md'),
+    reconciledDocument([spec()], artifactId));
   const watcherInstance = new watcher.PlanFolderWatcher();
   const boot = await watcherInstance.reconcileWorkspace(workspace, true);
   const planId = boot.settled[0].planId;

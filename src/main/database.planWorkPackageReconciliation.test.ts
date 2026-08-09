@@ -65,7 +65,7 @@ type PackageInput = {
   declaredState: 'ready' | 'blocked'; contentHash: string; sortOrder: number;
   paths: { path: string; intentKind?: string | null }[];
 };
-type MutationStage = 'plan-demotion' | 'packages' | 'paths' | 'layout' | 'lifecycle'
+type MutationStage = 'plan-demotion' | 'packages' | 'paths' | 'obligations' | 'layout' | 'lifecycle'
   | 'sources' | 'projection-state';
 type DbModule = typeof import('./database');
 let dbm: DbModule;
@@ -122,6 +122,7 @@ test('schema adds companions, overview columns, and the guarded intent binding',
   assert.deepEqual(columns('plan_work_packages'), [
     'id', 'workspace_id', 'plan_id', 'title', 'acceptance_condition', 'state',
     'assignee_agent_id', 'revision', 'created_at', 'updated_at', 'intent_id',
+    'schema_version', 'content_hash', 'projection_status',
   ]);
   assert.deepEqual(columns('plan_work_package_sources'), [
     'package_id', 'workspace_id', 'plan_id', 'source_rel_path', 'source_local_id',
@@ -275,7 +276,7 @@ test('runtime evidence ignores reconciler lifecycle but detects immutable packag
 });
 
 test('every mutation-stage fault rolls back the entire applied snapshot', () => {
-  const stages: MutationStage[] = ['plan-demotion', 'packages', 'paths', 'layout',
+  const stages: MutationStage[] = ['plan-demotion', 'packages', 'paths', 'obligations', 'layout',
     'lifecycle', 'sources', 'projection-state'];
   for (const stage of stages) {
     const ctx = context();

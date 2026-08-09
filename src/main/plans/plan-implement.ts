@@ -137,7 +137,7 @@ export interface PlanReadiness {
   planId: string;
   runState: string | null;
   packageCounts: Record<'ready' | 'blocked' | 'executing' | 'done' | 'archived', number>;
-  wpStatus: 'unpackaged' | 'synced' | 'invalid' | 'conflict' | null;
+  wpStatus: 'unpackaged' | 'synced' | 'invalid' | 'conflict' | 'legacy-unmigrated' | null;
   responsibilityStatus: 'valid' | 'absent' | 'invalid' | null;
   overviewStatus: 'absent' | 'synced' | 'invalid' | 'apply-error' | null;
   supervisorValid: boolean;

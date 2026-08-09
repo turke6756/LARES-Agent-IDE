@@ -84,6 +84,9 @@ type PlanWorkPackage = {
   workspaceId: string;
   planId: string;
   intentId: string | null;
+  schemaVersion: number | null;
+  contentHash: string | null;
+  projectionStatus: 'synced' | 'legacy-unmigrated' | null;
   title: string;
   acceptanceCondition: string | null;
   state: string;
@@ -105,7 +108,8 @@ let dbm: DbModule;
 
 function makePackage(over: Partial<PlanWorkPackage> = {}): PlanWorkPackage {
   return {
-    id: 'wp-1', workspaceId: 'ws-1', planId: 'plan-1', intentId: null, title: 'Work package',
+    id: 'wp-1', workspaceId: 'ws-1', planId: 'plan-1', intentId: null,
+    schemaVersion: null, contentHash: null, projectionStatus: null, title: 'Work package',
     acceptanceCondition: 'tests pass', state: 'ready', assigneeAgentId: null,
     revision: 1, createdAt: 1000, updatedAt: 1000,
     ...over,

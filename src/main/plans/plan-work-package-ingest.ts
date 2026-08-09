@@ -51,6 +51,7 @@ export type PlanWorkPackageDiagnosticCode =
   | 'schema-invalid'
   | 'package-invalid'
   | 'reachability-invalid'
+  | 'legacy-unmigrated'
   | 'dependency-invalid'
   | 'prose-mismatch'
   | 'apply-conflict'
@@ -118,7 +119,7 @@ export type ParsePlanWorkPackageDocumentResult =
 export interface PlanFolderProjectionReconcileResult {
   responsibility: ReturnType<typeof reconcilePlanResponsibility>;
   workPackages: {
-    status: 'synced' | 'unpackaged' | 'invalid' | 'conflict';
+    status: 'synced' | 'unpackaged' | 'invalid' | 'conflict' | 'legacy-unmigrated';
     diagnostics: PlanWorkPackageDiagnostic[];
     applyResult?: ApplyPlanWorkPackageSnapshotResult;
   };
@@ -774,6 +775,11 @@ export function reconcilePlanFolderPlanningState(input: {
         persistWpStatus({ workspaceId: input.workspaceId, planId: input.planId,
           status: 'conflict', diagnostics, reconciledAt });
         return complete({ status: 'conflict', diagnostics, applyResult });
+      }
+      if (applyResult.status === 'legacy-unmigrated') {
+        const diagnostics = applyResult.diagnostics.map((detail): PlanWorkPackageDiagnostic =>
+          ({ code: 'legacy-unmigrated', detail, sourceRelPath: located.source.sourceRelPath }));
+        return complete({ status: 'legacy-unmigrated', diagnostics, applyResult });
       }
       return complete({ status: 'synced', diagnostics: [], applyResult });
     } catch (err) {

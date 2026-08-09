@@ -1720,6 +1720,12 @@ function initContextOptimizerSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_plan_work_packages_plan ON plan_work_packages(plan_id);
   `);
   try { db.exec(`ALTER TABLE plan_work_packages ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
+  // Planning-surface mechanics WP-B2. These are source-projection attributes,
+  // deliberately plain columns rather than cascading foreign keys. NULL remains
+  // meaningful for unmanaged / pre-projection packages.
+  try { db.exec(`ALTER TABLE plan_work_packages ADD COLUMN schema_version INTEGER`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plan_work_packages ADD COLUMN content_hash TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plan_work_packages ADD COLUMN projection_status TEXT`); } catch { /* exists */ }
 
   // Save-card SC-WP-3B — package_finalizations (§5 of the shared bundle contract):
   // the finalization boundary frozen by an explicit human/supervisor plan-package
@@ -2284,6 +2290,44 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_dispatch_attempts_reconcile
     ON plan_dispatch_attempts(state, created_at)`);
 
+  // WP-B2 reachability declarations and proof evidence. These are intentionally
+  // FK-free: declarations/evidence are historical, code-state-bound records and
+  // must not disappear when a mutable package row is removed.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_wp_reachability_obligations (
+      id                  TEXT PRIMARY KEY,
+      package_id          TEXT NOT NULL,
+      package_content_hash TEXT NOT NULL,
+      schema_version      INTEGER NOT NULL,
+      obligation_kind     TEXT NOT NULL CHECK (obligation_kind IN ('entry-link','construct')),
+      ordinal             INTEGER NOT NULL,
+      declared_json       TEXT NOT NULL,
+      mutation_path       TEXT NOT NULL,
+      verification_target TEXT NOT NULL,
+      expect_failure_id   TEXT NOT NULL,
+      UNIQUE (package_id, package_content_hash, obligation_kind, ordinal)
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_wp_reachability_obligations_package
+      ON plan_wp_reachability_obligations (package_id, package_content_hash, obligation_kind, ordinal);
+
+    CREATE TABLE IF NOT EXISTS plan_wp_reachability_evidence (
+      id                          TEXT PRIMARY KEY,
+      obligation_id               TEXT NOT NULL,
+      package_content_hash         TEXT NOT NULL,
+      specimen_base_oid            TEXT NOT NULL,
+      specimen_tree_oid            TEXT NOT NULL,
+      mutation_blob_oid            TEXT NOT NULL,
+      baseline_result              TEXT NOT NULL,
+      mutated_result               TEXT NOT NULL,
+      failure_classification       TEXT NOT NULL,
+      verdict                      TEXT NOT NULL CHECK (verdict IN ('pass','fail','indeterminate')),
+      verification_target_version  TEXT NOT NULL,
+      verified_at                  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_wp_reachability_evidence_obligation
+      ON plan_wp_reachability_evidence (obligation_id, verified_at);
+  `);
+
   // Save-card intent architecture WP-1. Schema ships ahead of the projection and
   // remains additive for existing databases. execution_run_id is deliberately
   // nullable and otherwise unused until activity worktrees land in WP-5.
@@ -2509,6 +2553,86 @@ function initContextOptimizerSchema(): void {
       PRIMARY KEY (plan_id, tab)
     );
   `);
+
+  // Existing projection-state tables predate the v1 cutoff status. Rebuild only
+  // when their CHECK does not yet admit it, preserving every sibling projection
+  // column exactly as the house lifecycle-table migration does above.
+  const projectionStateSql = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'plan_folder_projection_state'`,
+  ).get() as { sql?: string } | undefined;
+  if (!projectionStateSql?.sql?.includes("'legacy-unmigrated'")) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE plan_folder_projection_state__new (
+          plan_id                       TEXT PRIMARY KEY REFERENCES plans(id) ON DELETE CASCADE,
+          workspace_id                  TEXT NOT NULL,
+          wp_status                     TEXT NOT NULL DEFAULT 'unpackaged'
+                                        CHECK (wp_status IN ('unpackaged','synced','invalid','conflict','legacy-unmigrated')),
+          wp_source_rel_path            TEXT,
+          wp_projection_hash            TEXT,
+          wp_diagnostics_json           TEXT NOT NULL DEFAULT '[]',
+          wp_reconciled_at              INTEGER,
+          responsibility_event_id       TEXT,
+          responsibility_status         TEXT NOT NULL DEFAULT 'absent'
+                                        CHECK (responsibility_status IN ('valid','absent','invalid')),
+          responsibility_detail         TEXT,
+          responsibility_reconciled_at  INTEGER,
+          overview_status               TEXT NOT NULL DEFAULT 'absent'
+                                        CHECK (overview_status IN ('absent','synced','invalid','apply-error')),
+          overview_source_hash          TEXT,
+          overview_diagnostics_json     TEXT NOT NULL DEFAULT '[]',
+          overview_reconciled_at         INTEGER,
+          overview_adoption_state       TEXT NOT NULL DEFAULT 'never-seen'
+                                        CHECK (overview_adoption_state IN ('never-seen','observed','projected'))
+        );
+        INSERT INTO plan_folder_projection_state__new
+          SELECT * FROM plan_folder_projection_state;
+        DROP TABLE plan_folder_projection_state;
+        ALTER TABLE plan_folder_projection_state__new RENAME TO plan_folder_projection_state;
+        CREATE INDEX idx_plan_folder_projection_workspace
+          ON plan_folder_projection_state(workspace_id, wp_status);
+      `);
+    })();
+  }
+
+  // The cutoff is a one-time server-owned snapshot, not a rolling allow-list.
+  // On the migration boot only, capture the exact v1 package/hash population;
+  // fresh installs record the empty snapshot and can never grandfather later v1.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_wp_legacy_grandfathers (
+      package_id       TEXT NOT NULL,
+      content_hash     TEXT NOT NULL,
+      schema_version   INTEGER NOT NULL CHECK (schema_version = 1),
+      grandfathered_at INTEGER NOT NULL,
+      PRIMARY KEY (package_id, content_hash, schema_version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_wp_legacy_grandfathers_package
+      ON plan_wp_legacy_grandfathers(package_id);
+  `);
+  const grandfatherMarker = 'wp_b2_v1_grandfather_snapshot';
+  if (!hasAppliedMigration(db, grandfatherMarker)) {
+    const grandfatheredAt = Date.now();
+    db.transaction(() => {
+      db.prepare(`
+        INSERT OR IGNORE INTO plan_wp_legacy_grandfathers
+          (package_id, content_hash, schema_version, grandfathered_at)
+        SELECT package_id, applied_hash, 1, ?
+          FROM plan_work_package_sources
+         WHERE source_format = 'structured-v1'
+      `).run(grandfatheredAt);
+      db.exec(`
+        UPDATE plan_work_packages
+           SET schema_version = 1,
+               content_hash = (SELECT applied_hash FROM plan_work_package_sources s
+                                WHERE s.package_id = plan_work_packages.id),
+               projection_status = 'synced'
+         WHERE id IN (SELECT package_id FROM plan_work_package_sources)
+           AND schema_version IS NULL
+      `);
+      db.prepare(`INSERT INTO applied_migrations (name, applied_at) VALUES (?, ?)`)
+        .run(grandfatherMarker, grandfatheredAt);
+    })();
+  }
 
   // WP-2B (Priority 0) — one-time, resumable workspace-lineage backfill. Populates
   // stream_lane_stats.workspace_id/workspace_root by folding each stream's launch cwd
@@ -5552,6 +5676,9 @@ export interface PlanWorkPackage {
   planId: string;
   /** Null/omitted only for legacy-unbound packages. */
   intentId?: string | null;
+  schemaVersion?: number | null;
+  contentHash?: string | null;
+  projectionStatus?: 'synced' | 'legacy-unmigrated' | null;
   title: string;
   acceptanceCondition: string | null;
   state: PlanWorkPackageState;
@@ -5567,6 +5694,9 @@ function rowToPlanWorkPackage(row: any): PlanWorkPackage {
     workspaceId: row.workspace_id,
     planId: row.plan_id,
     intentId: row.intent_id ?? null,
+    schemaVersion: row.schema_version ?? null,
+    contentHash: row.content_hash ?? null,
+    projectionStatus: row.projection_status ?? null,
     title: row.title,
     acceptanceCondition: row.acceptance_condition ?? null,
     state: row.state,
@@ -5581,17 +5711,22 @@ export function upsertPlanWorkPackage(pkg: PlanWorkPackage): void {
   run(
     `INSERT INTO plan_work_packages (
        id, workspace_id, plan_id, title, acceptance_condition, state,
-       assignee_agent_id, revision, created_at, updated_at, intent_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       assignee_agent_id, revision, created_at, updated_at, intent_id,
+       schema_version, content_hash, projection_status
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
-       workspace_id = excluded.workspace_id, plan_id = excluded.plan_id,
-       intent_id = COALESCE(excluded.intent_id, plan_work_packages.intent_id),
+        workspace_id = excluded.workspace_id, plan_id = excluded.plan_id,
+        intent_id = COALESCE(excluded.intent_id, plan_work_packages.intent_id),
+        schema_version = COALESCE(excluded.schema_version, plan_work_packages.schema_version),
+        content_hash = COALESCE(excluded.content_hash, plan_work_packages.content_hash),
+        projection_status = COALESCE(excluded.projection_status, plan_work_packages.projection_status),
        title = excluded.title, acceptance_condition = excluded.acceptance_condition,
        state = excluded.state, assignee_agent_id = excluded.assignee_agent_id,
        revision = excluded.revision, updated_at = excluded.updated_at`,
     [pkg.id, pkg.workspaceId, pkg.planId, pkg.title, pkg.acceptanceCondition,
       pkg.state, pkg.assigneeAgentId, pkg.revision, pkg.createdAt, pkg.updatedAt,
-      pkg.intentId ?? null],
+      pkg.intentId ?? null, pkg.schemaVersion ?? null, pkg.contentHash ?? null,
+      pkg.projectionStatus ?? null],
   );
 }
 
@@ -5703,6 +5838,9 @@ export function assignPlanWorkPackage(
   const pkg = getPlanWorkPackage(packageId);
   if (!pkg) throw new Error(`assignPlanWorkPackage: no package ${packageId}`);
   if (agentId !== null) {
+    if (pkg.projectionStatus === 'legacy-unmigrated') {
+      throw new Error(`assignPlanWorkPackage: package ${packageId} is legacy-unmigrated (quarantined)`);
+    }
     const ok = queryOne(
       `SELECT 1 AS ok FROM agents WHERE id = ? AND workspace_id = ?`,
       [agentId, pkg.workspaceId],
@@ -5865,6 +6003,9 @@ function transitionPlanWorkPackageStateInTransaction(
   }
   const pkg = getPlanWorkPackage(input.packageId);
   if (!pkg) throw new Error(`transitionPlanWorkPackageState: no package ${input.packageId}`);
+  if (input.toState === 'executing' && pkg.projectionStatus === 'legacy-unmigrated') {
+    throw new Error(`transitionPlanWorkPackageState: package ${input.packageId} is legacy-unmigrated (quarantined)`);
+  }
   if (pkg.state === 'done') {
     throw new Error(`transitionPlanWorkPackageState: package ${input.packageId} is done (terminal)`);
   }
@@ -5939,7 +6080,8 @@ export type PlanRunLifecycleState = 'active' | 'archived';
 // Planning-surface WP-B: disk work-package reconciliation.
 export type PlanWorkPackageReconcileState =
   | 'synced' | 'drift-conflict' | 'missing-pristine' | 'missing-conflict';
-export type PlanWorkPackageProjectionStatus = 'unpackaged' | 'synced' | 'invalid' | 'conflict';
+export type PlanWorkPackageProjectionStatus =
+  | 'unpackaged' | 'synced' | 'invalid' | 'conflict' | 'legacy-unmigrated';
 export type PlanOverviewProjectionStatus = 'absent' | 'synced' | 'invalid' | 'apply-error';
 export type PlanOverviewAdoptionState = 'never-seen' | 'observed' | 'projected';
 export type ReconciledPlanWorkPackageState = 'ready' | 'blocked';
@@ -6109,11 +6251,26 @@ export interface PlanWorkPackageRuntimeEvidence {
 export interface ReconciledPlanWorkPackageInput {
   id: string; sourceLocalId: string; title: string; acceptanceCondition: string | null;
   declaredState: ReconciledPlanWorkPackageState; contentHash: string; sortOrder: number;
+  /** Parser-owned callers always set this; omitted only by legacy test/store adapters. */
+  schemaVersion?: 1 | 2;
+  reachability?: {
+    kind: 'none' | 'behavior';
+    rationale?: string;
+    entry_seam_links?: readonly {
+      seam_kind: string; path: string; symbol: string; entering_test: string;
+      mutation: string; verification: { target: string; expect_failure: string };
+    }[];
+    production_constructs?: readonly {
+      name: string; producer_path: string; producer_symbol: string;
+      consumer_path: string; entering_test: string; mutation: string;
+      verification: { target: string; expect_failure: string };
+    }[];
+  };
   paths: readonly PlanWorkPackagePathInput[];
 }
 
 export type PlanWorkPackageApplyMutationStage =
-  | 'plan-demotion' | 'packages' | 'paths' | 'layout' | 'lifecycle' | 'sources'
+  | 'plan-demotion' | 'packages' | 'paths' | 'obligations' | 'layout' | 'lifecycle' | 'sources'
   | 'projection-state';
 
 export interface ApplyPlanWorkPackageSnapshotInput {
@@ -6124,7 +6281,9 @@ export interface ApplyPlanWorkPackageSnapshotInput {
 }
 
 export interface ApplyPlanWorkPackageSnapshotResult {
-  status: 'applied' | 'conflict'; diagnostics: string[]; demotedToHardening: boolean;
+  status: 'applied' | 'conflict' | 'legacy-unmigrated';
+  diagnostics: string[]; demotedToHardening: boolean;
+  quarantinedPackageIds?: string[];
 }
 
 function rowToPlanWorkPackageSource(row: any): PlanWorkPackageSource {
@@ -6703,7 +6862,8 @@ export function reconcilePlanResponsibility(
   })();
 }
 
-type NormalizedReconciledPackage = Omit<ReconciledPlanWorkPackageInput, 'paths'> & {
+type NormalizedReconciledPackage = Omit<ReconciledPlanWorkPackageInput, 'paths' | 'schemaVersion'> & {
+  schemaVersion: 1 | 2;
   paths: PlanWorkPackagePathInput[];
 };
 
@@ -6732,7 +6892,7 @@ function normalizeReconciledPackages(
       }
       return { path: normalized, intentKind: entry.intentKind ?? null };
     });
-    return { ...pkg, paths };
+    return { ...pkg, schemaVersion: pkg.schemaVersion ?? 2, paths };
   });
 }
 
@@ -6767,11 +6927,59 @@ function writeWorkPackageProjectionConflict(
   })();
 }
 
+function isGrandfatheredV1Package(packageId: string, contentHash: string): boolean {
+  return queryOne(
+    `SELECT 1 AS ok FROM plan_wp_legacy_grandfathers
+      WHERE package_id = ? AND content_hash = ? AND schema_version = 1`,
+    [packageId, contentHash],
+  ) !== null;
+}
+
+function reachabilityObligationId(
+  packageId: string, contentHash: string, kind: 'entry-link' | 'construct', ordinal: number,
+): string {
+  return `${packageId}:${contentHash}:${kind}:${ordinal}`;
+}
+
+function persistReachabilityObligations(pkg: NormalizedReconciledPackage): void {
+  if (pkg.schemaVersion !== 2 || pkg.reachability?.kind !== 'behavior') return;
+  const insert = (
+    kind: 'entry-link' | 'construct', ordinal: number,
+    declared: Record<string, unknown>, mutationPath: string,
+    verification: { target: string; expect_failure: string },
+  ): void => {
+    run(
+      `INSERT INTO plan_wp_reachability_obligations
+         (id, package_id, package_content_hash, schema_version, obligation_kind,
+          ordinal, declared_json, mutation_path, verification_target, expect_failure_id)
+       VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         declared_json = excluded.declared_json,
+         mutation_path = excluded.mutation_path,
+         verification_target = excluded.verification_target,
+         expect_failure_id = excluded.expect_failure_id`,
+      [reachabilityObligationId(pkg.id, pkg.contentHash, kind, ordinal), pkg.id,
+        pkg.contentHash, kind, ordinal, JSON.stringify(declared), mutationPath,
+        verification.target, verification.expect_failure],
+    );
+  };
+  (pkg.reachability.entry_seam_links ?? []).forEach((obligation, ordinal) =>
+    insert('entry-link', ordinal, obligation as unknown as Record<string, unknown>,
+      obligation.mutation, obligation.verification));
+  (pkg.reachability.production_constructs ?? []).forEach((obligation, ordinal) =>
+    insert('construct', ordinal, obligation as unknown as Record<string, unknown>,
+      obligation.mutation, obligation.verification));
+}
+
 /** Apply one complete, already-validated disk projection in one transaction. */
 export function applyPlanWorkPackageSnapshot(
   input: ApplyPlanWorkPackageSnapshotInput,
 ): ApplyPlanWorkPackageSnapshotResult {
   const packages = normalizeReconciledPackages(input.packages);
+  const quarantinedPackageIds = packages
+    .filter((pkg) => pkg.schemaVersion === 1 && !isGrandfatheredV1Package(pkg.id, pkg.contentHash))
+    .map((pkg) => pkg.id);
+  const quarantined = new Set(quarantinedPackageIds);
   const database = getDb();
   database.exec('BEGIN IMMEDIATE');
   let transactionOpen = true;
@@ -6830,7 +7038,8 @@ export function applyPlanWorkPackageSnapshot(
     database.exec('ROLLBACK');
     transactionOpen = false;
     writeWorkPackageProjectionConflict(input, packages, diagnostics);
-    return { status: 'conflict', diagnostics, demotedToHardening: false };
+    return { status: 'conflict', diagnostics, demotedToHardening: false,
+      ...(quarantinedPackageIds.length > 0 ? { quarantinedPackageIds } : {}) };
   }
 
   const afterStage = (stage: PlanWorkPackageApplyMutationStage): void => input.afterMutationStage?.(stage);
@@ -6847,15 +7056,25 @@ export function applyPlanWorkPackageSnapshot(
         run(
           `INSERT INTO plan_work_packages
              (id, workspace_id, plan_id, title, acceptance_condition, state,
-              assignee_agent_id, revision, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)`,
-          [pkg.id, input.workspaceId, input.planId, pkg.title, pkg.acceptanceCondition,
-            pkg.declaredState, input.reconciledAt, input.reconciledAt]);
-      } else if (current.source.appliedHash !== pkg.contentHash) {
-        run(`UPDATE plan_work_packages SET title = ?, acceptance_condition = ?,
-          revision = revision + 1, updated_at = ? WHERE id = ?`,
-        [pkg.title, pkg.acceptanceCondition, input.reconciledAt, current.package.id]);
-      }
+              assignee_agent_id, revision, created_at, updated_at,
+              schema_version, content_hash, projection_status)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, ?)`,
+           [pkg.id, input.workspaceId, input.planId, pkg.title, pkg.acceptanceCondition,
+             pkg.declaredState, input.reconciledAt, input.reconciledAt, pkg.schemaVersion,
+             pkg.contentHash, quarantined.has(pkg.id) ? 'legacy-unmigrated' : 'synced']);
+       } else if (current.source.appliedHash !== pkg.contentHash) {
+         run(`UPDATE plan_work_packages SET title = ?, acceptance_condition = ?,
+           revision = revision + 1, updated_at = ?, schema_version = ?, content_hash = ?,
+           projection_status = ? WHERE id = ?`,
+         [pkg.title, pkg.acceptanceCondition, input.reconciledAt, pkg.schemaVersion,
+           pkg.contentHash, quarantined.has(pkg.id) ? 'legacy-unmigrated' : 'synced',
+           current.package.id]);
+       } else {
+         run(`UPDATE plan_work_packages SET schema_version = ?, content_hash = ?,
+           projection_status = ? WHERE id = ?`,
+         [pkg.schemaVersion, pkg.contentHash,
+           quarantined.has(pkg.id) ? 'legacy-unmigrated' : 'synced', current.package.id]);
+       }
     }
     afterStage('packages');
 
@@ -6869,6 +7088,9 @@ export function applyPlanWorkPackageSnapshot(
         [pkg.id, input.workspaceId, entry.path, entry.intentKind ?? null, input.reconciledAt]);
     }
     afterStage('paths');
+
+    for (const pkg of packages) persistReachabilityObligations(pkg);
+    afterStage('obligations');
 
     for (const pkg of packages) {
       const current = byLocalId.get(pkg.sourceLocalId.toLocaleLowerCase('en-US'));
@@ -6933,20 +7155,171 @@ export function applyPlanWorkPackageSnapshot(
       `INSERT INTO plan_folder_projection_state
          (plan_id, workspace_id, wp_status, wp_source_rel_path, wp_projection_hash,
           wp_diagnostics_json, wp_reconciled_at)
-       VALUES (?, ?, 'synced', ?, ?, '[]', ?)
-       ON CONFLICT(plan_id) DO UPDATE SET wp_status = 'synced',
+       VALUES (?, ?, ?, ?, ?, '[]', ?)
+       ON CONFLICT(plan_id) DO UPDATE SET wp_status = excluded.wp_status,
          wp_source_rel_path = excluded.wp_source_rel_path,
          wp_projection_hash = excluded.wp_projection_hash, wp_diagnostics_json = '[]',
          wp_reconciled_at = excluded.wp_reconciled_at`,
-      [input.planId, input.workspaceId, input.sourceRelPath, input.projectionHash, input.reconciledAt]);
+      [input.planId, input.workspaceId,
+        quarantinedPackageIds.length > 0 ? 'legacy-unmigrated' : 'synced',
+        input.sourceRelPath, input.projectionHash, input.reconciledAt]);
     afterStage('projection-state');
     database.exec('COMMIT');
     transactionOpen = false;
-  return { status: 'applied', diagnostics: [], demotedToHardening };
+  return quarantinedPackageIds.length > 0
+    ? { status: 'legacy-unmigrated',
+      diagnostics: quarantinedPackageIds.map((id) => `legacy-unmigrated:${id}`),
+      demotedToHardening, quarantinedPackageIds }
+    : { status: 'applied', diagnostics: [], demotedToHardening };
   } catch (err) {
     if (transactionOpen) database.exec('ROLLBACK');
     throw err;
   }
+}
+
+export type PlanWpReachabilityObligationKind = 'entry-link' | 'construct';
+export interface PlanWpReachabilityObligation {
+  id: string; packageId: string; packageContentHash: string; schemaVersion: number;
+  obligationKind: PlanWpReachabilityObligationKind; ordinal: number;
+  declaredJson: string; mutationPath: string; verificationTarget: string;
+  expectFailureId: string;
+}
+
+export type PlanWpReachabilityVerdict = 'pass' | 'fail' | 'indeterminate';
+export interface PlanWpReachabilityEvidence {
+  id: string; obligationId: string; packageContentHash: string;
+  specimenBaseOid: string; specimenTreeOid: string; mutationBlobOid: string;
+  baselineResult: string; mutatedResult: string; failureClassification: string;
+  verdict: PlanWpReachabilityVerdict; verificationTargetVersion: string;
+  verifiedAt: number;
+}
+
+function rowToPlanWpReachabilityObligation(row: any): PlanWpReachabilityObligation {
+  return {
+    id: row.id, packageId: row.package_id, packageContentHash: row.package_content_hash,
+    schemaVersion: row.schema_version, obligationKind: row.obligation_kind,
+    ordinal: row.ordinal, declaredJson: row.declared_json, mutationPath: row.mutation_path,
+    verificationTarget: row.verification_target, expectFailureId: row.expect_failure_id,
+  };
+}
+
+function rowToPlanWpReachabilityEvidence(row: any): PlanWpReachabilityEvidence {
+  return {
+    id: row.id, obligationId: row.obligation_id,
+    packageContentHash: row.package_content_hash, specimenBaseOid: row.specimen_base_oid,
+    specimenTreeOid: row.specimen_tree_oid, mutationBlobOid: row.mutation_blob_oid,
+    baselineResult: row.baseline_result, mutatedResult: row.mutated_result,
+    failureClassification: row.failure_classification, verdict: row.verdict,
+    verificationTargetVersion: row.verification_target_version, verifiedAt: row.verified_at,
+  };
+}
+
+export function listPlanWpReachabilityObligations(
+  packageId: string, packageContentHash?: string,
+): PlanWpReachabilityObligation[] {
+  const hash = packageContentHash ?? getPlanWorkPackage(packageId)?.contentHash;
+  if (!hash) return [];
+  return queryAll(
+    `SELECT * FROM plan_wp_reachability_obligations
+      WHERE package_id = ? AND package_content_hash = ?
+      ORDER BY obligation_kind, ordinal, id`,
+    [packageId, hash],
+  ).map(rowToPlanWpReachabilityObligation);
+}
+
+export function listPlanWpReachabilityEvidence(
+  obligationId: string,
+): PlanWpReachabilityEvidence[] {
+  return queryAll(
+    `SELECT * FROM plan_wp_reachability_evidence
+      WHERE obligation_id = ? ORDER BY verified_at, id`,
+    [obligationId],
+  ).map(rowToPlanWpReachabilityEvidence);
+}
+
+const REACHABILITY_GIT_OID_RE = /^[0-9a-f]{40}$/i;
+
+/** Write one proof run's evidence atomically. Any invalid/mismatched row rejects
+ * the complete batch, so a partial set can never masquerade as run coverage. */
+export function insertPlanWpReachabilityEvidenceBatch(
+  evidenceRows: readonly PlanWpReachabilityEvidence[],
+): void {
+  getDb().transaction(() => {
+    for (const evidence of evidenceRows) {
+      const obligation = queryOne(
+        `SELECT package_content_hash FROM plan_wp_reachability_obligations WHERE id = ?`,
+        [evidence.obligationId],
+      ) as { package_content_hash: string } | null;
+      if (!obligation || obligation.package_content_hash !== evidence.packageContentHash) {
+        throw new Error(`insertPlanWpReachabilityEvidenceBatch: obligation/hash mismatch for ${evidence.obligationId}`);
+      }
+      for (const [field, oid] of [
+        ['specimenBaseOid', evidence.specimenBaseOid],
+        ['specimenTreeOid', evidence.specimenTreeOid],
+        ['mutationBlobOid', evidence.mutationBlobOid],
+      ] as const) {
+        if (!REACHABILITY_GIT_OID_RE.test(oid)) {
+          throw new Error(`insertPlanWpReachabilityEvidenceBatch: ${field} must be a full 40-hex git OID`);
+        }
+      }
+      run(
+        `INSERT INTO plan_wp_reachability_evidence
+           (id, obligation_id, package_content_hash, specimen_base_oid,
+            specimen_tree_oid, mutation_blob_oid, baseline_result, mutated_result,
+            failure_classification, verdict, verification_target_version, verified_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [evidence.id, evidence.obligationId, evidence.packageContentHash,
+          evidence.specimenBaseOid, evidence.specimenTreeOid, evidence.mutationBlobOid,
+          evidence.baselineResult, evidence.mutatedResult, evidence.failureClassification,
+          evidence.verdict, evidence.verificationTargetVersion, evidence.verifiedAt],
+      );
+    }
+  })();
+}
+
+/** The exact §4.6 obligation predicate. Every identity is supplied/read at the
+ * current completion-candidate boundary; absence or any mismatch is false. */
+export function isPlanWpReachabilityObligationCleared(input: {
+  obligationId: string; packageContentHash: string; candidateTreeOid: string;
+  mutationBlobOid: string; verificationTargetVersion: string;
+}): boolean {
+  return queryOne(
+    `SELECT 1 AS ok FROM plan_wp_reachability_evidence
+      WHERE obligation_id = ? AND verdict = 'pass'
+        AND specimen_tree_oid = ? AND package_content_hash = ?
+        AND mutation_blob_oid = ? AND verification_target_version = ?
+      LIMIT 1`,
+    [input.obligationId, input.candidateTreeOid, input.packageContentHash,
+      input.mutationBlobOid, input.verificationTargetVersion],
+  ) !== null;
+}
+
+export interface PlanWpReachabilityClearance {
+  packageId: string; packageContentHash: string | null; cleared: boolean;
+  obligations: Array<PlanWpReachabilityObligation & { cleared: boolean }>;
+}
+
+/** Package-level §4.6 coverage: every current obligation must have fresh pass
+ * evidence for the same candidate tree, package hash, patch blob and registry. */
+export function getPlanWpReachabilityClearance(input: {
+  packageId: string; candidateTreeOid: string; verificationTargetVersion: string;
+  mutationBlobOidByObligationId: Readonly<Record<string, string>>;
+}): PlanWpReachabilityClearance {
+  const pkg = getPlanWorkPackage(input.packageId);
+  const contentHash = pkg?.contentHash ?? null;
+  if (!pkg || !contentHash || pkg.projectionStatus === 'legacy-unmigrated') {
+    return { packageId: input.packageId, packageContentHash: contentHash,
+      cleared: false, obligations: [] };
+  }
+  const obligations = listPlanWpReachabilityObligations(pkg.id, contentHash)
+    .map((obligation) => ({ ...obligation, cleared: isPlanWpReachabilityObligationCleared({
+      obligationId: obligation.id, packageContentHash: contentHash,
+      candidateTreeOid: input.candidateTreeOid,
+      mutationBlobOid: input.mutationBlobOidByObligationId[obligation.id] ?? '',
+      verificationTargetVersion: input.verificationTargetVersion,
+    }) }));
+  return { packageId: pkg.id, packageContentHash: contentHash,
+    cleared: obligations.every((obligation) => obligation.cleared), obligations };
 }
 
 export interface PlanExecutionRun {
@@ -7244,6 +7617,9 @@ export function insertPlanDispatchAttempt(input: {
     const pkg = getPlanWorkPackage(input.packageId);
     if (!pkg || pkg.id !== input.requestedPlanItemId || pkg.planId !== input.planId) {
       throw new Error('insertPlanDispatchAttempt: package is not the requested plan item');
+    }
+    if (pkg.projectionStatus === 'legacy-unmigrated') {
+      throw new Error(`insertPlanDispatchAttempt: package ${pkg.id} is legacy-unmigrated (quarantined)`);
     }
     if (pkg.state !== 'ready') {
       throw new Error(`insertPlanDispatchAttempt: package ${pkg.id} is '${pkg.state}', not ready`);
