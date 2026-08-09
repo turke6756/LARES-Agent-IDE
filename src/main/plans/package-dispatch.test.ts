@@ -215,6 +215,50 @@ test('intent get-or-create is keyed by dispatch attempt while separate briefs mi
   assert.equal(first?.briefDigest?.length, 64);
 });
 
+test('production registrar obtains the package dispatch path and stamps the supervisor delivery', async () => {
+  const s = seed();
+  let handler: ((event: unknown, request: unknown) => Promise<import('./plan-lifecycle').PlanPackageDispatchResponse>) | undefined;
+  let deliveredIntent: string | null = null;
+  svc.registerPlanPackageDispatchIpc({
+    handle(channel, listener) {
+      assert.equal(channel, 'plan:dispatchPackage');
+      handler = listener as typeof handler;
+    },
+  }, {
+    intentPackaging: true,
+    now: () => 3200,
+    newId: () => `route-${serial}`,
+    deliver: async ({ dispatch }) => {
+      const ctx = await import('../git-checkpoints/dispatch-context').then((m) =>
+        m.buildDispatchTurnContext({
+          getAgent: (id) => id === s.agentId
+            ? { workspaceId: s.workspaceId, title: 'worker' } : null,
+          resolveCapability: async () => ({
+            resolution: { agentShell: { source: null, note: '' }, internal: null },
+            repoState: 'repo', commonDir: '/r/.git', commonDirQueueKey: '/r',
+            repoRoot: '/r', workspacePrefix: '', protectedRoot: false,
+            reason: 'ok', detail: null,
+          }),
+        }, s.agentId, dispatch));
+      deliveredIntent = ctx?.intentStamp?.intentId ?? null;
+      assert.ok(deliveredIntent, 'production delivery receives the private intent carrier');
+      openStampedTurn(s, `route-turn-${serial}`, 3210, ctx?.intentStamp);
+      return { disposition: 'delivered-unconfirmed' };
+    },
+  });
+
+  assert.ok(handler, 'production registration must mount plan:dispatchPackage');
+  const response = await handler({}, {
+    attemptId: `route-attempt-${serial}`,
+    packageId: s.packageId,
+    promptText: 'Implement the registered package brief',
+  });
+  assert.equal(response.ok, true);
+  assert.equal(dbm.getSaveIntentByDispatchAttempt(`route-attempt-${serial}`)?.id, deliveredIntent);
+  assert.equal(dbm.getPlanDispatchAttempt(`route-attempt-${serial}`)?.state, 'reconciled');
+  assert.equal(dbm.getPlanWorkPackage(s.packageId)?.state, 'executing');
+});
+
 test('failed send marks the attempt failed and leaves the package ready', async () => {
   const s = seed();
   const result = await svc.dispatchPlanPackage({

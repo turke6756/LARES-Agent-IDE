@@ -4,7 +4,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
-import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, HistoryNotice, LaunchAgentInput, LaunchableAgentProvider, QueryResult, RetentionExecutionResult, SendOutcome, StopEligibilityMode, StopResult, Team, TerminalDeadSnapshot, TerminalLogRange, TerminalLogTail, UsageLimitsReading, hasSupervisorPrivilege } from '../../shared/types';
+import { Agent, AgentProvider, AgentRoleLane, AgentStatus, AgentStopReason, BulkStopItemResult, ContextStats, ContinuationPhaseSignal, ContinuationPhaseState, ForceContinuationResult, HistoryNotice, LaunchAgentInput, LaunchableAgentProvider, QueryResult, RetentionExecutionResult, SendOutcome, StopEligibilityMode, StopResult, Team, TerminalDeadSnapshot, TerminalLogRange, TerminalLogTail, UsageLimitsReading, hasSupervisorPrivilege, type ResolvedIntentStamp } from '../../shared/types';
 import { assembleGuardSnapshot, evaluateStopEligibility, type AgentBrowserState, type GuardDeps } from '../lifecycle/guards';
 import {
   TMUX_SESSION_PREFIX, PROVIDER_COMMANDS, WORKER_CLAUDE_MODEL,
@@ -98,6 +98,7 @@ import type { TurnCoordinator, TurnContext } from '../git-checkpoints/turn-coord
 import type { TurnCompletionTracker } from './turn-completion-tracker';
 import {
   resolveRequestedPlanBinding,
+  withResolvedIntentStamp,
   withResolvedPlanStamp,
   type DispatchContext,
   type ResolvedPlanStamp,
@@ -198,6 +199,7 @@ import {
   insertAgentSession, closeAgentSession,
   getAgentsByOwner,
   getPlan, planItemInPlan,
+  getSaveIntent, listTurnRecords,
   saveAgentContextStats, getAgentContextStats, deleteAgentContextStats,
   getDb,
   bindPromotionAgentAtomic,
@@ -749,11 +751,12 @@ function resolveLifecyclePlanStamp(
   agent: Agent,
   requested: RequestedPlanBinding | undefined,
   carrySource: 'fork-carry' | 'revive-carry',
+  intentStamp?: ResolvedIntentStamp,
 ): ResolvedPlanStamp {
   if (!requested || requested.mode === 'agent-default') {
     return Object.freeze({
-      planId: agent.planId ?? null,
-      planItemId: null,
+      planId: intentStamp?.planId ?? agent.planId ?? null,
+      planItemId: intentStamp?.planItemId ?? null,
       source: carrySource,
     });
   }
@@ -770,6 +773,40 @@ function resolveLifecyclePlanStamp(
   return Object.freeze({ ...resolution.stamp });
 }
 
+/** Resolve the latest immutable task identity for a same-task lifecycle carry.
+ * Explicit plan overrides are new dispatch choices and never inherit an old intent. */
+function resolveLifecycleIntentStamp(
+  agent: Agent,
+  requested: RequestedPlanBinding | undefined,
+  carrySource: 'fork-carry' | 'revive-carry',
+): ResolvedIntentStamp | undefined {
+  if (process.env.LARES_INTENT_PACKAGING !== '1'
+      || (requested && requested.mode !== 'agent-default')) return undefined;
+  const latest = listTurnRecords(agent.workspaceId, { agentId: agent.id, limit: 200 })
+    .reverse()
+    .find((turn) => turn.intentId && turn.status !== 'delivery_failed');
+  if (!latest?.intentId) return undefined;
+  const intent = getSaveIntent(latest.intentId);
+  if (!intent || intent.kind !== 'task') return undefined;
+  return Object.freeze({
+    intentId: intent.id,
+    kind: 'task',
+    executionRunId: intent.executionRunId,
+    planId: intent.planId ?? latest.planId ?? null,
+    planItemId: intent.planItemId ?? latest.planItemId ?? null,
+    source: carrySource,
+  });
+}
+
+function withLifecycleStamps(
+  dispatch: DispatchContext,
+  planStamp: ResolvedPlanStamp,
+  intentStamp?: ResolvedIntentStamp,
+): DispatchContext {
+  const planDispatch = withResolvedPlanStamp(dispatch, planStamp);
+  return intentStamp ? withResolvedIntentStamp(planDispatch, intentStamp) : planDispatch;
+}
+
 /** Rehydrate only the binding frozen on the continuation attempt. A legacy
  * attempt has no trustworthy binding, so callers must not substitute a live
  * agent default or a latest-turn value. */
@@ -779,7 +816,11 @@ function getContinuationAttemptDispatch(attemptId: string): DispatchContext | nu
   if (binding.source !== 'continuation-carry') {
     throw new Error(`continuation attempt ${attemptId} has invalid source '${binding.source}'`);
   }
-  return withResolvedPlanStamp({ origin: 'human-terminal' }, binding);
+  return withLifecycleStamps(
+    { origin: 'human-terminal' },
+    binding,
+    binding.intentStamp,
+  );
 }
 
 /** WP3.1 — the orientation preamble prepended to a revival wake message. There is
@@ -6114,7 +6155,10 @@ export class AgentSupervisor extends EventEmitter {
 
     // Resolve before creating or launching anything. The default is frozen from
     // the source agent's persisted binding; no turn-record lookup participates.
-    const planStamp = resolveLifecyclePlanStamp(source, opts.requestedPlanBinding, 'fork-carry');
+    const intentStamp = resolveLifecycleIntentStamp(source, opts.requestedPlanBinding, 'fork-carry');
+    const planStamp = resolveLifecyclePlanStamp(
+      source, opts.requestedPlanBinding, 'fork-carry', intentStamp,
+    );
 
     const newSessionId = uuidv4();
     const logPath = path.join(this.logsDir, `${uuidv4().substring(0, 8)}.log`);
@@ -6172,7 +6216,7 @@ export class AgentSupervisor extends EventEmitter {
       this.pendingInitialPrompts.set(newAgent.id, {
         text: opts.message,
         expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
-        dispatch: withResolvedPlanStamp({ origin: 'human-terminal' }, planStamp),
+        dispatch: withLifecycleStamps({ origin: 'human-terminal' }, planStamp, intentStamp),
       });
     }
 
@@ -7008,8 +7052,13 @@ export class AgentSupervisor extends EventEmitter {
       this.assertResumable(agent);                                                   // WP3.2
       // Freeze before the ownership gate/stop/relaunch sequence. The default is
       // the agent's own persisted plan rail, never a latest-turn rediscovery.
-      const planStamp = resolveLifecyclePlanStamp(agent, opts.requestedPlanBinding, 'revive-carry');
-      const wakeDispatch = withResolvedPlanStamp({ origin: 'human-terminal' }, planStamp);
+      const intentStamp = resolveLifecycleIntentStamp(agent, opts.requestedPlanBinding, 'revive-carry');
+      const planStamp = resolveLifecyclePlanStamp(
+        agent, opts.requestedPlanBinding, 'revive-carry', intentStamp,
+      );
+      const wakeDispatch = withLifecycleStamps(
+        { origin: 'human-terminal' }, planStamp, intentStamp,
+      );
       if (agent.isSupervisor) {                                                      // successor guard: supervisor targets ONLY
         const successor = getAgentsByWorkspace(agent.workspaceId).find(a =>
           a.id !== agentId && a.isSupervisor && a.status !== 'done' && a.status !== 'crashed');

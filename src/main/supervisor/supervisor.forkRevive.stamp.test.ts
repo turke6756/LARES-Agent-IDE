@@ -23,14 +23,18 @@ function pending(supervisor: AgentSupervisor, agentId: string): PendingPrompt | 
   }).pendingInitialPrompts.get(agentId);
 }
 
-async function stampOf(agent: Agent, dispatch: DispatchContext) {
+async function contextOf(agent: Agent, dispatch: DispatchContext) {
   const ctx = await buildDispatchTurnContext({
     getAgent: (id) => id === agent.id ? agent : null,
     resolveCapability: async () => ({ repoRoot: agent.workingDirectory } as unknown as GitCapability),
     planInWorkspace: () => true,
   }, agent.id, dispatch);
   assert.ok(ctx, 'trusted pending dispatch must build a turn context');
-  return ctx.planStamp;
+  return ctx;
+}
+
+async function stampOf(agent: Agent, dispatch: DispatchContext) {
+  return (await contextOf(agent, dispatch)).planStamp;
 }
 
 function patchDatabase(workspacePath: string, agents: Agent[]) {
@@ -39,6 +43,7 @@ function patchDatabase(workspacePath: string, agents: Agent[]) {
   const keys = [
     'getAgent', 'getWorkspace', 'getAgentsByWorkspace', 'createAgent',
     'updateAgentResumeSessionId', 'addEvent', 'getPlan', 'planItemInPlan',
+    'listTurnRecords', 'getSaveIntent',
   ];
   const original: Record<string, unknown> = {};
   for (const key of keys) original[key] = db[key];
@@ -69,6 +74,13 @@ function patchDatabase(workspacePath: string, agents: Agent[]) {
   // SC-WP-3A: item-in-plan lookup — only (ws-1, plan-b, item-1) is a valid item.
   db.planItemInPlan = (workspaceId: string, planId: string, planItemId: string) =>
     workspaceId === 'ws-1' && planId === 'plan-b' && planItemId === 'item-1';
+  db.listTurnRecords = (_workspaceId: string, opts?: { agentId?: string }) => [{
+    id: `turn-${opts?.agentId ?? 'unknown'}`, intentId: 'svi-carried', status: 'closed',
+    planId: 'plan-a', planItemId: 'item-carried',
+  }];
+  db.getSaveIntent = (id: string) => id === 'svi-carried' ? {
+    id, kind: 'task', executionRunId: null, planId: 'plan-a', planItemId: 'item-carried',
+  } : null;
 
   return () => { for (const key of keys) db[key] = original[key]; };
 }
@@ -201,6 +213,55 @@ test('revive freezes carry/explicit/none, validates explicit items (SC-WP-3A), a
       planId: 'plan-delivery', planItemId: null, source: 'revive-carry',
     });
   } finally {
+    restore();
+    fs.rmSync(workspacePath, { recursive: true, force: true });
+  }
+});
+
+test('intentPackaging carries the immutable task stamp through fork and revive', async () => {
+  const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'intent-carry-'));
+  const source = makeAgent('intent-source', {
+    workspaceId: 'ws-1', workingDirectory: workspacePath, command: 'claude',
+    provider: 'claude', resumeSessionId: 'session-source', status: 'done', planId: 'plan-a',
+  });
+  const agents = [source];
+  const restore = patchDatabase(workspacePath, agents);
+  const priorFlag = process.env.LARES_INTENT_PACKAGING;
+  process.env.LARES_INTENT_PACKAGING = '1';
+  try {
+    const supervisor = quietSupervisor();
+    const forked = await supervisor.forkAgent(source.id, { message: 'same task fork' });
+    const forkPending = pending(supervisor, forked.id);
+    assert.ok(forkPending);
+    const forkContext = await contextOf(forked, forkPending.dispatch);
+    assert.deepEqual(forkContext.planStamp, {
+      planId: 'plan-a', planItemId: 'item-carried', source: 'fork-carry',
+    });
+    assert.deepEqual(forkContext.intentStamp, {
+      intentId: 'svi-carried', kind: 'task', executionRunId: null,
+      planId: 'plan-a', planItemId: 'item-carried', source: 'fork-carry',
+    });
+
+    await supervisor.reviveAgent(source.id, { message: 'same task revive' });
+    const revivePending = pending(supervisor, source.id);
+    assert.ok(revivePending);
+    const reviveContext = await contextOf(source, revivePending.dispatch);
+    assert.deepEqual(reviveContext.intentStamp, {
+      intentId: 'svi-carried', kind: 'task', executionRunId: null,
+      planId: 'plan-a', planItemId: 'item-carried', source: 'revive-carry',
+    });
+
+    await supervisor.reviveAgent(source.id, {
+      message: 'new explicit task',
+      requestedPlanBinding: { mode: 'explicit', planId: 'plan-b', planItemId: 'item-1' },
+    });
+    const explicit = pending(supervisor, source.id);
+    assert.ok(explicit);
+    assert.equal((await contextOf(source, explicit.dispatch)).intentStamp, undefined,
+      'an explicit new dispatch choice cannot inherit the prior task identity');
+  } finally {
+    if (priorFlag === undefined) delete process.env.LARES_INTENT_PACKAGING;
+    else process.env.LARES_INTENT_PACKAGING = priorFlag;
     restore();
     fs.rmSync(workspacePath, { recursive: true, force: true });
   }

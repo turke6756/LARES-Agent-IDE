@@ -21,6 +21,7 @@ import {
   confirmPlanDispatchAttempt,
   getActivePlanExecutionRun,
   getAgent,
+  getOwnerForWorker,
   getDb,
   getPlan,
   getPlanWorkPackage,
@@ -116,6 +117,38 @@ export interface PackageDispatchResult {
   disposition: PackageDeliveryResult['disposition'] | null;
   failure: PackageDispatchFailure | null;
   diagnostic?: string;
+}
+
+/** Renderer/API-safe plan-package dispatch request. Identity is resolved and minted
+ * main-side; callers can supply only the durable attempt key, package key, and brief. */
+export interface PlanPackageDispatchRequest {
+  attemptId?: string;
+  packageId: string;
+  promptText: string;
+}
+
+export interface PlanPackageDispatchResponse {
+  ok: boolean;
+  attemptId: string | null;
+  disposition: PackageDeliveryResult['disposition'] | null;
+  failure: PackageDispatchFailure | 'package-unassigned' | 'invalid-request' | null;
+  diagnostic?: string;
+}
+
+export interface PlanPackageDispatchIpcLike {
+  handle(channel: string, listener: (event: unknown, request: unknown) => unknown): void;
+}
+
+export interface PlanPackageDispatchRouteDeps {
+  getPackage?: typeof getPlanWorkPackage;
+  getAgent?: typeof getAgent;
+  getOwner?: typeof getOwnerForWorker;
+  dispatch?: typeof dispatchPlanPackage;
+  reconcile?: typeof reconcilePackageDispatches;
+  newId?: () => string;
+  now?: () => number;
+  intentPackaging?: boolean;
+  deliver: PackageDispatchDeps['deliver'];
 }
 
 function defaultPackageDispatchDeps(): DispatchDeps {
@@ -257,6 +290,70 @@ export async function dispatchPlanPackage(
       diagnostic: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+/** Register the production plan-package brief route. The handler deliberately
+ * rehydrates every authority-bearing field from main-owned rows before dispatch. */
+export function registerPlanPackageDispatchIpc(
+  ipc: PlanPackageDispatchIpcLike,
+  deps: PlanPackageDispatchRouteDeps,
+): void {
+  ipc.handle('plan:dispatchPackage', async (_event, raw): Promise<PlanPackageDispatchResponse> => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, attemptId: null, disposition: null, failure: 'invalid-request' };
+    }
+    const request = raw as Partial<PlanPackageDispatchRequest>;
+    if (
+      typeof request.packageId !== 'string' || request.packageId.trim() === ''
+      || typeof request.promptText !== 'string' || request.promptText.trim() === ''
+      || (request.attemptId !== undefined
+        && (typeof request.attemptId !== 'string' || request.attemptId.trim() === ''))
+    ) {
+      return { ok: false, attemptId: null, disposition: null, failure: 'invalid-request' };
+    }
+
+    const getPackage = deps.getPackage ?? getPlanWorkPackage;
+    const getAgentById = deps.getAgent ?? getAgent;
+    const getOwner = deps.getOwner ?? getOwnerForWorker;
+    const pkg = getPackage(request.packageId);
+    if (!pkg) {
+      return { ok: false, attemptId: null, disposition: null, failure: 'package-not-found' };
+    }
+    if (!pkg.assigneeAgentId) {
+      return { ok: false, attemptId: null, disposition: null, failure: 'package-unassigned' };
+    }
+    const newId = deps.newId ?? randomUUID;
+    const now = deps.now ?? Date.now;
+    const attemptId = request.attemptId ?? `dispatch_${newId()}`;
+    const result = await (deps.dispatch ?? dispatchPlanPackage)({
+      attemptId,
+      lifecycleEventId: `dispatch-confirm_${newId()}`,
+      packageId: pkg.id,
+      planId: pkg.planId,
+      planItemId: pkg.id,
+      targetAgentId: pkg.assigneeAgentId,
+      ownerAgentId: (() => {
+        const target = getAgentById(pkg.assigneeAgentId);
+        return target ? getOwner(target)?.id ?? null : null;
+      })(),
+      promptText: request.promptText,
+      createdAt: now(),
+    }, {
+      intentPackaging: deps.intentPackaging,
+      deliver: deps.deliver,
+    });
+
+    // sendInputWithOutcome opens the stamped turn before it resolves. Reconcile
+    // immediately so a hookless-but-delivered production send need not wait for boot.
+    if (result.ok && result.attempt) (deps.reconcile ?? reconcilePackageDispatches)(now());
+    return {
+      ok: result.ok,
+      attemptId: result.attempt?.id ?? attemptId,
+      disposition: result.disposition,
+      failure: result.failure,
+      ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}),
+    };
+  });
 }
 
 /** The idempotent startup/periodic hook exposed to the app lifecycle. Database

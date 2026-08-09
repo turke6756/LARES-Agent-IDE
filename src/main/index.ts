@@ -1057,7 +1057,7 @@ app.whenReady().then(async () => {
     // EADDRINUSE auto-increment — never a hardcoded 24678.
     browserManager = new BrowserManager(() => mainWindow, apiPort);
     registerBrowserIpc(browserManager);
-    registerPlanIpc();
+    registerPlanIpc(supervisor);
     // WP2-B ⇄ WP2-A seam: inject the Phase-2 browser-tool facade into the
     // API server. Setter, not constructor param, because the manager is
     // constructed AFTER the awaited apiServer.start() (its M2 filter needs

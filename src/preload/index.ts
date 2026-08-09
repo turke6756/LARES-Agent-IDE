@@ -243,6 +243,7 @@ const api: IpcApi = {
     listComments: (planId) => ipcRenderer.invoke('plan:comment:list', planId),
     createComment: (req) => ipcRenderer.invoke('plan:comment:create', req),
     replyComment: (req) => ipcRenderer.invoke('plan:comment:reply', req),
+    dispatchPackage: (req) => ipcRenderer.invoke('plan:dispatchPackage', req),
   },
   // WP-P1B: read-only planning reader (bounded fs enumeration + read-by-opaque-id).
   // `list` is a pure mount/refresh read (NO demand-probe); a voluntary open is

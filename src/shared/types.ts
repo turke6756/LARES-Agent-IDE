@@ -3296,6 +3296,18 @@ export interface IpcApi {
      *  service revalidates `callerAgentId` against the plan's current responsible
      *  supervisor server-side; a non-responsible id is rejected. */
     replyComment: (req: AnswerPlanCommentRequest) => Promise<AnswerPlanCommentResult>;
+    /** Dispatch one assigned package brief through the main-owned intent boundary. */
+    dispatchPackage: (req: {
+      attemptId?: string;
+      packageId: string;
+      promptText: string;
+    }) => Promise<{
+      ok: boolean;
+      attemptId: string | null;
+      disposition: SendDisposition | null;
+      failure: string | null;
+      diagnostic?: string;
+    }>;
   };
   /** WP-P1B: read-only planning reader. `list` enumerates bare proposals + §R0
    *  plan folders and is a pure mount/refresh read (emits NO demand-probe);

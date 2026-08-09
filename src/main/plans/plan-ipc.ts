@@ -83,6 +83,10 @@ import {
   type ListPlanCommentsDeps,
 } from './plan-comments';
 import { registerPlanImplementIpc } from './plan-implement';
+import {
+  registerPlanPackageDispatchIpc,
+  type PackageDeliveryResult,
+} from './plan-lifecycle';
 import { workspaceStateDir, workspaceStateDirName } from '../workspace-state-dir';
 import { listMissionBoardCards, listMissionBoardTimeline } from './mission-board';
 import { queryBlameToIntent } from './blame-to-intent';
@@ -1352,7 +1356,16 @@ export function registerProposalDeleteIpc(
   });
 }
 
-export function registerPlanIpc(): void {
+export interface PlanDispatchDelivery {
+  sendInputWithOutcome(
+    agentId: string,
+    text: string,
+    opts: Record<string, never>,
+    dispatch: import('../git-checkpoints/dispatch-context').DispatchContext,
+  ): Promise<import('../../shared/types').SendOutcome>;
+}
+
+export function registerPlanIpc(delivery: PlanDispatchDelivery): void {
   ipcMain.handle(
     'plan-folder:list',
     (_e, workspaceId: string, workspaceRoot: string, pathType?: PathType) =>
@@ -1448,6 +1461,18 @@ export function registerPlanIpc(): void {
   // `app_user_id` is derived main-side (never from the renderer payload). Pins a
   // durable execution baseline and flips the plan `ready → executing`.
   registerPlanImplementIpc(ipcMain);
+
+  // WP-1b: this is the production bridge from the registered plan surface to
+  // AgentSupervisor delivery. Main-owned package rows select the agent/plan/item;
+  // the wire request has no authority-bearing intent field.
+  registerPlanPackageDispatchIpc(ipcMain, {
+    deliver: async ({ targetAgentId, promptText, dispatch }): Promise<PackageDeliveryResult> => {
+      const outcome = await delivery.sendInputWithOutcome(targetAgentId, promptText, {}, dispatch);
+      return outcome.disposition === 'failed'
+        ? { disposition: 'failed', reason: outcome.reason ?? 'delivery-failed' }
+        : { disposition: 'delivered-unconfirmed' };
+    },
+  });
 
   // WP-P6B-query: read-only package cards with structured state and transient
   // open-turn activity kept in separate DTO fields. No polling or state writes.
