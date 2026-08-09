@@ -406,6 +406,112 @@ export interface PlanListItem extends Plan {
   snippet: string | null;
 }
 
+// Planning-surface mechanics WP-D6 â€” SQLite-only execution-ledger projection.
+export const PLAN_LEDGER_PROJECTION_CHANNEL = 'plan:ledgerProjection' as const;
+
+export type PlanLedgerBindingState = 'bound' | 'legacy-unbound' | 'quarantined';
+
+export interface PlanLedgerSourceProposal {
+  id: string;
+  artifactId: string | null;
+  title: string | null;
+  state: string;
+}
+
+export interface PlanLedgerIntent {
+  intentId: string;
+  kind: string;
+  status: string;
+  reason: string | null;
+  integrationNote: string | null;
+}
+
+export interface PlanLedgerDispatchAttempt {
+  id: string;
+  state: string;
+  targetAgentId: string | null;
+  targetAgentTitle: string | null;
+  targetSessionId: string | null;
+  orchestrationId: string | null;
+  confirmedTurnId: string | null;
+  createdAt: number;
+  confirmedAt: number | null;
+}
+
+export interface PlanLedgerGateAttempt {
+  id: string;
+  gateKey: string;
+  gateRevision: number;
+  attemptNo: number;
+  outcome: 'pending' | 'passed' | 'failed' | 'cancelled';
+  finalizationId: string | null;
+  witnessAgentId: string | null;
+  witnessSessionId: string | null;
+  witnessTurnId: string | null;
+  evidence: unknown | null;
+  decidedAt: number | null;
+  createdAt: number;
+}
+
+export interface PlanLedgerCommit {
+  repositoryKey: string;
+  commitOid: string;
+  parentOid: string | null;
+  observedAt: number | null;
+  source: string | null;
+  firstLinkedAt: number;
+  gateAttemptIds: string[];
+}
+
+export interface PlanLedgerDeploymentEvent {
+  id: string;
+  environment: string;
+  state: 'not_required' | 'not_deployed' | 'deploying' | 'deployed' | 'failed' | 'rolled_back';
+  repositoryKey: string | null;
+  commitOid: string | null;
+  witnessAgentId: string | null;
+  witnessSessionId: string | null;
+  detail: unknown | null;
+  occurredAt: number;
+  current: boolean;
+}
+
+export interface PlanLedgerStateEvent {
+  id: string;
+  fromState: string;
+  toState: string;
+  actor: string;
+  reason: string | null;
+  occurredAt: number;
+}
+
+export interface PlanLedgerPackageProjection {
+  id: string;
+  title: string;
+  acceptanceCondition: string | null;
+  state: MissionBoardPackageState;
+  revision: number;
+  assigneeAgentId: string | null;
+  bindingState: PlanLedgerBindingState;
+  intent: PlanLedgerIntent | null;
+  dispatchAttempts: PlanLedgerDispatchAttempt[];
+  gateAttempts: PlanLedgerGateAttempt[];
+  commitChain: PlanLedgerCommit[];
+  deploymentEvents: PlanLedgerDeploymentEvent[];
+  deploymentState: Array<{ environment: string; state: PlanLedgerDeploymentEvent['state'] }>;
+  stateHistory: PlanLedgerStateEvent[];
+}
+
+export interface PlanLedgerProjection {
+  planId: string;
+  workspaceId: string;
+  planArtifactId: string | null;
+  runState: string | null;
+  responsibleSupervisorId: string | null;
+  sourceProposal: PlanLedgerSourceProposal | null;
+  packages: PlanLedgerPackageProjection[];
+}
+
 // WP-P6B-query — live mission-board card DTOs. Package state is the structured
 // SC-WP-3A value. Open-turn activity is separate and has no `done` value.
 export type MissionBoardPackageState =
@@ -3271,6 +3377,8 @@ export interface IpcApi {
     /** List a workspace's plans for the "Plans" card gallery. Each row carries a
      *  cheap description snippet (summary-zone prose) for `html` surfaces. */
     list: (workspaceId?: string) => Promise<PlanListItem[]>;
+    /** Full package execution projection read exclusively from SQLite. */
+    ledgerProjection: (planId: string) => Promise<PlanLedgerProjection | null>;
     /** One row per valid folder in `<workspaceStateDir()>/plans/`. */
     listPromotedFolders: (
       workspaceId: string,

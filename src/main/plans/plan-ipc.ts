@@ -25,12 +25,14 @@ import type {
   ObservedOverviewSourceToken,
   DeleteProposalRequest,
   DeleteProposalResult,
+  PlanLedgerProjection,
 } from '../../shared/types';
 import {
   hasSupervisorPrivilege,
   isPlanTabKey,
   PLAN_TAB_KEYS,
   PLAN_REVIEW_PROJECTION_CHANNEL,
+  PLAN_LEDGER_PROJECTION_CHANNEL,
 } from '../../shared/types';
 import {
   getPlans,
@@ -112,6 +114,7 @@ import {
   type PlanPackageWitness,
   type TransitionResult,
 } from './package-ledger';
+import { renderPlanFromLedger } from './plan-ledger-projection';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
@@ -1252,6 +1255,26 @@ export function registerPlanOverviewIpc(
 
 export function registerPlanCommentIpc(ipc: PlanIpcLike, deps: CreatePlanCommentDeps): void {
   ipc.handle('plan:comment:create', (_event, raw: unknown) => createPlanComment(raw, deps));
+  // `registerPlanCommentIpc` is mounted by the app's primary registerIpcHandlers
+  // seam. Keep the DB-only projection on that proven production path rather than
+  // only on the later, plan-specific registration pass in main/index.ts.
+  registerPlanLedgerProjectionIpc(ipc);
+}
+
+export function runPlanLedgerProjection(
+  rawPlanId: unknown,
+  render: (planId: string) => PlanLedgerProjection | null = renderPlanFromLedger,
+): PlanLedgerProjection | null {
+  if (typeof rawPlanId !== 'string' || rawPlanId === '') return null;
+  return render(rawPlanId);
+}
+
+export function registerPlanLedgerProjectionIpc(
+  ipc: PlanIpcLike,
+  render: (planId: string) => PlanLedgerProjection | null = renderPlanFromLedger,
+): void {
+  ipc.handle(PLAN_LEDGER_PROJECTION_CHANNEL, (_event, rawPlanId: unknown) =>
+    runPlanLedgerProjection(rawPlanId, render));
 }
 
 // ── WP-P4D-reply — plan-comment answer (companion reply) ──────────────────────
