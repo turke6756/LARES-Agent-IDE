@@ -91,6 +91,7 @@ import {
   registerOrchestrationProviderSettingsIpc,
 } from './orchestration/orchestration-provider-settings-transport';
 import { resolvePlanBindingAtBoundary } from './api-server';
+import { proveReachability, type ReachabilityProofRequest } from './plans/reachability-prover';
 
 // Managed temp dir for clipboard-bitmap pastes. Dropped OS files inject their
 // OWN on-disk path (converted) and never land here — only screenshots do.
@@ -187,6 +188,8 @@ export function registerIpcHandlers(
   mainWindow: BrowserWindow,
   detachedWindowDeps: DetachedWindowDeps,
 ): void {
+  ipcMain.handle('prove_reachability', (_event, request: ReachabilityProofRequest) =>
+    proveReachability(request));
   registerOrchestrationProviderSettingsIpc(ipcMain, (workspaceId) =>
     getWorkspace(workspaceId)?.path ?? null);
   onOrchestrationProviderSettingsChanged((event) => {

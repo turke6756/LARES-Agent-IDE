@@ -761,5 +761,8 @@ const api: IpcApi = {
 (api.plans as IpcApi['plans'] & {
   finalizeItemDone: (request: { planItemId: string }) => Promise<unknown>;
 }).finalizeItemDone = (request) => ipcRenderer.invoke('plan:finalizeItemDone', request);
+(api.plans as IpcApi['plans'] & {
+  proveReachability: (request: unknown) => Promise<unknown>;
+}).proveReachability = (request) => ipcRenderer.invoke('prove_reachability', request);
 
 contextBridge.exposeInMainWorld('api', api);
