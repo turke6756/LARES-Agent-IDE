@@ -24,6 +24,9 @@ import {
   PlanManifestError,
   PLAN_LOCK_HEARTBEAT_MS,
   PLAN_LOCK_STALE_MS,
+  calculateArcFreshness,
+  calculatePlanArcFreshness,
+  normalizeArcCutoff,
   type LockTuning,
   type ResponsibilityEvent,
   type PlanManifest,
@@ -152,6 +155,76 @@ function delay(ms: number): Promise<void> {
 test('exported defaults match the settled protocol (2s heartbeat / 15s stale)', async () => {
   assert.equal(PLAN_LOCK_HEARTBEAT_MS, 2000);
   assert.equal(PLAN_LOCK_STALE_MS, 15000);
+});
+
+// ── ARC freshness ──────────────────────────────────────────────────────────
+
+test('ARC cutoff unit regression — legacy seconds normalize before comparing source milliseconds', async () => {
+  const home = await makeHome();
+  const folder = await scaffoldFolder(home, '2026-08-03-arc-seconds');
+  const cutoffSeconds = 1_786_034_858.657;
+  await fs.writeFile(
+    path.join(folder, 'ARC.md'),
+    `# ARC\n<!--ARC-META ${JSON.stringify({ source_cutoffs: { folder_mtime_ms: cutoffSeconds } })} -->\nold completion prose\n`,
+  );
+  const source = path.join(folder, 'plan.md');
+  await fs.writeFile(source, '# newer source\n');
+  await fs.utimes(source, (cutoffSeconds + 10) / 1000, cutoffSeconds + 10);
+
+  const normalized = normalizeArcCutoff(cutoffSeconds);
+  assert.equal(normalized?.cutoffUnit, 'seconds');
+  assert.equal(normalized?.cutoffMs, cutoffSeconds * 1000);
+
+  const freshness = calculateArcFreshness(folder);
+  assert.equal(freshness.cutoffUnit, 'seconds');
+  assert.equal(freshness.cutoffMs, cutoffSeconds * 1000);
+  assert.equal(freshness.stale, true, 'seconds must be normalized before the source-mtime comparison');
+  assert.ok(freshness.sourceMtimeMs > freshness.cutoffMs!);
+});
+
+test('ARC freshness scan is read-only, stable, and marks fresh versus stale folders', async () => {
+  const home = await makeHome();
+  const fresh = await scaffoldFolder(home, 'b-fresh');
+  const stale = await scaffoldFolder(home, 'a-stale');
+  const writeArc = async (folder: string, cutoff: number): Promise<void> => {
+    await fs.writeFile(
+      path.join(folder, 'ARC.md'),
+      `# ARC\n<!--ARC-META ${JSON.stringify({ source_cutoffs: { folder_mtime_ms: cutoff } })} -->\n`,
+    );
+  };
+  const freshSourceMtime = (await fs.stat(path.join(fresh, 'plan.json'))).mtimeMs;
+  const staleSourceMtime = (await fs.stat(path.join(stale, 'plan.json'))).mtimeMs;
+  await writeArc(fresh, freshSourceMtime + 1000);
+  await writeArc(stale, staleSourceMtime - 1000);
+  const before = await Promise.all(
+    [fresh, stale].map((folder) => fs.readFile(path.join(folder, 'ARC.md'), 'utf8')),
+  );
+
+  const scan = calculatePlanArcFreshness(home);
+  assert.deepEqual(scan.map((row) => row.folder), ['a-stale', 'b-fresh']);
+  assert.equal(scan[0].freshness.stale, true);
+  assert.equal(scan[1].freshness.stale, false);
+  const after = await Promise.all(
+    [fresh, stale].map((folder) => fs.readFile(path.join(folder, 'ARC.md'), 'utf8')),
+  );
+  assert.deepEqual(after, before, 'freshness calculation must not rewrite ARC content');
+});
+
+test('ARC freshness fails closed when metadata cannot establish currency', async () => {
+  const home = await makeHome();
+  const folder = await scaffoldFolder(home, 'arc-no-meta');
+  await fs.writeFile(path.join(folder, 'ARC.md'), '# ARC without metadata\ncompletion prose\n');
+  assert.deepEqual(
+    calculateArcFreshness(folder),
+    {
+      stale: true,
+      sourceMtimeMs: (await fs.stat(path.join(folder, 'plan.json'))).mtimeMs,
+      storedCutoff: null,
+      cutoffMs: null,
+      cutoffUnit: null,
+      error: 'arc-meta-missing',
+    },
+  );
 });
 
 // ── Basic CAS append ──────────────────────────────────────────────────────────

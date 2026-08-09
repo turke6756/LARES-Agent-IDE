@@ -290,6 +290,7 @@ export function buildPlanDocuments(
       kind: doc.category as PlanTabDocument['kind'],
       sizeBytes: doc.sizeBytes,
       mtimeMs: doc.mtimeMs,
+      ...(doc.stale !== undefined ? { stale: doc.stale } : {}),
     };
     if (isWorkPackageSource && folderProjection.wpStatus === 'synced') {
       projected.machine = { kind: 'work-packages', status: 'source' };
@@ -359,7 +360,14 @@ export function readPlanDocument(
     if (!manifestDoc) return { error: 'document is not registered to the plan folder' };
     const read = d.readPlanningDocument(rawRef.documentId, { pathType: workspace.pathType });
     if ('error' in read) return read;
-    return { ref: rawRef, name: read.name, content: read.content, truncated: read.truncated, sizeBytes: read.sizeBytes };
+    return {
+      ref: rawRef,
+      name: read.name,
+      content: read.content,
+      truncated: read.truncated,
+      sizeBytes: read.sizeBytes,
+      ...(read.stale !== undefined ? { stale: read.stale } : {}),
+    };
   }
 
   const row = d.getRegisteredDocument(planId, rawRef.documentId);

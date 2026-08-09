@@ -42,6 +42,7 @@ import type {
   PlanningIntentOutputView,
 } from '../../shared/types';
 import { workspaceStateDir } from '../workspace-state-dir';
+import { calculateArcFreshness } from './plan-manifest';
 
 // ── Caps (overridable in tests) ────────────────────────────────────────────
 export interface PlanningReaderCaps {
@@ -694,12 +695,16 @@ export function listPlanningEntries(
 
     // Register opaque ids + build the manifest.
     const manifestDocs = sourceProposal ? [...folderDocs, sourceProposal] : folderDocs;
+    const arcFreshness = folderDocs.some((d) => d.category === 'arc' && d.name === 'ARC.md')
+      ? calculateArcFreshness(folder)
+      : null;
     const documents: PlanningReaderDocument[] = manifestDocs.map((d) => ({
       docId: registerDoc(d.category === 'proposal' ? proposalsDir : folder, d.absPath, d.relPath, d.name),
       name: d.name,
       category: d.category,
       sizeBytes: d.size,
       mtimeMs: d.mtimeMs,
+      ...(d.category === 'arc' && d.name === 'ARC.md' && arcFreshness ? { stale: arcFreshness.stale } : {}),
     }));
 
     // Canonical marked doc: plan.md, else the linked source proposal.
@@ -773,11 +778,28 @@ export function readPlanningDocument(
 
   const r = readFileSafe(abs, caps.maxReadBytes);
   if (r === null) return { error: 'document unreadable or no longer present' };
+  if (res.name === 'ARC.md') {
+    const freshness = calculateArcFreshness(res.boundary);
+    if (freshness.stale) {
+      const detail = freshness.error
+        ? `Freshness could not be verified (${freshness.error}).`
+        : `Source artifacts are newer than ARC-META by ${Math.ceil(freshness.sourceMtimeMs - freshness.cutoffMs!)} ms.`;
+      return {
+        docId,
+        name: res.name,
+        content: `# ARC is stale\n\n${detail} Refresh ARC from current disk and ledger evidence before using its prose as completion state.`,
+        truncated: false,
+        sizeBytes: r.size,
+        stale: true,
+      };
+    }
+  }
   return {
     docId,
     name: res.name,
     content: r.content,
     truncated: r.truncated,
     sizeBytes: r.size,
+    ...(res.name === 'ARC.md' ? { stale: false } : {}),
   };
 }

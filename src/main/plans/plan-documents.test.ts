@@ -128,6 +128,31 @@ test('ARC.md maps to overview while plan.md maps to plan', () => {
   } finally { f.dispose(); }
 });
 
+test('ARC freshness indicator and withheld read state cross the production document bridge', () => {
+  const arc = { ...doc('arc-stale', 'ARC.md', 'arc'), stale: true };
+  const f = fixture([arc]);
+  f.deps.readPlanningDocument = (id) => ({
+    docId: id,
+    name: 'ARC.md',
+    content: '# ARC is stale',
+    truncated: false,
+    sizeBytes: 100,
+    stale: true,
+  });
+  try {
+    const model = buildPlanDocuments(PLAN_ID, f.deps)!;
+    assert.equal(tab(model, 'overview').documents[0].stale, true);
+    const read = readPlanDocument(PLAN_ID, { source: 'folder', documentId: arc.docId }, f.deps);
+    assert.ok(!('error' in read));
+    if (!('error' in read)) {
+      assert.equal(read.stale, true);
+      assert.match(read.content, /ARC is stale/);
+    }
+  } finally {
+    f.dispose();
+  }
+});
+
 test('plan.json and every .gitkeep are suppressed defensively', () => {
   const f = fixture([
     doc('json-id', 'plan.json', 'other'),

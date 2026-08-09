@@ -179,6 +179,17 @@ describe('PlanDocumentTabs (WP-P4B tabbed document home)', () => {
     expect(ovEl.compareDocumentPosition(readerEl) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it('shows a stale badge and withholds the ARC reader when freshness is stale', async () => {
+    const staleModel = model();
+    staleModel.tabs.find((tab) => tab.key === 'overview')!.documents[0].stale = true;
+    documentsMock.mockResolvedValueOnce(staleModel);
+    await render(<PlanDocumentTabs planId="plan-1" />);
+
+    expect(document.querySelector('[data-testid="plan-arc-stale-badge"]')?.textContent).toContain('stale');
+    expect(document.querySelector('[data-testid="plan-arc-stale-notice"]')?.textContent).toContain('ARC is stale');
+    expect(document.querySelector('[data-testid="proposal-reader-body"]')).toBeNull();
+  });
+
   it('renders only projected keys — no plan.json / .gitkeep tab', async () => {
     await render(<PlanDocumentTabs planId="plan-1" />);
     const keys = tabButtons().map((b) => b.getAttribute('data-tab-key'));

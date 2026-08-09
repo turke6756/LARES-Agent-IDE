@@ -39,7 +39,7 @@
 //   npm run build:main
 //   node dist/main/main/plans/plan-manifest.test.js
 
-import { promises as fs } from 'fs';
+import { promises as fs, readdirSync, readFileSync, statSync } from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 
@@ -115,6 +115,120 @@ export interface PlanManifest {
   created_at?: number;
   updated_at?: number;
   [k: string]: unknown;
+}
+
+// ── ARC freshness ──────────────────────────────────────────────────────────
+
+const ARC_META_RE = /<!--ARC-META\s*([\s\S]*?)-->/;
+/** Values below this cannot be contemporary Unix epoch milliseconds. */
+const UNIX_MILLISECONDS_FLOOR = 100_000_000_000;
+
+export type ArcCutoffUnit = 'seconds' | 'milliseconds';
+
+export interface ArcFreshness {
+  /** True means ARC prose must not be presented as current completion state. */
+  stale: boolean;
+  /** Max mtime of source artifacts, computed from disk for this read. */
+  sourceMtimeMs: number;
+  /** Value exactly as stored in ARC-META. */
+  storedCutoff: number | null;
+  /** Stored cutoff normalized to Unix epoch milliseconds. */
+  cutoffMs: number | null;
+  cutoffUnit: ArcCutoffUnit | null;
+  /** Non-null when freshness could not be established from valid ARC metadata. */
+  error: 'source-unreadable' | 'arc-missing' | 'arc-meta-missing' | 'arc-meta-malformed' | 'cutoff-missing' | null;
+}
+
+/**
+ * Normalize legacy ARC cutoffs explicitly. Early ARC-META writers accidentally
+ * persisted Unix seconds under `folder_mtime_ms`; comparing that value directly
+ * with filesystem milliseconds makes every ARC look fresh. Contemporary epoch
+ * seconds and milliseconds are separated by three orders of magnitude.
+ */
+export function normalizeArcCutoff(value: unknown): {
+  storedCutoff: number;
+  cutoffMs: number;
+  cutoffUnit: ArcCutoffUnit;
+} | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
+  if (value < UNIX_MILLISECONDS_FLOOR) {
+    return { storedCutoff: value, cutoffMs: value * 1000, cutoffUnit: 'seconds' };
+  }
+  return { storedCutoff: value, cutoffMs: value, cutoffUnit: 'milliseconds' };
+}
+
+/**
+ * Compute the current source cutoff without writing the plan folder. This mirrors
+ * the ARC freshness contract: ARC.md itself, inert .gitkeep placeholders, and
+ * manifest lock/temp files are not sources.
+ */
+export function maxArcSourceMtimeMs(planFolder: string): number {
+  let max = 0;
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (dir === planFolder && entry.name === 'ARC.md') continue;
+      if (entry.name === '.gitkeep') continue;
+      if (entry.name.endsWith('.lock') || entry.name.includes('.wtmp-')) continue;
+      const absolute = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(absolute);
+      } else if (entry.isFile()) {
+        max = Math.max(max, statSync(absolute).mtimeMs);
+      }
+    }
+  };
+  walk(planFolder);
+  return max;
+}
+
+/**
+ * Read-only ARC freshness calculation. Metadata failures fail closed (`stale`)
+ * so callers never present unverifiable ARC prose as current completion state.
+ */
+export function calculateArcFreshness(planFolder: string): ArcFreshness {
+  let sourceMtimeMs: number;
+  try {
+    sourceMtimeMs = maxArcSourceMtimeMs(planFolder);
+  } catch {
+    return { stale: true, sourceMtimeMs: 0, storedCutoff: null, cutoffMs: null, cutoffUnit: null, error: 'source-unreadable' };
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(path.join(planFolder, 'ARC.md'), 'utf8');
+  } catch {
+    return { stale: true, sourceMtimeMs, storedCutoff: null, cutoffMs: null, cutoffUnit: null, error: 'arc-missing' };
+  }
+  const match = raw.match(ARC_META_RE);
+  if (!match) {
+    return { stale: true, sourceMtimeMs, storedCutoff: null, cutoffMs: null, cutoffUnit: null, error: 'arc-meta-missing' };
+  }
+  let meta: unknown;
+  try {
+    meta = JSON.parse(match[1].trim());
+  } catch {
+    return { stale: true, sourceMtimeMs, storedCutoff: null, cutoffMs: null, cutoffUnit: null, error: 'arc-meta-malformed' };
+  }
+  const cutoff = normalizeArcCutoff(
+    (meta as { source_cutoffs?: { folder_mtime_ms?: unknown } } | null)?.source_cutoffs?.folder_mtime_ms,
+  );
+  if (!cutoff) {
+    return { stale: true, sourceMtimeMs, storedCutoff: null, cutoffMs: null, cutoffUnit: null, error: 'cutoff-missing' };
+  }
+  return {
+    stale: sourceMtimeMs > cutoff.cutoffMs,
+    sourceMtimeMs,
+    ...cutoff,
+    error: null,
+  };
+}
+
+/** Calculate every immediate plan folder in stable name order; never writes. */
+export function calculatePlanArcFreshness(plansHome: string): Array<{ folder: string; freshness: ArcFreshness }> {
+  return readdirSync(plansHome, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b))
+    .map((folder) => ({ folder, freshness: calculateArcFreshness(path.join(plansHome, folder)) }));
 }
 
 export interface CasResult<T = PlanManifest> {

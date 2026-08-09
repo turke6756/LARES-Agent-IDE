@@ -123,6 +123,26 @@ test('manifest hides .gitkeep and plan.json; categorizes plan.md / ARC.md / subd
   assert.equal(cat('s1.md'), 'supplement');
 });
 
+test('stale ARC is marked and its completion prose is withheld at read time', () => {
+  const root = makeWorkspace();
+  const folder = makePlanFolder(root, 'stale-arc-deadbeef', { planMd: '# current plan' });
+  const sourceMtimeMs = fs.statSync(nodePath.join(folder, 'plan.md')).mtimeMs;
+  fs.writeFileSync(
+    nodePath.join(folder, 'ARC.md'),
+    `# ARC\n<!--ARC-META ${JSON.stringify({ source_cutoffs: { folder_mtime_ms: sourceMtimeMs - 1000 } })} -->\nCURRENT COMPLETION: done\n`,
+  );
+
+  const entry = listPlanningEntries(root).entries.find((row) => row.kind === 'plan-folder')!;
+  const arc = entry.documents.find((doc) => doc.name === 'ARC.md')!;
+  assert.equal(arc.stale, true, 'list surface exposes a stale indicator');
+  const read = readPlanningDocument(arc.docId);
+  assert.ok(!('error' in read));
+  if ('error' in read) return;
+  assert.equal(read.stale, true);
+  assert.match(read.content, /ARC is stale/);
+  assert.ok(!read.content.includes('CURRENT COMPLETION: done'), 'stale completion prose is not presented');
+});
+
 test('missing plan.json → folder not adopted (diagnostic, not an entry)', () => {
   const root = makeWorkspace();
   const folder = nodePath.join(plansDir(root), 'no-json-dir');

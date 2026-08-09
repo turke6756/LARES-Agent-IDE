@@ -400,6 +400,14 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
             }`}
           >
             {TAB_LABELS[t.key] ?? t.key}
+            {t.key === 'overview' && primaryDocOf(t)?.stale && (
+              <span
+                className="ml-1 rounded bg-amber-500/20 px-1 py-0.5 text-[9px] uppercase text-amber-300"
+                data-testid="plan-arc-stale-badge"
+              >
+                stale
+              </span>
+            )}
           </button>
         ))}
       </div>
@@ -542,6 +550,13 @@ export default function PlanDocumentTabs({ planId }: { planId: string }): React.
                   data-testid="plan-supplement-machine-diagnostic"
                 >
                   This work-package file couldn't be read. Fix its machine block; the parsed board shows the last valid packages.
+                </div>
+              ) : activeDoc?.stale ? (
+                <div
+                  className="flex h-full items-center justify-center px-6 text-center text-[13px] text-amber-300"
+                  data-testid="plan-arc-stale-notice"
+                >
+                  ARC is stale. Refresh it from current disk and ledger evidence before using its prose as completion state.
                 </div>
               ) : (
                 <ProposalReader

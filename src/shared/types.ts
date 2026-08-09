@@ -5142,6 +5142,8 @@ export interface PlanningReaderDocument {
   category: 'plan' | 'arc' | 'deliberation' | 'research' | 'supplement' | 'proposal' | 'other';
   sizeBytes: number;
   mtimeMs: number;
+  /** ARC-only: computed from current source mtimes versus ARC-META at list time. */
+  stale?: boolean;
 }
 
 /** One row in the planning reader — a bare proposal or a plan folder. */
@@ -5177,6 +5179,8 @@ export interface PlanningReaderReadResult {
   /** True when the file exceeded the per-file byte cap and was truncated. */
   truncated: boolean;
   sizeBytes: number;
+  /** ARC-only: true when content was withheld because ARC-META is stale/unverifiable. */
+  stale?: boolean;
 }
 
 // ── WP-P4A: folder-native plan document tabs ──
@@ -5245,6 +5249,8 @@ export interface PlanTabDocument {
   kind: 'arc' | 'plan' | 'deliberation' | 'research' | 'supplement' | 'proposal' | 'legacy-html';
   sizeBytes: number;
   mtimeMs: number | null;
+  /** ARC-only read-time freshness indicator. */
+  stale?: boolean;
   machine?: { kind: 'work-packages'; status: 'source' | 'invalid' };
 }
 
@@ -5269,6 +5275,7 @@ export interface PlanDocumentReadResult {
   content: string;
   truncated: boolean;
   sizeBytes: number;
+  stale?: boolean;
 }
 
 // ── WP-P4D-create — plan-comment create + routing ─────────────────────────────
