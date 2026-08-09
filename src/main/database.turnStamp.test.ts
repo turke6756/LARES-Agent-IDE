@@ -113,6 +113,8 @@ type DbModule = {
   listNamedSaveSetMembers(repositoryKey: string): Array<{
     intentId: string; entryId: string; pathBytesBase64: string; inventoryDigest: string; createdAt: number;
   }>;
+  insertAttributionResolution(input: Record<string, unknown>): Record<string, unknown>;
+  findCurrentAttributionResolution(input: Record<string, unknown>): Record<string, unknown> | null;
 };
 
 let dbm: DbModule;
@@ -194,6 +196,43 @@ test('WP-2 migration creates byte-addressed named save-set membership', () => {
     { intentId: 'named-baseline', entryId: 'entry-a', pathBytesBase64: 'YS50cw==', inventoryDigest: 'digest-a', createdAt: 123 },
     { intentId: 'named-baseline', entryId: 'entry-b', pathBytesBase64: 'Yi50cw==', inventoryDigest: 'digest-a', createdAt: 123 },
   ]);
+});
+
+test('WP-3 attribution resolutions are evidence-digest bound', () => {
+  const schema = dbm.getDb().prepare(
+    `SELECT type, name FROM sqlite_master WHERE name IN (?, ?, ?) ORDER BY name`,
+  ).all('attribution_resolutions', 'idx_attribution_resolutions_evidence',
+    'idx_attribution_resolutions_candidate');
+  assert.deepEqual(schema, [
+    { type: 'table', name: 'attribution_resolutions' },
+    { type: 'index', name: 'idx_attribution_resolutions_candidate' },
+    { type: 'index', name: 'idx_attribution_resolutions_evidence' },
+  ]);
+  const ws = freshWorkspace();
+  for (const id of ['intent-resolution-a', 'intent-resolution-b']) {
+    dbm.createNamedSaveSet({
+      id, workspaceId: ws, repositoryKey: 'repo-resolution', title: id,
+      inventoryDigest: 'inventory', createdAt: 10,
+      members: [{ entryId: `entry-${id}`, pathBytesBase64: 'YS50cw==' }],
+    });
+  }
+  dbm.insertAttributionResolution({
+    id: 'resolution-1', repositoryKey: 'repo-resolution', pathBytesBase64: 'YS50cw==',
+    evidenceDigest: 'evidence-before', earlierIntentId: 'intent-resolution-a',
+    laterIntentId: 'intent-resolution-b', resolution: 'commit-together',
+    chosenByAppUserId: 'human-1', chosenAt: 20, supersededIntentId: null,
+    restoreTurnId: null, consumedByCandidateId: null,
+  });
+  const lookup = {
+    repositoryKey: 'repo-resolution', pathBytesBase64: 'YS50cw==',
+    earlierIntentId: 'intent-resolution-a', laterIntentId: 'intent-resolution-b',
+  };
+  assert.equal(dbm.findCurrentAttributionResolution({
+    ...lookup, evidenceDigest: 'evidence-before',
+  })?.id, 'resolution-1');
+  assert.equal(dbm.findCurrentAttributionResolution({
+    ...lookup, evidenceDigest: 'evidence-after-byte-or-witness-change',
+  }), null);
 });
 
 test('turn allocation writes an immutable intent stamp and raw mutation is rejected', () => {

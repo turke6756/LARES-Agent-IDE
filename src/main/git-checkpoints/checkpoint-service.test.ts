@@ -186,6 +186,28 @@ test('snapshot leaves HEAD, real index checksum, porcelain-v2, and all refs/head
   assert.equal(fs.readdirSync(path.join(repo, '.git')).some((f) => f.startsWith('lares-idx-')), false);
 });
 
+test('afterImageRestoreInput exposes a verified per-path blob without restoring', async () => {
+  const repo = mkRepo();
+  fs.writeFileSync(path.join(repo, 'after.txt'), 'verified after image\n');
+  commitAll(repo);
+  const afterOid = git(repo, ['rev-parse', 'HEAD']).trim();
+  const expectedBlob = git(repo, ['rev-parse', 'HEAD:after.txt']).trim();
+  const store = new FakeStore();
+  store.seedOpen('after-turn', 'WS', {
+    afterOid, afterRef: 'HEAD', afterReady: true,
+    touched: [{ path: 'after.txt', op: 'write' }],
+  });
+  const svc = mkService({ store });
+  const input = await svc.afterImageRestoreInput({
+    turnId: 'after-turn', workspaceId: 'WS', repoRoot: repo, path: 'after.txt',
+  });
+  assert.deepEqual(input, {
+    turnId: 'after-turn', workspaceId: 'WS', path: 'after.txt',
+    afterCommitOid: afterOid, afterBlobOid: expectedBlob,
+  });
+  assert.equal(fs.readFileSync(path.join(repo, 'after.txt'), 'utf8'), 'verified after image\n');
+});
+
 test('[V] core.autocrlf=true: captured blob bytes == worktree CRLF bytes, NOT the LF HEAD blob', async () => {
   const repo = mkRepo({ config: [['core.autocrlf', 'true']] });
   const crlf = Buffer.from('alpha\r\nbeta\r\ngamma\r\n', 'latin1');

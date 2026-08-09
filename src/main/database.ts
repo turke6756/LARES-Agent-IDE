@@ -2458,6 +2458,32 @@ function initContextOptimizerSchema(): void {
       ON named_save_set_members(save_intent_id, inventory_digest);
   `);
 
+  // Save-card intent architecture WP-3 — evidence-bound human attribution
+  // resolutions. This region is additive and self-contained so parallel schema
+  // work can merge without sharing a table rebuild or migration marker.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS attribution_resolutions (
+      id                       TEXT PRIMARY KEY,
+      repository_key           TEXT NOT NULL,
+      path_bytes_base64        TEXT NOT NULL,
+      evidence_digest          TEXT NOT NULL,
+      earlier_intent_id        TEXT NOT NULL REFERENCES save_intents(id),
+      later_intent_id          TEXT NOT NULL REFERENCES save_intents(id),
+      resolution               TEXT NOT NULL CHECK (resolution IN
+                                 ('commit-together','superseded-intentionally','restore-lost-work')),
+      chosen_by_app_user_id    TEXT NOT NULL,
+      chosen_at                INTEGER NOT NULL,
+      superseded_intent_id     TEXT REFERENCES save_intents(id),
+      restore_turn_id          TEXT REFERENCES turn_records(id),
+      consumed_by_candidate_id TEXT,
+      UNIQUE (repository_key, path_bytes_base64, evidence_digest,
+              earlier_intent_id, later_intent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_attribution_resolutions_evidence
+      ON attribution_resolutions(repository_key, path_bytes_base64, evidence_digest);
+    CREATE INDEX IF NOT EXISTS idx_attribution_resolutions_candidate
+      ON attribution_resolutions(consumed_by_candidate_id);
+  `);
   try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_stamp_source TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE plan_dispatch_attempts ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
@@ -7620,6 +7646,92 @@ export interface SaveIntent {
   createdAt: number;
   readyAt: number | null;
   committedAt: number | null;
+}
+
+export type AttributionResolutionChoice =
+  | 'commit-together' | 'superseded-intentionally' | 'restore-lost-work';
+
+export interface AttributionResolution {
+  id: string;
+  repositoryKey: string;
+  pathBytesBase64: string;
+  evidenceDigest: string;
+  earlierIntentId: string;
+  laterIntentId: string;
+  resolution: AttributionResolutionChoice;
+  chosenByAppUserId: string;
+  chosenAt: number;
+  supersededIntentId: string | null;
+  restoreTurnId: string | null;
+  consumedByCandidateId: string | null;
+}
+
+function rowToAttributionResolution(row: any): AttributionResolution {
+  return {
+    id: row.id,
+    repositoryKey: row.repository_key,
+    pathBytesBase64: row.path_bytes_base64,
+    evidenceDigest: row.evidence_digest,
+    earlierIntentId: row.earlier_intent_id,
+    laterIntentId: row.later_intent_id,
+    resolution: row.resolution,
+    chosenByAppUserId: row.chosen_by_app_user_id,
+    chosenAt: row.chosen_at,
+    supersededIntentId: row.superseded_intent_id ?? null,
+    restoreTurnId: row.restore_turn_id ?? null,
+    consumedByCandidateId: row.consumed_by_candidate_id ?? null,
+  };
+}
+
+export function insertAttributionResolution(value: AttributionResolution): AttributionResolution {
+  run(
+    `INSERT INTO attribution_resolutions
+      (id, repository_key, path_bytes_base64, evidence_digest, earlier_intent_id,
+       later_intent_id, resolution, chosen_by_app_user_id, chosen_at,
+       superseded_intent_id, restore_turn_id, consumed_by_candidate_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [value.id, value.repositoryKey, value.pathBytesBase64, value.evidenceDigest,
+      value.earlierIntentId, value.laterIntentId, value.resolution,
+      value.chosenByAppUserId, value.chosenAt, value.supersededIntentId,
+      value.restoreTurnId, value.consumedByCandidateId],
+  );
+  return getAttributionResolution(value.id)!;
+}
+
+export function getAttributionResolution(id: string): AttributionResolution | null {
+  const row = queryOne('SELECT * FROM attribution_resolutions WHERE id = ?', [id]);
+  return row ? rowToAttributionResolution(row) : null;
+}
+
+/** A changed byte/witness/classifier version changes the digest and misses here. */
+export function findCurrentAttributionResolution(input: {
+  repositoryKey: string;
+  pathBytesBase64: string;
+  evidenceDigest: string;
+  earlierIntentId: string;
+  laterIntentId: string;
+}): AttributionResolution | null {
+  const row = queryOne(
+    `SELECT * FROM attribution_resolutions
+      WHERE repository_key = ? AND path_bytes_base64 = ? AND evidence_digest = ?
+        AND earlier_intent_id = ? AND later_intent_id = ?`,
+    [input.repositoryKey, input.pathBytesBase64, input.evidenceDigest,
+      input.earlierIntentId, input.laterIntentId],
+  );
+  return row ? rowToAttributionResolution(row) : null;
+}
+
+export function consumeAttributionResolution(
+  id: string,
+  evidenceDigest: string,
+  candidateId: string,
+): AttributionResolution | null {
+  run(
+    `UPDATE attribution_resolutions SET consumed_by_candidate_id = ?
+      WHERE id = ? AND evidence_digest = ? AND consumed_by_candidate_id IS NULL`,
+    [candidateId, id, evidenceDigest],
+  );
+  return getAttributionResolution(id);
 }
 
 // ── Save-card architecture WP-5 — planning activity worktrees ─────────────────

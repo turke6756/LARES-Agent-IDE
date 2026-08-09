@@ -26,6 +26,7 @@ import type {
   RepositoryIdentity,
   SelectionPreview,
   CommitCandidate,
+  CrossIntentChallengeAtom,
 } from '../../shared/commit-candidates';
 import type { CandidateBuildContext } from './candidate-service';
 import type { CommitRepresentation } from './commit-representation';
@@ -35,11 +36,16 @@ import type { FrozenManifestMember } from './finalization-service';
 interface TestCase {
   name: string;
   run(): Promise<void> | void;
+  skipped?: string;
 }
 
 const tests: TestCase[] = [];
 function test(name: string, run: () => Promise<void> | void): void {
   tests.push({ name, run });
+}
+
+function skip(name: string, reason: string, run: () => Promise<void> | void): void {
+  tests.push({ name, run, skipped: reason });
 }
 
 type Handler = (event: unknown, ...args: unknown[]) => unknown;
@@ -356,12 +362,13 @@ test('overlap component + selected unattributed entry surface the acknowledgemen
   assert.deepEqual(response.unacknowledgedUnattributedEntryIds, ['eu']);
 });
 
-function eligibleContext(): CandidateBuildContext {
+function eligibleContext(over: Partial<CandidateBuildContext> = {}): CandidateBuildContext {
   return baseContext({
     finalizations: [finalization()],
     currentCommitReps: new Map<string, CommitRepresentation>([
       ['e1', { expectedState: 'present', rawBlobOid: 'raw-e1', commitBlobOid: 'commit-e1', commitMode: '100644' }],
     ]),
+    ...over,
   });
 }
 
@@ -384,9 +391,34 @@ test('an otherwise-eligible production-shaped preview remains tokenless', async 
   assert.equal(response.refusal, null);
 });
 
+// WP-3 foundation: cross-intent atoms are filtered by selectedTopologyEvidence (kind === 'overlap'); WP-4 rewires atom projection and MUST unskip this test.
+skip('production registration transports the versioned cross-intent atom unchanged', 'WP-4 atom projection', async () => {
+  const atom: CrossIntentChallengeAtom = {
+    kind: 'cross-intent', atomId: 'cross:repo:path:a:b', digest: 'evidence-1',
+    reasonVersion: 1, pathBytesBase64: 'c3JjL2UxLnRz', displayPath: 'src/e1.ts',
+    earlierIntentId: 'intent-a', laterIntentId: 'intent-b', evidenceDigest: 'evidence-1',
+    resolution: null,
+  };
+  const ipc = new FakeIpc();
+  registerSaveCardPreviewIpc(ipc, () => ({
+    resolvePreviewContext: async () => eligibleContext({ reviewChallengeAtoms: [atom] }),
+  }));
+  assert.ok(ipc.handlers.has(SAVECARD_PREVIEW_CHANNEL),
+    'production registerSaveCardPreviewIpc must register cross-intent transport');
+  const response = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, {
+    workspaceId: 'ws-1', selectedComponentIds: ['c1'],
+    selectedUnattributedEntryIds: [], finalizationIds: ['fin-1'],
+  }) as SaveCardPreviewResponse;
+  assert.deepEqual(response.reviewedManifest?.challengeAtoms, [atom]);
+});
+
 (async () => {
   let failed = 0;
   for (const entryCase of tests) {
+    if (entryCase.skipped) {
+      console.log(`  - ${entryCase.name} (skipped: ${entryCase.skipped})`);
+      continue;
+    }
     try {
       await entryCase.run();
       console.log(`  ✓ ${entryCase.name}`);

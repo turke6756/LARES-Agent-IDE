@@ -92,6 +92,8 @@ import {
 import { CheckpointQueue, type CheckpointPriority, type SkippedDeadline } from './checkpoint-queue';
 import { checkpointRef, recoveryRef, type CheckpointEdge } from './ref-encoding';
 import { deriveRawGitMode } from './raw-git-mode';
+import { encodeGitPath } from '../commit-candidates/dirty-inventory';
+import { resolveCheckpointPathBlob } from './concurrency-policy';
 
 // ── injectable seams ──────────────────────────────────────────────────────────
 
@@ -202,6 +204,15 @@ export interface CheckpointServiceOptions {
     lstat?: LstatFn;
   }) => Promise<EnumerationOutcome>;
   platform?: NodeJS.Platform;
+}
+
+/** Verified after-image input consumed by the supervisor restore authority. */
+export interface AfterImageRestoreInput {
+  turnId: string;
+  workspaceId: string;
+  path: string;
+  afterCommitOid: string;
+  afterBlobOid: string | null;
 }
 
 // ── result / outcome types ──────────────────────────────────────────────────────
@@ -933,6 +944,45 @@ export class CheckpointService {
    * are rejected, mirroring `validateRestorePaths` (whole-tree recovery is never
    * reachable here). Defaults `requestedPaths` to the full witnessed set.
    */
+  /**
+   * Resolve the verified after-checkpoint blob used by the cross-intent picker.
+   * This is deliberately read-only: callers receive an input for the existing
+   * supervisor-side restore authority; workers and the renderer never write it.
+   */
+  async afterImageRestoreInput(params: {
+    turnId: string;
+    workspaceId: string;
+    repoRoot: string;
+    path: string;
+  }): Promise<AfterImageRestoreInput | null> {
+    const row = this.store.getTurnRecord(params.turnId);
+    if (!row || row.workspaceId !== params.workspaceId || !row.afterOid) return null;
+    const canonical = canonicalHistoryPath(params.path, params.repoRoot);
+    const witnessed = (row.touched ?? []).some((entry) =>
+      (entry.op === 'write' || entry.op === 'create')
+      && canonicalHistoryPath(entry.path, params.repoRoot) === canonical);
+    if (!witnessed || canonical === '') return null;
+    const usable = await this.isEdgeUsable(
+      params.repoRoot, row.afterReady, row.afterRef, row.afterOid,
+    );
+    if (!usable) return null;
+    const encoded = encodeGitPath(Buffer.from(canonical, 'utf8'));
+    const afterBlobOid = await resolveCheckpointPathBlob({
+      repoRoot: params.repoRoot,
+      gitExe: this.gitExe,
+      commitOid: row.afterOid,
+      path: encoded,
+      runGit: this.runGit,
+    });
+    return {
+      turnId: row.id,
+      workspaceId: row.workspaceId,
+      path: canonical,
+      afterCommitOid: row.afterOid,
+      afterBlobOid,
+    };
+  }
+
   async previewRestore(params: {
     turnId: string;
     workspaceId: string;

@@ -27,6 +27,7 @@ export interface ContentionWorkspaceScope {
 
 export interface ContentionTurnEvidence {
   turnId: string;
+  intentId: string | null;
   workspaceId: string;
   agentId: string | null;
   taskLabel: string | null;
@@ -121,6 +122,7 @@ function turnIsInWindow(turn: TurnRecord, now: number, recentWindowMs: number): 
 function evidence(turn: TurnRecord): ContentionTurnEvidence {
   return {
     turnId: turn.id,
+    intentId: turn.intentId ?? null,
     workspaceId: turn.workspaceId,
     agentId: turn.agentId,
     taskLabel: turn.taskLabel,

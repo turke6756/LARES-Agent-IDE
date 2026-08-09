@@ -39,6 +39,8 @@ function turn(overrides: Partial<TurnRecord> & Pick<TurnRecord, 'id' | 'workspac
     ownerBrickGeneration: null,
     sessionId: null,
     taskLabel: 'editing',
+    intentId: 'intent-default',
+    intentStampSource: 'task-dispatch',
     startedAt: NOW - 100,
     endedAt: null,
     status: 'open',
@@ -86,6 +88,7 @@ test('repo-normalized overlap emits a non-blocking advisory', () => {
   assert.equal(advisory.blocks, false);
   assert.equal(advisory.overlaps.length, 1);
   assert.equal(advisory.overlaps[0].turns[0].turnId, 'active-a');
+  assert.equal(advisory.overlaps[0].turns[0].intentId, 'intent-default');
   assert.equal(advisory.overlaps[0].path.pathBytesBase64,
     Buffer.from('packages/a/src/foo.ts', 'utf8').toString('base64'));
 });

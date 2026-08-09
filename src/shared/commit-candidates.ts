@@ -193,6 +193,25 @@ export interface ReviewedClosureObligation {
   commitMode: string | null;
 }
 
+export type CrossIntentResolution =
+  | 'commit-together'
+  | 'superseded-intentionally'
+  | 'restore-lost-work';
+
+/** Versioned, evidence-bound blocker: exactly one per path + intent pair. */
+export interface CrossIntentChallengeAtom {
+  kind: 'cross-intent';
+  atomId: string;
+  digest: string;
+  reasonVersion: 1;
+  pathBytesBase64: string;
+  displayPath: string;
+  earlierIntentId: string;
+  laterIntentId: string;
+  evidenceDigest: string;
+  resolution: CrossIntentResolution | null;
+}
+
 export type ReviewChallengeAtom =
   | {
       kind: 'unattributed';
@@ -209,7 +228,8 @@ export type ReviewChallengeAtom =
       memberPathBytesBase64: string[];
       contributors: AttributionContributor[];
       ownershipGroupKeys: string[];
-    };
+    }
+  | CrossIntentChallengeAtom;
 
 /**
  * Main-process-only review contract. It deliberately excludes operational
@@ -369,14 +389,14 @@ export function normalizeReviewedSemanticManifest(
         sortedStrings(manifest.attributionTopology.selectedUnattributedPathBytesBase64),
     },
     closureObligations: sortedByJcs(manifest.closureObligations),
-    challengeAtoms: sortedByJcs(manifest.challengeAtoms.map((atom) => atom.kind === 'unattributed'
-      ? { ...atom }
-      : {
+    challengeAtoms: sortedByJcs(manifest.challengeAtoms.map((atom) => atom.kind === 'overlap'
+      ? {
           ...atom,
           memberPathBytesBase64: sortedStrings(atom.memberPathBytesBase64),
           contributors: sortedByJcs(atom.contributors),
           ownershipGroupKeys: [...atom.ownershipGroupKeys].sort(),
-        })),
+        }
+      : { ...atom })),
   };
 }
 

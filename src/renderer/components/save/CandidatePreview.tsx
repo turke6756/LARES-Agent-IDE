@@ -5,6 +5,8 @@ import type {
   CommitEligibility,
   PackageVerificationState,
   ReviewChallengeAtom,
+  CrossIntentChallengeAtom,
+  CrossIntentResolution,
 } from '../../../shared/commit-candidates';
 import { renderSaveRefusal } from './save-refusal-copy';
 
@@ -48,6 +50,12 @@ export interface CandidatePreviewProps {
   authoritativeResponse?: SaveCardPreviewResponse | null;
   /** Lets the package checkbox mirror preview/verification work in place. */
   onBusyChange?: (busy: boolean) => void;
+  /** Main-owned persistence seam. A restore choice is a request to supervisor
+   * authority; CandidatePreview never mutates repository bytes itself. */
+  onCrossIntentResolution?: (
+    atom: CrossIntentChallengeAtom,
+    resolution: CrossIntentResolution,
+  ) => void | Promise<void>;
 }
 
 export interface CandidatePreviewDraft {
@@ -59,6 +67,11 @@ export interface CandidatePreviewDraft {
   /** Exact challenge evidence acknowledged by the human. Both atom id and digest
    * are retained, so a changed atom resets without disturbing unchanged atoms. */
   acknowledgedChallengeAtoms: ReviewChallengeAtom[];
+  crossIntentResolutions?: Array<{
+    atomId: string;
+    evidenceDigest: string;
+    resolution: CrossIntentResolution;
+  }>;
   previewedCandidateId: string | null;
   componentTopologyDigest: string;
   checkedUnattributedEntryIds: string[];
@@ -151,6 +164,26 @@ function unattributedAtomForEntry(
     atom.kind === 'unattributed' && atom.pathBytesBase64 === pathBytesBase64);
 }
 
+function crossIntentAtoms(response: SaveCardPreviewResponse): CrossIntentChallengeAtom[] {
+  return challengeAtoms(response).filter(
+    (atom): atom is CrossIntentChallengeAtom => atom.kind === 'cross-intent',
+  );
+}
+
+function crossIntentKey(atom: CrossIntentChallengeAtom): string {
+  return `${atom.atomId}\0${atom.evidenceDigest}`;
+}
+
+function retainCrossResolutions(
+  current: Record<string, CrossIntentResolution>,
+  response: SaveCardPreviewResponse,
+): Record<string, CrossIntentResolution> {
+  return Object.fromEntries(crossIntentAtoms(response).flatMap((atom) => {
+    const resolution = atom.resolution ?? current[crossIntentKey(atom)];
+    return resolution ? [[crossIntentKey(atom), resolution]] : [];
+  }));
+}
+
 export default function CandidatePreview({
   workspaceId,
   selection,
@@ -161,11 +194,13 @@ export default function CandidatePreview({
   onDraftChange,
   authoritativeResponse,
   onBusyChange,
+  onCrossIntentResolution,
 }: CandidatePreviewProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [messageBody, setMessageBody] = useState('');
   const [userTrailers, setUserTrailers] = useState('');
   const [acknowledgedAtoms, setAcknowledgedAtoms] = useState<ReviewChallengeAtom[]>([]);
+  const [crossResolutions, setCrossResolutions] = useState<Record<string, CrossIntentResolution>>({});
   const [commitBusy, setCommitBusy] = useState(false);
   const commitInFlightRef = useRef(false);
 
@@ -198,6 +233,7 @@ export default function CandidatePreview({
         setState({ status: 'ready', response });
         setMessageBody(response.defaultMessageBody);
         setAcknowledgedAtoms((current) => retainAcknowledgedAtoms(current, response));
+        setCrossResolutions((current) => retainCrossResolutions(current, response));
       } catch (err) {
         if (isCurrent()) setState({ status: 'error', message: `Preview verification stage failed unexpectedly: ${errorMessage(err)}` });
       }
@@ -218,6 +254,7 @@ export default function CandidatePreview({
     if (!authoritativeResponse) return;
     setState({ status: 'ready', response: authoritativeResponse });
     setAcknowledgedAtoms((current) => retainAcknowledgedAtoms(current, authoritativeResponse));
+    setCrossResolutions((current) => retainCrossResolutions(current, authoritativeResponse));
   }, [authoritativeResponse]);
 
   useEffect(() => {
@@ -230,6 +267,13 @@ export default function CandidatePreview({
     const overlapSatisfied = !response.requiresOverlapAck
       || (currentOverlapAtoms.length > 0
         && currentOverlapAtoms.every((atom) => isAcknowledged(acknowledgedAtoms, atom)));
+    const currentCrossAtoms = crossIntentAtoms(response);
+    const selectedCrossResolutions = currentCrossAtoms.flatMap((atom) => {
+      const resolution = atom.resolution ?? crossResolutions[crossIntentKey(atom)];
+      return resolution ? [{ atomId: atom.atomId, evidenceDigest: atom.evidenceDigest, resolution }] : [];
+    });
+    const crossIntentSatisfied = selectedCrossResolutions.length === currentCrossAtoms.length
+      && selectedCrossResolutions.every((item) => item.resolution !== 'restore-lost-work');
     const unattributedSatisfied = currentAtoms
       .filter((atom) => atom.kind === 'unattributed')
       .every((atom) => isAcknowledged(acknowledgedAtoms, atom))
@@ -243,6 +287,7 @@ export default function CandidatePreview({
       reviewedManifestDigest: response.reviewedManifest?.reviewedManifestDigest ?? null,
       durableFinalizationIntent: response.durableFinalizationIntent ?? [],
       acknowledgedChallengeAtoms: acknowledgedAtoms,
+      crossIntentResolutions: selectedCrossResolutions,
       previewedCandidateId: response.isCandidate && 'candidateId' in response.candidate
         ? response.candidate.candidateId
         : null,
@@ -252,12 +297,13 @@ export default function CandidatePreview({
       messageBody,
       userTrailers,
       canSave: response.isCandidate && eligible && overlapSatisfied && unattributedSatisfied
+        && crossIntentSatisfied
         && Boolean(response.reviewedManifest?.reviewedManifestDigest)
         && Boolean(response.durableFinalizationIntent?.length) && !reservedTrailer,
       reservedTrailer,
       acknowledgedUnattributedEntryIds: checkedUnattributedEntryIds,
     });
-  }, [state, onDraftChange, messageBody, userTrailers, acknowledgedAtoms]);
+  }, [state, onDraftChange, messageBody, userTrailers, acknowledgedAtoms, crossResolutions]);
 
   if (state.status === 'loading') {
     return (
@@ -298,12 +344,19 @@ export default function CandidatePreview({
   const overlapAtoms = currentAtoms.filter((atom) => atom.kind === 'overlap');
   const overlapSatisfied = !response.requiresOverlapAck
     || (overlapAtoms.length > 0 && overlapAtoms.every((atom) => isAcknowledged(acknowledgedAtoms, atom)));
+  const currentCrossAtoms = crossIntentAtoms(response);
+  const selectedCrossResolutions = currentCrossAtoms.flatMap((atom) => {
+    const resolution = atom.resolution ?? crossResolutions[crossIntentKey(atom)];
+    return resolution ? [{ atomId: atom.atomId, evidenceDigest: atom.evidenceDigest, resolution }] : [];
+  });
+  const crossIntentSatisfied = selectedCrossResolutions.length === currentCrossAtoms.length
+    && selectedCrossResolutions.every((item) => item.resolution !== 'restore-lost-work');
   const unattributedSatisfied = currentAtoms
     .filter((atom) => atom.kind === 'unattributed')
     .every((atom) => isAcknowledged(acknowledgedAtoms, atom))
     && response.unacknowledgedUnattributedEntryIds.every((id) =>
       isAcknowledged(acknowledgedAtoms, unattributedAtomForEntry(response, id)));
-  const acksSatisfied = overlapSatisfied && unattributedSatisfied;
+  const acksSatisfied = overlapSatisfied && unattributedSatisfied && crossIntentSatisfied;
   // One-click save is allowed ONLY for a finalization-backed candidate that the
   // server declared eligible, with every acknowledgement satisfied and no reserved
   // user trailer. Mismatch / degraded / unfinalized work is previewable, never
@@ -324,6 +377,14 @@ export default function CandidatePreview({
     const atom = unattributedAtomForEntry(response, entryId);
     if (!atom) return;
     setAtomsAcknowledged([atom], !isAcknowledged(acknowledgedAtoms, atom));
+  };
+
+  const resolveCrossIntent = async (
+    atom: CrossIntentChallengeAtom,
+    resolution: CrossIntentResolution,
+  ) => {
+    await onCrossIntentResolution?.(atom, resolution);
+    setCrossResolutions((current) => ({ ...current, [crossIntentKey(atom)]: resolution }));
   };
 
   const unattributedRows = response.unacknowledgedUnattributedEntryIds.map((entryId) => ({
@@ -383,6 +444,43 @@ export default function CandidatePreview({
       </ul>
 
       {/* Acknowledgements — must be satisfied before a one-click save. */}
+      {currentCrossAtoms.map((atom) => {
+        const selected = atom.resolution ?? crossResolutions[crossIntentKey(atom)] ?? null;
+        return (
+          <fieldset
+            key={crossIntentKey(atom)}
+            className="sc-preview-cross-intent"
+            data-testid="candidate-preview-cross-intent-picker"
+            data-path-bytes={atom.pathBytesBase64}
+          >
+            <legend>Two tasks diverged on {atom.displayPath}</legend>
+            <div className="sc-save-note">
+              Choose how to preserve the intent history. This decision resets if file or witness evidence changes.
+            </div>
+            {([
+              ['commit-together', 'Commit together'],
+              ['superseded-intentionally', 'Superseded intentionally'],
+              ['restore-lost-work', 'Work was lost — restore'],
+            ] as const).map(([resolution, label]) => (
+              <label key={resolution} className="sc-preview-ack">
+                <input
+                  type="radio"
+                  name={`cross-intent-${atom.atomId}`}
+                  value={resolution}
+                  checked={selected === resolution}
+                  onChange={() => { void resolveCrossIntent(atom, resolution); }}
+                />
+                <span>{label}</span>
+              </label>
+            ))}
+            {selected === 'restore-lost-work' && (
+              <div className="sc-save-note" data-testid="candidate-preview-restore-authority-note">
+                Restore is sent to supervisor checkpoint authority. This stale preview cannot be saved.
+              </div>
+            )}
+          </fieldset>
+        );
+      })}
       {response.requiresOverlapAck && (
         <label className="sc-preview-ack" data-testid="candidate-preview-overlap-ack">
           <input
@@ -499,6 +597,7 @@ export default function CandidatePreview({
                   reviewedManifestDigest: response.reviewedManifest?.reviewedManifestDigest ?? null,
                   durableFinalizationIntent: response.durableFinalizationIntent ?? [],
                   acknowledgedChallengeAtoms: acknowledgedAtoms,
+                  crossIntentResolutions: selectedCrossResolutions,
                   previewedCandidateId: response.isCandidate && 'candidateId' in response.candidate
                     ? response.candidate.candidateId
                     : null,

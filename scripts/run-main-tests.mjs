@@ -716,6 +716,9 @@ const TESTS = [
   // recent turn_records.touched, planned paths mapped through the workspace prefix
   // into repo-relative pathBytesBase64 before comparison; advisory only, never blocks.
   'dist/main/main/git-checkpoints/contention-model.test.js',
+  // Intent architecture WP-3: per-path checkpoint-tree observation and the
+  // five-way graduated concurrency classifier, including pruned evidence.
+  'dist/main/main/git-checkpoints/concurrency-policy.test.js',
   // WP-P7C: blame-to-intent — file→contributing turns→plans with a confidence
   // label + conflicting-contributor list ("contributed," never "authored"); file-level
   // v1, no exact-line/clobber overclaim; post-ledger strengthen via SC-WP-2G.

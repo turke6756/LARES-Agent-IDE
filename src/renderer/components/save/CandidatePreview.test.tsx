@@ -23,6 +23,7 @@ import type {
   CommitEligibility,
   PackageVerificationState,
   ReviewChallengeAtom,
+  CrossIntentChallengeAtom,
   SelectionPreview,
 } from '../../../shared/commit-candidates';
 import CandidatePreview, { type CandidatePreviewSelection } from './CandidatePreview';
@@ -93,6 +94,15 @@ function response(over: Partial<SaveCardPreviewResponse> = {}): SaveCardPreviewR
       boundaryStatus: 'ready', frozenMemberManifestDigest: 'frozen-1',
     }],
     ...over,
+  };
+}
+
+function crossIntentAtom(over: Partial<CrossIntentChallengeAtom> = {}): CrossIntentChallengeAtom {
+  return {
+    kind: 'cross-intent', atomId: 'cross-1', digest: 'evidence-1', reasonVersion: 1,
+    pathBytesBase64: Buffer.from('src/shared.ts').toString('base64'),
+    displayPath: 'src/shared.ts', earlierIntentId: 'intent-a', laterIntentId: 'intent-b',
+    evidenceDigest: 'evidence-1', resolution: null, ...over,
   };
 }
 
@@ -282,6 +292,43 @@ describe('CandidatePreview', () => {
     const unattr = q('candidate-preview-unattributed-ack')!.querySelector('input') as HTMLInputElement;
     await act(async () => { unattr.click(); });
     expect(save().disabled).toBe(false);
+  });
+
+  it('scenario 7: cross-intent divergence blocks only on one three-choice picker', async () => {
+    const atom = crossIntentAtom();
+    const onCrossIntentResolution = vi.fn();
+    preview.mockResolvedValue(response({
+      reviewedManifest: { ...response().reviewedManifest!, challengeAtoms: [atom] },
+    }));
+    await render({ onCrossIntentResolution });
+
+    const pickers = all('candidate-preview-cross-intent-picker');
+    expect(pickers).toHaveLength(1);
+    expect(pickers[0].textContent).toContain('src/shared.ts');
+    const choices = pickers[0].querySelectorAll<HTMLInputElement>('input[type="radio"]');
+    expect(choices).toHaveLength(3);
+    expect((q('candidate-preview-save') as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => { choices[0].click(); await Promise.resolve(); });
+    expect(onCrossIntentResolution).toHaveBeenCalledWith(atom, 'commit-together');
+    expect((q('candidate-preview-save') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('scenario 8: lost-work choice requests authority and cannot commit stale bytes', async () => {
+    const atom = crossIntentAtom();
+    const onCrossIntentResolution = vi.fn();
+    preview.mockResolvedValue(response({
+      reviewedManifest: { ...response().reviewedManifest!, challengeAtoms: [atom] },
+    }));
+    await render({ onCrossIntentResolution });
+
+    const restore = q('candidate-preview-cross-intent-picker')!
+      .querySelector<HTMLInputElement>('input[value="restore-lost-work"]')!;
+    await act(async () => { restore.click(); await Promise.resolve(); });
+
+    expect(onCrossIntentResolution).toHaveBeenCalledWith(atom, 'restore-lost-work');
+    expect(q('candidate-preview-restore-authority-note')!.textContent).toContain('supervisor');
+    expect((q('candidate-preview-save') as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('labels unattributed acknowledgements with paths and acknowledges a backlog in one gesture', async () => {
