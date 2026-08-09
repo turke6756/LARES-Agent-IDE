@@ -25,9 +25,10 @@
 // lane's dirty file in the same folder is never silently dropped from the preview.
 
 import * as fs from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
-import type { GitCapability, SaveCardMintRequest, SaveCardPreviewRequest, SaveSweepIntent } from '../../shared/types';
+import type { GitCapability, SaveCardMintRequestV2, SaveCardPreviewRequest, SaveSweepIntent,
+  SaveCardAttributionResolutionRequest, SaveCardAttributionResolutionResponse } from '../../shared/types';
 import type { PlanCandidatePreviewRequest } from '../../shared/types';
 import type { DirtyEntry } from '../../shared/commit-candidates';
 import { BUNDLE_CONTRACT_VERSION } from '../../shared/constants';
@@ -41,9 +42,14 @@ import {
   listCommitPathLinks as dbListCommitPathLinks,
   listTurnRecords as dbListTurnRecords,
   listActivePackageFinalizationsForRepository as dbListActivePackageFinalizationsForRepository,
+  getSaveIntentFinalization as dbGetSaveIntentFinalization,
+  getAttributionResolution as dbGetAttributionResolution,
+  findCurrentAttributionResolution as dbFindCurrentAttributionResolution,
+  insertAttributionResolution as dbInsertAttributionResolution,
   type PackageFinalization,
   type PlanWorkPackage,
   type PlanWorkPackagePath,
+  type SaveIntentFinalization,
 } from '../database';
 import { probeWorkspaceGit as realProbeWorkspaceGit } from '../git/git-runtime';
 import { runGit as realRunGit, runGitBytes as realRunGitBytes } from '../git-checkpoints/git-command';
@@ -51,6 +57,8 @@ import {
   CommitCandidateService,
   computeCandidateTopologyDigest,
   buildCandidate,
+  buildCandidateV2,
+  reviewChallengeAtomsForInventory,
   type CandidateTokenSnapshot,
   type CandidateBuildContext,
   type CandidateInventoryRead,
@@ -83,6 +91,7 @@ import type {
   SaveCardFinalizeRoutes,
   SaveCardPreviewRoutes,
   SaveCardMintRoutes,
+  SaveCardAttributionResolutionRoutes,
 } from './save-card-ipc';
 import { parseFinalizationManifest, resolvePinnedSelectionDrift } from './pinned-selection-drift';
 import { readCheckpointTree } from './protection-read';
@@ -96,6 +105,18 @@ import type {
 
 const OID_RE = /^[0-9a-f]{40,64}$/;
 const HEAD_TIMEOUT_MS = 10_000;
+
+function isV2MintRequest(
+  request: CandidateTokenSnapshot['normalizedRequest'],
+): request is import('../../shared/commit-candidates').MintCandidateTokenRequestV2 {
+  return Array.isArray((request as { selectedIntentIds?: unknown }).selectedIntentIds);
+}
+
+function isCrossIntentAtom(
+  atom: import('../../shared/commit-candidates').ReviewChallengeAtom,
+): atom is import('../../shared/commit-candidates').CrossIntentChallengeAtom {
+  return atom.kind === 'cross-intent' && 'evidenceDigest' in atom && 'pathBytesBase64' in atom;
+}
 
 /** Injected seams. Production passes only `gitExe` (the engine's already-resolved
  *  internal Git); the rest default to the live database / git runtime. Tests
@@ -181,6 +202,7 @@ function canonicalDir(realpath: (p: string) => string, p: string): string {
 export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   saveCardPreviewRoutes: SaveCardPreviewRoutes;
   saveCardMintRoutes: SaveCardMintRoutes;
+  saveCardAttributionResolutionRoutes: SaveCardAttributionResolutionRoutes;
   planPreviewRoutes: PlanCandidatePreviewRoutes;
   saveCardFinalizeRoutes: SaveCardFinalizeRoutes;
   productionSeams: PreviewProductionSeams;
@@ -305,6 +327,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         components: read.components,
         ledger,
         protectionByEntryId: read.protectionByEntryId,
+        ...(read.intentUnits ? { intentUnits: read.intentUnits } : {}),
         pinnedHeadOid,
         indexFingerprint,
         contractVersion,
@@ -371,6 +394,22 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   }
 
   /** Complete a scope into a full build context for the given effective selection. */
+  function adaptIntentFinalization(row: SaveIntentFinalization): PackageFinalization {
+    return {
+      id: row.id, packageId: row.saveUnitId, repositoryKey: row.repositoryKey,
+      finalizationKind: row.saveUnitKind === 'task' ? 'plan-package' : 'fleet-adhoc',
+      planId: null, planItemId: null, packageRevision: row.revision,
+      finalizedAt: row.finalizedAt, finalizedBy: row.finalizedBy,
+      checkpointTurnId: null, checkpointOid: row.checkpointOid,
+      boundaryRef: row.boundaryRef, boundaryStatus: row.boundaryStatus,
+      lifecycleStatus: row.lifecycleStatus,
+      supersededByFinalizationId: row.supersededByFinalizationId,
+      releasedAt: null, memberManifestJson: row.memberManifestJson,
+      contractVersion: 2, failureReason: row.failureReason,
+      createdFromWorkspaceId: null,
+    };
+  }
+
   async function buildContext(
     scope: PreviewScope,
     selectedComponentIds: readonly string[],
@@ -378,7 +417,10 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     finalizationIds: readonly string[],
   ): Promise<CandidateBuildContext> {
     const finalizations = [...new Set(finalizationIds)]
-      .map((id) => getPackageFinalization(id))
+      .map((id) => getPackageFinalization(id)
+        ?? (process.env.LARES_INTENT_PACKAGING === '1'
+          ? (() => { const row = dbGetSaveIntentFinalization(id); return row ? adaptIntentFinalization(row) : null; })()
+          : null))
       .filter((f): f is PackageFinalization => f !== null);
     const effectiveMembers = finalizationIds.length === 0
       ? selectionMembers(scope, selectedComponentIds, selectedUnattributedEntryIds)
@@ -410,29 +452,66 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
       );
     },
   };
-  const saveCardMintRoutes: SaveCardMintRoutes = {
-    async mintCandidate(req: SaveCardMintRequest) {
+  const saveCardMintRoutes = {
+    async mintCandidate(req: SaveCardMintRequestV2 | import('../../shared/types').LegacySaveCardMintRequest) {
       const scope = await assembleScope(req.workspaceId);
+      if (process.env.LARES_INTENT_PACKAGING !== '1') {
+        if (!('selectedComponentIds' in req)) throw new Error('intent packaging is disabled');
+        const context = await buildContext(
+          scope,
+          req.selectedComponentIds,
+          req.selectedUnattributedEntryIds,
+          req.finalizationIds,
+        );
+        const candidate = service.mintCandidateToken({
+          selectedComponentIds: req.selectedComponentIds,
+          selectedUnattributedEntryIds: req.selectedUnattributedEntryIds,
+          finalizationIds: req.finalizationIds,
+          acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
+          ...(req.reviewedManifestDigest !== undefined
+            ? { reviewedManifestDigest: req.reviewedManifestDigest }
+            : {}),
+          ...(req.acknowledgedChallengeAtoms !== undefined
+            ? { acknowledgedChallengeAtoms: req.acknowledgedChallengeAtoms }
+            : {}),
+        }, context);
+        return { candidate, context };
+      }
+      if (!('selectedIntentIds' in req)) throw new Error('intent packaging requires a v2 mint request');
+      const v2Request = req as SaveCardMintRequestV2;
+      const selectedIds = new Set([...v2Request.selectedIntentIds, ...v2Request.selectedNamedSaveSetIds]);
+      const selectedUnits = (scope.context.intentUnits ?? []).filter((unit) => selectedIds.has(unit.intentId));
+      if (selectedUnits.length !== selectedIds.size) throw new Error('selected save intent is stale or unknown');
+      const memberEntryIds = [...new Set(selectedUnits.flatMap((unit) => unit.memberEntryIds))].sort();
       const context = await buildContext(
         scope,
-        req.selectedComponentIds,
-        req.selectedUnattributedEntryIds,
-        req.finalizationIds,
+        [],
+        memberEntryIds,
+        v2Request.finalizationIds,
       );
-      const candidate = service.mintCandidateToken({
-        selectedComponentIds: req.selectedComponentIds,
-        selectedUnattributedEntryIds: req.selectedUnattributedEntryIds,
-        finalizationIds: req.finalizationIds,
-        acknowledgeTopologyDigest: req.acknowledgeTopologyDigest,
-        acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
-        ...(req.reviewedManifestDigest !== undefined
-          ? { reviewedManifestDigest: req.reviewedManifestDigest }
+      const attributionResolutions = v2Request.resolutionIds.map((id) => dbGetAttributionResolution(id))
+        .filter((row): row is NonNullable<typeof row> => row !== null)
+        .filter((row) => row.resolution !== 'restore-lost-work')
+        .map((row) => ({
+          resolutionId: row.id, evidenceDigest: row.evidenceDigest,
+          resolution: row.resolution as 'commit-together' | 'superseded-intentionally',
+          affectedPathBytesBase64: [row.pathBytesBase64],
+          intentIds: [row.earlierIntentId, row.laterIntentId],
+        }));
+      const v2Context = { ...context, attributionResolutions };
+      const candidate = service.mintCandidateTokenV2({
+        selectedIntentIds: v2Request.selectedIntentIds,
+        selectedNamedSaveSetIds: v2Request.selectedNamedSaveSetIds,
+        resolutionIds: v2Request.resolutionIds,
+        finalizationIds: v2Request.finalizationIds,
+        ...(v2Request.reviewedManifestDigest !== undefined
+          ? { reviewedManifestDigest: v2Request.reviewedManifestDigest }
           : {}),
-        ...(req.acknowledgedChallengeAtoms !== undefined
-          ? { acknowledgedChallengeAtoms: req.acknowledgedChallengeAtoms }
+        ...(v2Request.acknowledgedChallengeAtoms !== undefined
+          ? { acknowledgedChallengeAtoms: v2Request.acknowledgedChallengeAtoms }
           : {}),
-      }, context);
-      return { candidate, context };
+      }, v2Context);
+      return { candidate, context: v2Context };
     },
   };
 
@@ -561,13 +640,29 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     if (!workspaceId) throw new Error('candidate snapshot has no repository workspace');
     const scope = await assembleScope(workspaceId);
     const request = snapshot.normalizedRequest;
-    const context = await buildContext(
-      scope,
-      request.selectedComponentIds,
-      request.selectedUnattributedEntryIds,
-      request.finalizationIds,
-    );
-    const rebuilt = buildCandidate(request, context);
+    let context: CandidateBuildContext;
+    let rebuilt;
+    if (isV2MintRequest(request)) {
+      const selectedIds = new Set([...request.selectedIntentIds, ...request.selectedNamedSaveSetIds]);
+      const units = (scope.context.intentUnits ?? []).filter((unit) => selectedIds.has(unit.intentId));
+      const memberEntryIds = [...new Set(units.flatMap((unit) => unit.memberEntryIds))].sort();
+      const base = await buildContext(scope, [], memberEntryIds, request.finalizationIds);
+      const attributionResolutions = request.resolutionIds.map((id) => dbGetAttributionResolution(id))
+        .filter((row) => row !== null && row.resolution !== 'restore-lost-work')
+        .map((row) => ({
+          resolutionId: row!.id, evidenceDigest: row!.evidenceDigest,
+          resolution: row!.resolution as 'commit-together' | 'superseded-intentionally',
+          affectedPathBytesBase64: [row!.pathBytesBase64],
+          intentIds: [row!.earlierIntentId, row!.laterIntentId],
+        }));
+      context = { ...base, attributionResolutions };
+      rebuilt = buildCandidateV2(request, context);
+    } else {
+      context = await buildContext(
+        scope, request.selectedComponentIds, request.selectedUnattributedEntryIds, request.finalizationIds,
+      );
+      rebuilt = buildCandidate(request, context);
+    }
     const entriesById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
     const members = rebuilt.members.flatMap((member) => {
       const entry = entriesById.get(member.entryId);
@@ -909,6 +1004,37 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   const saveCardFinalizeRoutes: SaveCardFinalizeRoutes = {
     resolveBoundary: (request) => resolveFleetBoundary(request.packageId, request.targetWorkspaceId),
   };
+  const saveCardAttributionResolutionRoutes: SaveCardAttributionResolutionRoutes = {
+    async persistAttributionResolution(
+      request: SaveCardAttributionResolutionRequest,
+    ): Promise<SaveCardAttributionResolutionResponse> {
+      if (process.env.LARES_INTENT_PACKAGING !== '1') {
+        throw new Error('intent-first candidate packaging is disabled');
+      }
+      const scope = await assembleScope(request.workspaceId);
+      const atom = reviewChallengeAtomsForInventory(scope.context.inventory).find((candidate) =>
+        isCrossIntentAtom(candidate)
+        && candidate.atomId === request.atom.atomId
+        && candidate.evidenceDigest === request.atom.evidenceDigest);
+      if (!atom || !isCrossIntentAtom(atom)) throw new Error('cross-intent evidence is stale');
+      const identity = {
+        repositoryKey: scope.context.repository.repositoryKey,
+        pathBytesBase64: atom.pathBytesBase64,
+        evidenceDigest: atom.evidenceDigest,
+        earlierIntentId: atom.earlierIntentId,
+        laterIntentId: atom.laterIntentId,
+      };
+      const existing = dbFindCurrentAttributionResolution(identity);
+      const row = existing ?? dbInsertAttributionResolution({
+        id: randomUUID(), ...identity, resolution: request.resolution,
+        chosenByAppUserId: 'local-app-user', chosenAt: Date.now(),
+        supersededIntentId: request.resolution === 'superseded-intentionally'
+          ? atom.earlierIntentId : null,
+        restoreTurnId: null, consumedByCandidateId: null,
+      });
+      return { resolutionId: row.id, evidenceDigest: row.evidenceDigest, resolution: row.resolution };
+    },
+  };
   const productionSeams: PreviewProductionSeams = {
     candidateService: service,
     composeLocks,
@@ -922,5 +1048,10 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     },
   };
 
-  return { saveCardPreviewRoutes, saveCardMintRoutes, planPreviewRoutes, saveCardFinalizeRoutes, productionSeams };
+  const liveSaveCardMintRoutes: SaveCardMintRoutes = Object.assign(
+    saveCardMintRoutes,
+    saveCardAttributionResolutionRoutes,
+  );
+  return { saveCardPreviewRoutes, saveCardMintRoutes: liveSaveCardMintRoutes, saveCardAttributionResolutionRoutes,
+    planPreviewRoutes, saveCardFinalizeRoutes, productionSeams };
 }

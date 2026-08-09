@@ -392,16 +392,28 @@ test('an otherwise-eligible production-shaped preview remains tokenless', async 
 });
 
 // WP-3 foundation: cross-intent atoms are filtered by selectedTopologyEvidence (kind === 'overlap'); WP-4 rewires atom projection and MUST unskip this test.
-skip('production registration transports the versioned cross-intent atom unchanged', 'WP-4 atom projection', async () => {
+test('production registration transports the versioned cross-intent atom unchanged', async () => {
   const atom: CrossIntentChallengeAtom = {
     kind: 'cross-intent', atomId: 'cross:repo:path:a:b', digest: 'evidence-1',
     reasonVersion: 1, pathBytesBase64: 'c3JjL2UxLnRz', displayPath: 'src/e1.ts',
     earlierIntentId: 'intent-a', laterIntentId: 'intent-b', evidenceDigest: 'evidence-1',
     resolution: null,
   };
+  const base = eligibleContext({ reviewChallengeAtoms: [atom] });
+  const canonicalPath = { pathBytesBase64: atom.pathBytesBase64, displayPath: atom.displayPath, utf8Clean: true };
+  const context: CandidateBuildContext = {
+    ...base,
+    inventory: { ...base.inventory, entries: [{
+      ...base.inventory.entries[0], path: canonicalPath, commitPathspecs: [canonicalPath],
+    }] },
+    finalizations: [{
+      ...base.finalizations[0],
+      memberManifestJson: JSON.stringify([{ ...frozen('e1'), pathBytesBase64: atom.pathBytesBase64 }]),
+    }],
+  };
   const ipc = new FakeIpc();
   registerSaveCardPreviewIpc(ipc, () => ({
-    resolvePreviewContext: async () => eligibleContext({ reviewChallengeAtoms: [atom] }),
+    resolvePreviewContext: async () => context,
   }));
   assert.ok(ipc.handlers.has(SAVECARD_PREVIEW_CHANNEL),
     'production registerSaveCardPreviewIpc must register cross-intent transport');

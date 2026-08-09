@@ -25,6 +25,7 @@ import type {
   SelectionPreview,
   SaveCardQuotaWeakening,
   MintCandidateTokenRequest,
+  MintCandidateTokenRequestV2,
   NormalizedCommitEffect,
   AttributionContributor,
   ReviewChallengeAtom,
@@ -32,10 +33,15 @@ import type {
   ReviewedClosureObligation,
   ReviewedFinalizationIntent,
   ReviewedSemanticManifest,
+  ReviewedSemanticManifestV2,
+  AnyReviewedSemanticManifest,
+  ReviewedSaveIntent,
+  ReviewedAttributionResolution,
 } from '../../shared/commit-candidates';
 import {
   REVIEW_CHALLENGE_VERSION,
   REVIEWED_SEMANTIC_MANIFEST_VERSION,
+  REVIEWED_SEMANTIC_MANIFEST_VERSION_V2,
   canonicalizeReviewedSemanticManifest,
   normalizeCommitEffects,
   normalizeReviewedSemanticManifest,
@@ -47,9 +53,14 @@ import type { FrozenManifestMember } from './finalization-service';
 import type { IndexFingerprintResult } from './index-fingerprint';
 import {
   listPlanningActivityWorktrees,
+  listSaveIntentsForRepository,
+  listNamedSaveSetMembers,
+  getPlan,
+  getPlanWorkPackage,
   type PackageFinalization,
   type PlanningActivityWorktree,
 } from '../database';
+import { projectIntentUnits } from './intent-assembler';
 import type { GitCapability } from '../../shared/types';
 import type { RunGit } from '../git/git-runtime';
 import {
@@ -96,9 +107,20 @@ const DEFAULT_CANDIDATE_TOKEN_TTL_MS = 5 * 60 * 1000;
 const REVIEWED_MANIFEST_REGISTRY_CAP = 512;
 
 const assemblyByInventory = new WeakMap<DirtyInventory, ComponentAssembly>();
-const reviewedManifestByDigest = new Map<string, ReviewedSemanticManifest>();
+const reviewedManifestByDigest = new Map<string, AnyReviewedSemanticManifest>();
 const dischargedPathsByDigest = new Map<string, Set<string>>();
 const carryVerdictByCandidate = new WeakMap<object, ReviewCarryVerdict>();
+
+function isCrossIntentAtom(atom: ReviewChallengeAtom): atom is import('../../shared/commit-candidates').CrossIntentChallengeAtom {
+  return atom.kind === 'cross-intent'
+    && 'pathBytesBase64' in atom
+    && 'earlierIntentId' in atom
+    && 'laterIntentId' in atom;
+}
+
+export function reviewChallengeAtomsForInventory(inventory: DirtyInventory): readonly ReviewChallengeAtom[] {
+  return assemblyByInventory.get(inventory)?.overlapChallengeAtoms ?? [];
+}
 
 export type CandidateTokenState = 'issued' | 'consuming' | 'consumed';
 
@@ -106,7 +128,7 @@ export interface CandidateTokenSnapshot {
   readonly token: CommitCandidateToken;
   readonly candidate: CommitCandidate;
   readonly repositoryKey: string;
-  readonly normalizedRequest: MintCandidateTokenRequest;
+  readonly normalizedRequest: MintCandidateTokenRequest | MintCandidateTokenRequestV2;
   readonly componentTopologyDigest: string;
   readonly pinnedHeadOid: string | null;
   readonly indexFingerprint: string;
@@ -199,6 +221,7 @@ export interface CandidateInventoryRead {
   planAttributionUnavailableTurnIds: Set<string>;
   /** SC-WP-2L — retention quota-weakening warning; null unless a still-dirty edge is released. */
   quotaWeakening: SaveCardQuotaWeakening | null;
+  intentUnits?: CandidateIntentUnit[];
 }
 
 function compareStrings(left: string, right: string): number {
@@ -281,7 +304,6 @@ export class CommitCandidateService {
       selectedComponentIds: [...new Set(request.selectedComponentIds)].sort(compareBase64),
       selectedUnattributedEntryIds: [...new Set(request.selectedUnattributedEntryIds)].sort(compareBase64),
       finalizationIds: [...new Set(request.finalizationIds)].sort(compareBase64),
-      acknowledgeTopologyDigest: request.acknowledgeTopologyDigest,
       acknowledgeUnattributedEntryIds:
         [...new Set(request.acknowledgeUnattributedEntryIds)].sort(compareBase64),
     };
@@ -344,9 +366,6 @@ export class CommitCandidateService {
       built.componentIds,
       selectedUnattributed,
     );
-    if (!reviewCarried && normalizedRequest.acknowledgeTopologyDigest !== topologyDigest) {
-      return { ...built, eligibility: { eligible: false, reason: 'overlap-not-acknowledged' } };
-    }
     if (!reviewCarried && !sameStrings(
       built.selectedUnattributedEntryIds,
       normalizedRequest.acknowledgeUnattributedEntryIds,
@@ -401,6 +420,60 @@ export class CommitCandidateService {
       lastAccessedAt: now,
       sequence: this.tokenSequence++,
     });
+    return candidate;
+  }
+
+  /** Intent-first v2 mint. Selection and every attribution decision are resolved
+   * from fresh main-owned documents before the opaque single-use token is issued. */
+  mintCandidateTokenV2(
+    request: MintCandidateTokenRequestV2 & ReviewCarryEvidence,
+    context: CandidateBuildContext,
+  ): CommitCandidate | SelectionPreview {
+    if (process.env.LARES_INTENT_PACKAGING !== '1') {
+      throw new Error('intent-first candidate packaging is disabled');
+    }
+    const normalizedRequest: MintCandidateTokenRequestV2 = {
+      selectedIntentIds: sortedUniqueStrings(request.selectedIntentIds),
+      selectedNamedSaveSetIds: sortedUniqueStrings(request.selectedNamedSaveSetIds),
+      resolutionIds: sortedUniqueStrings(request.resolutionIds),
+      finalizationIds: sortedUniqueStrings(request.finalizationIds),
+      acknowledgeUnattributedEntryIds: sortedUniqueStrings(request.acknowledgeUnattributedEntryIds ?? []),
+    };
+    const built = buildCandidateV2(normalizedRequest, context);
+    if (!('candidateId' in built) || !built.eligibility.eligible) return built;
+    if (this.composeLocks.isHeld(context.repository.repositoryKey)) {
+      return { ...built, eligibility: { eligible: false, reason: 'compose-in-flight' } };
+    }
+    const now = this.now();
+    this.pruneExpired(now);
+    this.makeRoom(context.repository.repositoryKey);
+    let tokenId: string;
+    do tokenId = this.randomTokenBytes().toString('base64url');
+    while (this.tokens.has(tokenId));
+    const token: CommitCandidateToken = {
+      tokenId, candidateId: built.candidateId, contractVersion: 2,
+      issuedAt: now, expiresAt: now + this.tokenTtlMs,
+    };
+    const candidate = cloneAndFreeze({ ...built, token });
+    const selectedComponents = context.components.filter((component) =>
+      built.componentIds.includes(component.componentId));
+    const topologyDigest = computeCandidateTopologyDigest(
+      context, built.componentIds,
+      context.inventory.entries.filter((entry) => built.selectedUnattributedEntryIds.includes(entry.entryId)),
+    );
+    const snapshot = cloneAndFreeze<CandidateTokenSnapshot>({
+      token, candidate, repositoryKey: context.repository.repositoryKey,
+      normalizedRequest, componentTopologyDigest: topologyDigest,
+      pinnedHeadOid: context.pinnedHeadOid,
+      indexFingerprint: context.indexFingerprint.fingerprint,
+      indexWriteTreeOid: context.indexFingerprint.writeTreeOid,
+      commitEffects: candidateCommitEffects(built.members, context.inventory.entries, context),
+      finalizationManifests: context.finalizations
+        .filter((finalization) => normalizedRequest.finalizationIds.includes(finalization.id))
+        .map((finalization) => ({ finalizationId: finalization.id, memberManifestJson: finalization.memberManifestJson })),
+      associations: selectedComponents.flatMap((component) => component.associations),
+    });
+    this.tokens.set(tokenId, { snapshot, state: 'issued', lastAccessedAt: now, sequence: this.tokenSequence++ });
     return candidate;
   }
 
@@ -662,6 +735,23 @@ export class CommitCandidateService {
       gitExe,
     });
 
+    let intentUnits: CandidateIntentUnit[] | undefined;
+    if (process.env.LARES_INTENT_PACKAGING === '1') {
+      const intentAssembly = projectIntentUnits({
+        inventory: assembly.inventory,
+        witnesses,
+        intents: listSaveIntentsForRepository(repository.repositoryKey),
+        namedMembers: listNamedSaveSetMembers(repository.repositoryKey),
+        topology: assembly,
+      });
+      intentUnits = intentAssembly.intentUnits.map((unit) => ({
+        intentId: unit.intent.id, kind: unit.intent.kind, revision: unit.intent.revision,
+        title: unit.intent.title, planId: unit.intent.planId, planItemId: unit.intent.planItemId,
+        planTitle: unit.intent.planId ? getPlan(unit.intent.planId)?.slug ?? null : null,
+        planItemTitle: unit.intent.planItemId ? getPlanWorkPackage(unit.intent.planItemId)?.title ?? null : null,
+        memberEntryIds: unit.memberEntryIds,
+      }));
+    }
     return {
       inventory: assembly.inventory,
       components: assembly.components,
@@ -670,6 +760,7 @@ export class CommitCandidateService {
       protectionByEntryId,
       planAttributionUnavailableTurnIds,
       quotaWeakening: this.deps.readQuotaWeakening?.(repository.repositoryKey) ?? null,
+      ...(intentUnits ? { intentUnits } : {}),
     };
   }
 
@@ -789,10 +880,25 @@ export interface CandidateBuildContext {
    * structures from the exact ComponentAssembly cached for `inventory`. */
   reviewedAttributionTopology?: ReviewedAttributionTopology;
   reviewChallengeAtoms?: readonly ReviewChallengeAtom[];
+  /** Fresh intent-first selection documents. Required by v2 mint only. */
+  intentUnits?: readonly CandidateIntentUnit[];
+  attributionResolutions?: readonly ReviewedAttributionResolution[];
   protectionByEntryId?: Readonly<Record<string, ProtectionRung>>;
   pinnedHeadOid: string | null;
   indexFingerprint: IndexFingerprintResult;
   contractVersion: number;
+}
+
+export interface CandidateIntentUnit {
+  intentId: string;
+  kind: 'task' | 'named-save-set';
+  revision: number;
+  title: string;
+  planId: string | null;
+  planItemId: string | null;
+  planTitle?: string | null;
+  planItemTitle?: string | null;
+  memberEntryIds: string[];
 }
 
 function compareBase64(left: string, right: string): number {
@@ -875,7 +981,7 @@ function projectTopology(
 function selectedTopologyEvidence(
   candidate: CommitCandidate,
   context: CandidateBuildContext,
-): { topology: ReviewedAttributionTopology; overlapAtoms: ReviewChallengeAtom[] } {
+): { topology: ReviewedAttributionTopology; topologyAtoms: ReviewChallengeAtom[] } {
   const selectedMemberPaths = new Set(candidate.members.map((member) => member.path.pathBytesBase64));
   const assembly = assemblyByInventory.get(context.inventory);
   const topology = context.reviewedAttributionTopology ?? assembly?.selectedTopology;
@@ -883,9 +989,8 @@ function selectedTopologyEvidence(
   if (topology && atoms) {
     return {
       topology: projectTopology(topology, selectedMemberPaths),
-      overlapAtoms: atoms.filter((atom) =>
-        atom.kind === 'overlap'
-        && atom.memberPathBytesBase64.every((path) => selectedMemberPaths.has(path))),
+      topologyAtoms: atoms.filter((atom) =>
+        isCrossIntentAtom(atom) && selectedMemberPaths.has(atom.pathBytesBase64)),
     };
   }
 
@@ -914,7 +1019,8 @@ function selectedTopologyEvidence(
         .filter((path): path is string => path !== undefined)
         .sort(compareBase64),
     },
-    overlapAtoms: [],
+    topologyAtoms: (atoms ?? []).filter((atom) =>
+      isCrossIntentAtom(atom) && selectedMemberPaths.has(atom.pathBytesBase64)),
   };
 }
 
@@ -935,7 +1041,7 @@ function reviewedFrozenMembers(finalization: PackageFinalization) {
 export function buildReviewedSemanticManifest(
   candidate: CommitCandidate,
   context: CandidateBuildContext,
-): ReviewedSemanticManifest {
+): AnyReviewedSemanticManifest {
   const entryById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
   const members = candidate.members.map((member) => {
     const entry = entryById.get(member.entryId);
@@ -987,13 +1093,13 @@ export function buildReviewedSemanticManifest(
       const memberEffectDigest = sha256Hex(canonicalize(member));
       const body = { pathBytesBase64: member.finalPathBytesBase64, memberEffectDigest };
       return {
-        kind: 'unattributed',
+        kind: 'unattributed' as const,
         atomId: `unattributed:${sha256Hex(member.finalPathBytesBase64)}`,
         digest: sha256Hex(canonicalize(body)),
         ...body,
       };
     });
-  return normalizeReviewedSemanticManifest({
+  const base: ReviewedSemanticManifest = {
     manifestVersion: REVIEWED_SEMANTIC_MANIFEST_VERSION,
     candidateContractVersion: context.contractVersion,
     repositoryKey: context.repository.repositoryKey,
@@ -1004,17 +1110,37 @@ export function buildReviewedSemanticManifest(
     attributionTopology: topologyEvidence.topology,
     closureObligations,
     challengeVersion: REVIEW_CHALLENGE_VERSION,
-    challengeAtoms: [...topologyEvidence.overlapAtoms, ...unattributedAtoms],
-  });
+    challengeAtoms: [...topologyEvidence.topologyAtoms, ...unattributedAtoms],
+  };
+  if (candidate.contractVersion !== 2) return normalizeReviewedSemanticManifest(base);
+  const selectedUnits = (context.intentUnits ?? [])
+    .filter((unit) => candidate.saveIntentIds?.includes(unit.intentId));
+  const saveIntents: ReviewedSaveIntent[] = selectedUnits.map((unit) => ({
+    intentId: unit.intentId,
+    kind: unit.kind,
+    revision: unit.revision,
+    title: unit.title,
+    planId: unit.planId,
+    planItemId: unit.planItemId,
+    finalizationId: finalizations.find((finalization) =>
+      finalization.packageId === unit.intentId)?.finalizationId ?? '',
+  }));
+  return normalizeReviewedSemanticManifest({
+    ...base,
+    manifestVersion: REVIEWED_SEMANTIC_MANIFEST_VERSION_V2,
+    candidateContractVersion: 2,
+    saveIntents,
+    attributionResolutions: candidate.attributionResolutions ?? [],
+  } satisfies ReviewedSemanticManifestV2);
 }
 
-export function reviewedSemanticManifestDigest(manifest: ReviewedSemanticManifest): string {
+export function reviewedSemanticManifestDigest(manifest: AnyReviewedSemanticManifest): string {
   return sha256Hex(canonicalizeReviewedSemanticManifest(manifest));
 }
 
 /** Retain only manifests actually emitted by main. A renderer digest can select
  * one of these records but can never manufacture semantic equivalence. */
-export function rememberReviewedSemanticManifest(manifest: ReviewedSemanticManifest): string {
+export function rememberReviewedSemanticManifest(manifest: AnyReviewedSemanticManifest): string {
   const normalized = cloneAndFreeze(normalizeReviewedSemanticManifest(manifest));
   const digest = reviewedSemanticManifestDigest(normalized);
   reviewedManifestByDigest.delete(digest);
@@ -1035,7 +1161,7 @@ export function reviewCarryVerdictFor(
   return carryVerdictByCandidate.get(candidate) ?? null;
 }
 
-function effectMap(manifest: ReviewedSemanticManifest): Map<string, NormalizedCommitEffect> {
+function effectMap(manifest: AnyReviewedSemanticManifest): Map<string, NormalizedCommitEffect> {
   const result = new Map<string, NormalizedCommitEffect>();
   for (const member of manifest.members) {
     for (const effect of member.commitEffects) {
@@ -1082,7 +1208,7 @@ function exactDischargeProof(effect: NormalizedCommitEffect, context: CandidateB
   return link !== null && currentHeadMatches(effect, link, context);
 }
 
-function freshClosureProven(manifest: ReviewedSemanticManifest, context: CandidateBuildContext): boolean {
+function freshClosureProven(manifest: AnyReviewedSemanticManifest, context: CandidateBuildContext): boolean {
   return manifest.closureObligations.every((obligation) => {
     const asEffect: NormalizedCommitEffect = {
       pathBytesBase64: obligation.pathBytesBase64,
@@ -1112,7 +1238,7 @@ function atomsCovered(
   return current.every((atom) => acknowledgedCanonical.has(canonicalize(atom)));
 }
 
-function challengeMatchesTopology(manifest: ReviewedSemanticManifest): boolean {
+function challengeMatchesTopology(manifest: AnyReviewedSemanticManifest): boolean {
   const unattributedAtoms = new Set(manifest.challengeAtoms
     .filter((atom): atom is Extract<ReviewChallengeAtom, { kind: 'unattributed' }> =>
       atom.kind === 'unattributed')
@@ -1126,8 +1252,8 @@ function challengeMatchesTopology(manifest: ReviewedSemanticManifest): boolean {
 /** Adopted carry predicate: equality of the reviewed universe with the sole
  * proof-bearing asymmetry that an exact reviewed effect may be discharged. */
 export function evaluateReviewedManifestCarry(
-  reviewed: ReviewedSemanticManifest,
-  fresh: ReviewedSemanticManifest,
+  reviewed: AnyReviewedSemanticManifest,
+  fresh: AnyReviewedSemanticManifest,
   acknowledgedAtoms: readonly ReviewChallengeAtom[],
   context: CandidateBuildContext,
   freshEligibility: CommitEligibility,
@@ -1321,7 +1447,6 @@ interface ResolvedSelection {
   memberEntries: DirtyEntry[];
   /** A selected "unattributed" entry that actually belongs to a witnessed component
    *  is a smuggled proper-subset of that component — never allowed (contract §4). */
-  subsetViolation: boolean;
   blockingDrift: boolean;
 }
 
@@ -1347,12 +1472,10 @@ function resolveSelection(
       requestedComponentIds: request.selectedComponentIds,
       requestedUnattributedEntryIds: request.selectedUnattributedEntryIds,
     });
-    const componentEntryIds = new Set(context.components.flatMap((component) => component.dirtyEntryIds));
     return {
       componentIds: resolved.pinnedSelection.selectedComponentIds,
       unattributedEntryIds: resolved.pinnedSelection.selectedUnattributedEntryIds,
       memberEntries: resolved.frozenEntries,
-      subsetViolation: request.selectedUnattributedEntryIds.some((entryId) => componentEntryIds.has(entryId)),
       // Missing frozen paths continue through the established closure proof:
       // an exact ledger link may mean that member was already committed. Byte
       // movement and re-attribution have no such safe closure escape hatch.
@@ -1361,11 +1484,6 @@ function resolveSelection(
   }
   const entriesById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
   const componentById = new Map(context.components.map((component) => [component.componentId, component]));
-  const allComponentEntryIds = new Set<string>();
-  for (const component of context.components) {
-    for (const entryId of component.dirtyEntryIds) allComponentEntryIds.add(entryId);
-  }
-
   const memberIds = new Set<string>();
   const componentIds = [...new Set(request.selectedComponentIds)].sort(compareBase64);
   for (const componentId of componentIds) {
@@ -1374,13 +1492,11 @@ function resolveSelection(
     for (const entryId of component.dirtyEntryIds) memberIds.add(entryId);
   }
 
-  let subsetViolation = false;
   const unattributedEntryIds = [...new Set(request.selectedUnattributedEntryIds)].sort(compareBase64);
   for (const entryId of unattributedEntryIds) {
     if (!entriesById.has(entryId)) throw new Error(`unknown unattributed entry in selection: ${entryId}`);
     // Selecting a component's entry AS an independent unattributed atom would carve
     // a proper subset out of that component — reject it (component atomicity).
-    if (allComponentEntryIds.has(entryId)) subsetViolation = true;
     memberIds.add(entryId);
   }
 
@@ -1388,7 +1504,7 @@ function resolveSelection(
     .map((entryId) => entriesById.get(entryId)!)
     .sort((left, right) => compareBase64(left.path.pathBytesBase64, right.path.pathBytesBase64));
 
-  return { componentIds, unattributedEntryIds, memberEntries, subsetViolation, blockingDrift: false };
+  return { componentIds, unattributedEntryIds, memberEntries, blockingDrift: false };
 }
 
 interface CoveringFrozen {
@@ -1536,8 +1652,8 @@ export function computeCandidateTopologyDigest(
 /**
  * Assemble a `SelectionPreview` — a selection WITHOUT finalization coverage. Members
  * are listed with their git-level verification, but the preview is NEVER committable:
- * eligibility is always `package-not-finalized` (or `component-subset-not-allowed` if
- * the selection carves a proper subset of a witnessed component).
+ * eligibility is always `package-not-finalized`; v2 selection closure is derived
+ * from normalized Git effects rather than topology-component atomicity.
  */
 export function buildSelectionPreview(
   request: CandidateSelectionRequest,
@@ -1561,9 +1677,7 @@ export function buildSelectionPreview(
       protection,
     };
   });
-  const eligibility: CommitEligibility = selection.subsetViolation
-    ? { eligible: false, reason: 'component-subset-not-allowed' }
-    : { eligible: false, reason: 'package-not-finalized' };
+  const eligibility: CommitEligibility = { eligible: false, reason: 'package-not-finalized' };
   return {
     componentIds: selection.componentIds,
     selectedUnattributedEntryIds: selection.unattributedEntryIds,
@@ -1629,7 +1743,6 @@ export function buildCandidate(
   }
 
   const eligibility = evaluateEligibility({
-    subsetViolation: selection.subsetViolation,
     blockingDrift: selection.blockingDrift,
     extraneous,
     hasUnmerged: context.indexFingerprint.hasUnmerged,
@@ -1685,8 +1798,102 @@ export function buildCandidate(
   };
 }
 
+/** Intent-first v2 assembler. Topology components are consulted only as evidence;
+ * member selection is the union of selected save-intent documents. */
+export function buildCandidateV2(
+  request: MintCandidateTokenRequestV2,
+  context: CandidateBuildContext,
+): CommitCandidate | SelectionPreview {
+  const units = context.intentUnits ?? [];
+  const byId = new Map(units.map((unit) => [unit.intentId, unit]));
+  const selectedIds = sortedUniqueStrings([
+    ...request.selectedIntentIds,
+    ...request.selectedNamedSaveSetIds,
+  ]);
+  const selectedUnits = selectedIds.map((id) => {
+    const unit = byId.get(id);
+    if (!unit) throw new Error(`unknown save intent in selection: ${id}`);
+    return unit;
+  });
+  if (selectedUnits.some((unit) => unit.kind === 'task'
+      && !request.selectedIntentIds.includes(unit.intentId))) {
+    throw new Error('task intents must be selected through selectedIntentIds');
+  }
+  if (selectedUnits.some((unit) => unit.kind === 'named-save-set'
+      && !request.selectedNamedSaveSetIds.includes(unit.intentId))) {
+    throw new Error('named save sets must be selected through selectedNamedSaveSetIds');
+  }
+  const memberEntryIds = sortedUniqueStrings(selectedUnits.flatMap((unit) => unit.memberEntryIds));
+  const selectedEntrySet = new Set(memberEntryIds);
+  const componentIds = context.components
+    .filter((component) => component.dirtyEntryIds.some((entryId) => selectedEntrySet.has(entryId)))
+    .map((component) => component.componentId);
+  const built = buildCandidate({
+    selectedComponentIds: [],
+    selectedUnattributedEntryIds: memberEntryIds,
+    finalizationIds: request.finalizationIds,
+  }, context);
+  if (!('candidateId' in built)) return built;
+
+  const finalizationById = new Map(context.finalizations.map((row) => [row.id, row]));
+  const reviewedIntents: ReviewedSaveIntent[] = selectedUnits.map((unit) => {
+    const finalization = request.finalizationIds
+      .map((id) => finalizationById.get(id))
+      .find((row) => row?.packageId === unit.intentId);
+    return {
+      intentId: unit.intentId, kind: unit.kind, revision: unit.revision,
+      title: unit.title, planId: unit.planId, planItemId: unit.planItemId,
+      finalizationId: finalization?.id ?? '',
+    };
+  });
+  const staleIntent = reviewedIntents.some((intent) => {
+    const finalization = finalizationById.get(intent.finalizationId);
+    return !finalization || finalization.packageRevision !== intent.revision
+      || finalization.lifecycleStatus !== 'active';
+  });
+
+  const selectedResolutions = request.resolutionIds.map((id) =>
+    (context.attributionResolutions ?? []).find((resolution) => resolution.resolutionId === id));
+  if (selectedResolutions.some((resolution) => !resolution)) {
+    return { ...built, eligibility: { eligible: false, reason: 'resolution-stale' } };
+  }
+  const resolutions = selectedResolutions as ReviewedAttributionResolution[];
+  const crossAtoms = (context.reviewChallengeAtoms ?? assemblyByInventory.get(context.inventory)?.overlapChallengeAtoms ?? [])
+    .filter((atom): atom is import('../../shared/commit-candidates').CrossIntentChallengeAtom =>
+      isCrossIntentAtom(atom)
+      && selectedEntrySet.has(context.inventory.entries.find((entry) =>
+        entry.path.pathBytesBase64 === atom.pathBytesBase64)?.entryId ?? '')
+      && selectedIds.includes(atom.earlierIntentId)
+      && selectedIds.includes(atom.laterIntentId));
+  const resolutionFor = (atom: import('../../shared/commit-candidates').CrossIntentChallengeAtom) =>
+    resolutions.find((resolution) => resolution.evidenceDigest === atom.evidenceDigest
+      && resolution.affectedPathBytesBase64.includes(atom.pathBytesBase64)
+      && resolution.intentIds.includes(atom.earlierIntentId)
+      && resolution.intentIds.includes(atom.laterIntentId));
+  const missingResolution = crossAtoms.some((atom) => !resolutionFor(atom));
+  const eligibility: CommitEligibility = staleIntent
+    ? { eligible: false, reason: 'intent-revision-stale' }
+    : missingResolution
+      ? { eligible: false, reason: 'resolution-required' }
+      : built.eligibility;
+  const normalizedIntents = [...reviewedIntents].sort((a, b) => compareBase64(a.intentId, b.intentId));
+  const normalizedResolutions = [...resolutions].sort((a, b) => compareBase64(a.resolutionId, b.resolutionId));
+  const candidateId = sha256Hex(canonicalize({
+    candidateContractVersion: 2,
+    legacyCandidateClosureId: built.candidateId,
+    saveIntents: normalizedIntents,
+    attributionResolutions: normalizedResolutions,
+  }));
+  return {
+    ...built, candidateId, contractVersion: 2, componentIds,
+    saveIntentIds: normalizedIntents.map((intent) => intent.intentId),
+    selectedNamedSaveSetIds: sortedUniqueStrings(request.selectedNamedSaveSetIds),
+    attributionResolutions: normalizedResolutions,
+    eligibility,
+  };
+}
+
 interface EligibilityInputs {
-  subsetViolation: boolean;
   blockingDrift: boolean;
   extraneous: boolean;
   hasUnmerged: boolean;
@@ -1697,7 +1904,6 @@ interface EligibilityInputs {
 /** Collapse the per-member verification states + structural checks into a single
  *  eligibility verdict, most-structural reason first (deterministic precedence). */
 function evaluateEligibility(inputs: EligibilityInputs): CommitEligibility {
-  if (inputs.subsetViolation) return { eligible: false, reason: 'component-subset-not-allowed' };
   if (inputs.extraneous) return { eligible: false, reason: 'extraneous-finalization' };
   if (inputs.blockingDrift) return { eligible: false, reason: 'byte-mismatch' };
 

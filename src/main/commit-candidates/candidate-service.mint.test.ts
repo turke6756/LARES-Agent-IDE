@@ -14,12 +14,12 @@ import type {
   DirtyInventory,
   EncodedGitPath,
   MintCandidateTokenRequest,
+  CrossIntentChallengeAtom,
   RepositoryIdentity,
 } from '../../shared/commit-candidates';
 import {
   CommitCandidateService,
   buildCandidate,
-  computeCandidateTopologyDigest,
   type CandidateBuildContext,
   type CandidateServiceDeps,
   type CandidateTokenStoreOptions,
@@ -184,16 +184,10 @@ function service(tokenStore: CandidateTokenStoreOptions = {}): CommitCandidateSe
 }
 
 function requestFor(ctx: CandidateBuildContext, components: string[], unattributed: string[], fins: string[]): MintCandidateTokenRequest {
-  const digest = computeCandidateTopologyDigest(
-    ctx,
-    components,
-    ctx.inventory.entries.filter((item) => unattributed.includes(item.entryId)),
-  );
   return {
     selectedComponentIds: components,
     selectedUnattributedEntryIds: unattributed,
     finalizationIds: fins,
-    acknowledgeTopologyDigest: digest,
     acknowledgeUnattributedEntryIds: unattributed,
   };
 }
@@ -229,17 +223,15 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
   assert.equal(conflict.token, null);
 }
 
-// 4–6: topology and unattributed acknowledgements are validated; duplicate ack
-// values normalize before the immutable snapshot is stored.
+// 4–6: unattributed acknowledgements are validated; legacy topology-digest ack
+// keys are ignored compatibility fields (v2 resolution gating replaces topology
+// acks; WP-7 removes the keys); duplicate ack values normalize before the
+// immutable snapshot is stored.
 {
   const loose = entry('loose.txt');
   const fin = finalization([frozen('loose.txt')]);
   const ctx = context({ entries: [loose], unattributed: [loose.entryId], finalizations: [fin] });
   const valid = requestFor(ctx, [], [loose.entryId], [fin.id]);
-
-  const badTopology = asCandidate(service().mintCandidateToken({ ...valid, acknowledgeTopologyDigest: 'stale' }, ctx));
-  assert.deepEqual(badTopology.eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
-  assert.equal(badTopology.token, null);
 
   const unacked = asCandidate(service().mintCandidateToken({ ...valid, acknowledgeUnattributedEntryIds: [] }, ctx));
   assert.deepEqual(unacked.eligibility, { eligible: false, reason: 'unattributed-not-acknowledged' });
@@ -252,8 +244,9 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
     acknowledgeUnattributedEntryIds: [loose.entryId, loose.entryId],
   }, ctx));
   const snapshot = store.resolveCandidateToken(minted.token!.tokenId)!;
-  assert.deepEqual(snapshot.normalizedRequest.selectedUnattributedEntryIds, [loose.entryId]);
-  assert.deepEqual(snapshot.normalizedRequest.acknowledgeUnattributedEntryIds, [loose.entryId]);
+  const snapshotRequest = snapshot.normalizedRequest as MintCandidateTokenRequest;
+  assert.deepEqual(snapshotRequest.selectedUnattributedEntryIds, [loose.entryId]);
+  assert.deepEqual(snapshotRequest.acknowledgeUnattributedEntryIds, [loose.entryId]);
 }
 
 // 7–10: acknowledgement validation uses the resolved pin selection rather than
@@ -274,14 +267,8 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
     selectedComponentIds: [], selectedUnattributedEntryIds: rawIds, finalizationIds: [fin.id],
   }, ctx));
   assert.deepEqual(built.selectedUnattributedEntryIds, [x.entryId, y.entryId]);
-  const digest = computeCandidateTopologyDigest(
-    ctx,
-    built.componentIds,
-    ctx.inventory.entries.filter((item) => built.selectedUnattributedEntryIds.includes(item.entryId)),
-  );
   const request: MintCandidateTokenRequest = {
     selectedComponentIds: [], selectedUnattributedEntryIds: rawIds, finalizationIds: [fin.id],
-    acknowledgeTopologyDigest: digest,
     acknowledgeUnattributedEntryIds: built.selectedUnattributedEntryIds,
   };
   const store = service();
@@ -297,10 +284,6 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
     selectedUnattributedEntryIds: built.selectedUnattributedEntryIds,
   }, ctx));
   assert.ok(clean.token, 'clean raw-equals-resolved pin still mints');
-
-  const wrongDigest = asCandidate(service().mintCandidateToken({ ...request, acknowledgeTopologyDigest: 'wrong' }, ctx));
-  assert.deepEqual(wrongDigest.eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
-  assert.equal(wrongDigest.token, null);
 
   const missingResolved = asCandidate(service().mintCandidateToken({
     ...request, acknowledgeUnattributedEntryIds: [x.entryId],
@@ -441,4 +424,47 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
   assert.ok(minted.token);
 }
 
-console.log('candidate-service.mint: 18 contract rows passed');
+// WP-4 v2: intent documents and evidence-bound resolutions are required and
+// become part of candidate identity/token state.
+{
+  const priorFlag = process.env.LARES_INTENT_PACKAGING;
+  process.env.LARES_INTENT_PACKAGING = '1';
+  const shared = entry('shared.ts');
+  const one = finalization([frozen('shared.ts')], 'fin-intent-a');
+  const two = finalization([frozen('shared.ts')], 'fin-intent-b');
+  one.packageId = 'intent-a'; two.packageId = 'intent-b';
+  one.contractVersion = 2; two.contractVersion = 2;
+  const base = context({ entries: [shared], finalizations: [one, two] });
+  const atom: CrossIntentChallengeAtom = {
+    kind: 'cross-intent', atomId: 'cross:shared:a:b', digest: 'atom-digest', reasonVersion: 1,
+    pathBytesBase64: shared.path.pathBytesBase64, displayPath: 'shared.ts',
+    earlierIntentId: 'intent-a', laterIntentId: 'intent-b', evidenceDigest: 'evidence-v1',
+    resolution: null,
+  };
+  const ctx: CandidateBuildContext = {
+    ...base, contractVersion: 2,
+    intentUnits: [
+      { intentId: 'intent-a', kind: 'task', revision: 1, title: 'First task', planId: 'plan', planItemId: 'item-a', memberEntryIds: [shared.entryId] },
+      { intentId: 'intent-b', kind: 'task', revision: 1, title: 'Second task', planId: 'plan', planItemId: 'item-b', memberEntryIds: [shared.entryId] },
+    ],
+    reviewChallengeAtoms: [atom],
+    attributionResolutions: [{
+      resolutionId: 'resolution-1', evidenceDigest: 'evidence-v1', resolution: 'commit-together',
+      affectedPathBytesBase64: [shared.path.pathBytesBase64], intentIds: ['intent-a', 'intent-b'],
+    }],
+  };
+  const request = {
+    selectedIntentIds: ['intent-a', 'intent-b'], selectedNamedSaveSetIds: [],
+    resolutionIds: [], finalizationIds: [one.id, two.id],
+  };
+  const missing = asCandidate(service().mintCandidateTokenV2(request, ctx));
+  assert.deepEqual(missing.eligibility, { eligible: false, reason: 'resolution-required' });
+  const minted = asCandidate(service().mintCandidateTokenV2({ ...request, resolutionIds: ['resolution-1'] }, ctx));
+  assert.equal(minted.contractVersion, 2);
+  assert.deepEqual(minted.saveIntentIds, ['intent-a', 'intent-b']);
+  assert.ok(minted.token);
+  if (priorFlag === undefined) delete process.env.LARES_INTENT_PACKAGING;
+  else process.env.LARES_INTENT_PACKAGING = priorFlag;
+}
+
+console.log('candidate-service.mint: v1 refusals + v2 intent/resolution contract passed');

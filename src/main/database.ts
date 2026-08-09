@@ -2483,6 +2483,40 @@ function initContextOptimizerSchema(): void {
       ON attribution_resolutions(repository_key, path_bytes_base64, evidence_digest);
     CREATE INDEX IF NOT EXISTS idx_attribution_resolutions_candidate
       ON attribution_resolutions(consumed_by_candidate_id);
+
+    CREATE TABLE IF NOT EXISTS save_intent_finalizations (
+      id                   TEXT PRIMARY KEY,
+      save_unit_id         TEXT NOT NULL,
+      save_unit_kind       TEXT NOT NULL CHECK (save_unit_kind IN ('task','named-save-set')),
+      revision             INTEGER NOT NULL CHECK (revision > 0),
+      repository_key       TEXT NOT NULL,
+      member_manifest_json TEXT NOT NULL,
+      checkpoint_oid       TEXT NOT NULL,
+      boundary_ref         TEXT,
+      boundary_status      TEXT NOT NULL CHECK (boundary_status IN ('ready','unavailable','pruned')),
+      lifecycle_status     TEXT NOT NULL CHECK (lifecycle_status IN ('active','superseded','committed','abandoned')),
+      finalized_at         INTEGER NOT NULL,
+      finalized_by         TEXT NOT NULL,
+      superseded_by_finalization_id TEXT REFERENCES save_intent_finalizations(id),
+      failure_reason       TEXT,
+      UNIQUE (save_unit_id, revision)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_save_intent_finalizations_active
+      ON save_intent_finalizations(save_unit_id) WHERE lifecycle_status = 'active';
+    CREATE INDEX IF NOT EXISTS idx_save_intent_finalizations_repository
+      ON save_intent_finalizations(repository_key, lifecycle_status);
+
+    CREATE TABLE IF NOT EXISTS commit_intent_links (
+      repository_key TEXT NOT NULL,
+      commit_oid      TEXT NOT NULL,
+      intent_id       TEXT NOT NULL REFERENCES save_intents(id),
+      disposition     TEXT NOT NULL CHECK (disposition IN ('committed','superseded')),
+      resolution_id   TEXT REFERENCES attribution_resolutions(id),
+      created_at      INTEGER NOT NULL,
+      PRIMARY KEY (repository_key, commit_oid, intent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_commit_intent_links_intent
+      ON commit_intent_links(intent_id, created_at);
   `);
   try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_stamp_source TEXT`); } catch { /* exists */ }
@@ -3359,6 +3393,10 @@ function queryOne(sql: string, params: any[] = []): any | null {
 
 function run(sql: string, params: any[] = []): void {
   db.prepare(sql).run(...params);
+}
+
+function runWithResult(sql: string, params: any[] = []): { changes: number } {
+  return db.prepare(sql).run(...params);
 }
 
 /** Test seam — reset the module singleton cleanly (B2 A6). */
@@ -5653,6 +5691,21 @@ export interface CommitLedgerWrite {
   pathLinks?: readonly CommitPathLink[];
 }
 
+export interface CommitIntentLink {
+  repositoryKey: string;
+  commitOid: string;
+  intentId: string;
+  disposition: 'committed' | 'superseded';
+  resolutionId: string | null;
+  createdAt: number;
+}
+
+export interface IntentCommitLedgerWrite extends CommitLedgerWrite {
+  intentLinks: readonly CommitIntentLink[];
+  consumedResolutions: readonly { id: string; evidenceDigest: string; candidateId: string }[];
+  finalizationIds: readonly string[];
+}
+
 function rowToCommitRecord(row: any): CommitRecord {
   return {
     repositoryKey: row.repository_key,
@@ -5786,6 +5839,61 @@ export function listCommitPathLinks(
      ORDER BY commit_oid, path_bytes_base64`,
     [repositoryKey, ...(uniquePaths ?? [])],
   ).map(rowToCommitPathLink);
+}
+
+/** WP-4 intent ledger: every post-CAS structured write lands atomically. */
+export function writeIntentCommitLedger(write: IntentCommitLedgerWrite): void {
+  getDb().transaction(() => {
+    upsertCommitRecord(write.record);
+    for (const link of write.turnLinks ?? []) upsertCommitTurnLink(link);
+    for (const link of write.pathLinks ?? []) upsertCommitPathLink(link);
+    for (const link of write.intentLinks) {
+      run(
+        `INSERT INTO commit_intent_links
+          (repository_key, commit_oid, intent_id, disposition, resolution_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repository_key, commit_oid, intent_id) DO UPDATE SET
+           disposition = excluded.disposition, resolution_id = excluded.resolution_id`,
+        [link.repositoryKey, link.commitOid, link.intentId, link.disposition,
+          link.resolutionId, link.createdAt],
+      );
+      run(
+        `UPDATE save_intents SET state = ?,
+           committed_at = CASE WHEN ? = 'committed' THEN ? ELSE committed_at END
+          WHERE id = ? AND state IN ('open','ready')`,
+        [link.disposition, link.disposition, link.createdAt, link.intentId],
+      );
+    }
+    for (const consumed of write.consumedResolutions) {
+      const result = runWithResult(
+        `UPDATE attribution_resolutions SET consumed_by_candidate_id = ?
+          WHERE id = ? AND evidence_digest = ? AND consumed_by_candidate_id IS NULL`,
+        [consumed.candidateId, consumed.id, consumed.evidenceDigest],
+      );
+      if (result.changes !== 1) throw new Error(`stale attribution resolution: ${consumed.id}`);
+    }
+    for (const finalizationId of write.finalizationIds) {
+      run(
+        `UPDATE save_intent_finalizations SET lifecycle_status = 'committed'
+          WHERE id = ? AND lifecycle_status = 'active'`,
+        [finalizationId],
+      );
+    }
+  })();
+}
+
+export function listCommitIntentLinks(repositoryKey: string, commitOid: string): CommitIntentLink[] {
+  return queryAll(
+    `SELECT * FROM commit_intent_links WHERE repository_key = ? AND commit_oid = ? ORDER BY intent_id`,
+    [repositoryKey, commitOid],
+  ).map((row: any) => ({
+    repositoryKey: row.repository_key,
+    commitOid: row.commit_oid,
+    intentId: row.intent_id,
+    disposition: row.disposition,
+    resolutionId: row.resolution_id ?? null,
+    createdAt: row.created_at,
+  }));
 }
 
 // ── Save-card SC-WP-3A — plan_work_packages CRUD + item-validity accessor ──────
@@ -7676,6 +7784,96 @@ export interface AttributionResolution {
   supersededIntentId: string | null;
   restoreTurnId: string | null;
   consumedByCandidateId: string | null;
+}
+
+export type SaveUnitKind = 'task' | 'named-save-set';
+export interface SaveIntentFinalization {
+  id: string;
+  saveUnitId: string;
+  saveUnitKind: SaveUnitKind;
+  revision: number;
+  repositoryKey: string;
+  memberManifestJson: string;
+  checkpointOid: string;
+  boundaryRef: string | null;
+  boundaryStatus: 'ready' | 'unavailable' | 'pruned';
+  lifecycleStatus: 'active' | 'superseded' | 'committed' | 'abandoned';
+  finalizedAt: number;
+  finalizedBy: string;
+  supersededByFinalizationId: string | null;
+  failureReason: string | null;
+}
+
+function rowToSaveIntentFinalization(row: any): SaveIntentFinalization {
+  return {
+    id: row.id, saveUnitId: row.save_unit_id, saveUnitKind: row.save_unit_kind,
+    revision: row.revision, repositoryKey: row.repository_key,
+    memberManifestJson: row.member_manifest_json, checkpointOid: row.checkpoint_oid,
+    boundaryRef: row.boundary_ref ?? null, boundaryStatus: row.boundary_status,
+    lifecycleStatus: row.lifecycle_status, finalizedAt: row.finalized_at,
+    finalizedBy: row.finalized_by,
+    supersededByFinalizationId: row.superseded_by_finalization_id ?? null,
+    failureReason: row.failure_reason ?? null,
+  };
+}
+
+export function insertSaveIntentFinalization(value: SaveIntentFinalization): void {
+  run(
+    `INSERT INTO save_intent_finalizations
+      (id, save_unit_id, save_unit_kind, revision, repository_key, member_manifest_json,
+       checkpoint_oid, boundary_ref, boundary_status, lifecycle_status, finalized_at,
+       finalized_by, superseded_by_finalization_id, failure_reason)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [value.id, value.saveUnitId, value.saveUnitKind, value.revision, value.repositoryKey,
+      value.memberManifestJson, value.checkpointOid, value.boundaryRef, value.boundaryStatus,
+      value.lifecycleStatus, value.finalizedAt, value.finalizedBy,
+      value.supersededByFinalizationId, value.failureReason],
+  );
+}
+
+export function getSaveIntentFinalization(id: string): SaveIntentFinalization | null {
+  const row = queryOne('SELECT * FROM save_intent_finalizations WHERE id = ?', [id]);
+  return row ? rowToSaveIntentFinalization(row) : null;
+}
+
+export function getActiveSaveIntentFinalization(saveUnitId: string): SaveIntentFinalization | null {
+  const row = queryOne(
+    `SELECT * FROM save_intent_finalizations
+      WHERE save_unit_id = ? AND lifecycle_status = 'active' ORDER BY revision DESC LIMIT 1`,
+    [saveUnitId],
+  );
+  return row ? rowToSaveIntentFinalization(row) : null;
+}
+
+export function listActiveSaveIntentFinalizations(repositoryKey: string): SaveIntentFinalization[] {
+  return queryAll(
+    `SELECT * FROM save_intent_finalizations
+      WHERE repository_key = ? AND lifecycle_status = 'active' ORDER BY save_unit_id`,
+    [repositoryKey],
+  ).map(rowToSaveIntentFinalization);
+}
+
+export function maxSaveIntentFinalizationRevision(saveUnitId: string): number {
+  const row = queryOne(
+    'SELECT COALESCE(MAX(revision), 0) AS revision FROM save_intent_finalizations WHERE save_unit_id = ?',
+    [saveUnitId],
+  );
+  return Number(row?.revision ?? 0);
+}
+
+export function supersedeSaveIntentFinalization(id: string, supersededBy: string): void {
+  run(
+    `UPDATE save_intent_finalizations SET lifecycle_status = 'superseded',
+       superseded_by_finalization_id = ? WHERE id = ? AND lifecycle_status = 'active'`,
+    [supersededBy, id],
+  );
+}
+
+export function setSaveIntentFinalizationBoundaryStatus(
+  id: string,
+  status: SaveIntentFinalization['boundaryStatus'],
+): void {
+  run('UPDATE save_intent_finalizations SET boundary_status = ? WHERE id = ?', [status, id]);
 }
 
 function rowToAttributionResolution(row: any): AttributionResolution {

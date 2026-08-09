@@ -517,7 +517,6 @@ test('production coordinator seams reassemble a minted snapshot from the shared 
     selectedComponentIds: ['c1'],
     selectedUnattributedEntryIds: [],
     finalizationIds: ['fin-1'],
-    acknowledgeTopologyDigest: topology,
     acknowledgeUnattributedEntryIds: [],
   }, context) as CommitCandidate;
   assert.ok(minted.token, 'the production token store is the coordinator token store');
@@ -572,7 +571,7 @@ test('production sweep seam reconstructs a durable intent from fresh route state
   await routes.productionSeams.refreshSweepInventory(REPO_KEY);
 });
 
-test('save-card mint route purely forwards reviewed digest and acknowledged atoms', async () => {
+test('legacy save-card mint route forwards reviewed digest and acknowledged atoms without topology acknowledgement', async () => {
   const routes = createPreviewRoutes(baseDeps({
     getPackageFinalization: (id) => (id === 'fin-1' ? finalization({
       memberManifestJson: JSON.stringify([{ ...frozen('e1'), commitBlobOid: OID }]),
@@ -598,7 +597,6 @@ test('save-card mint route purely forwards reviewed digest and acknowledged atom
     selectedComponentIds: ['c1'],
     selectedUnattributedEntryIds: [],
     finalizationIds: ['fin-1'],
-    acknowledgeTopologyDigest: 'topology',
     acknowledgeUnattributedEntryIds: [],
     reviewedManifestDigest: 'd'.repeat(64),
     acknowledgedChallengeAtoms,

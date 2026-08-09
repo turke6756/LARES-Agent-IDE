@@ -72,6 +72,7 @@ import {
   registerSaveCardIntentIpc,
   registerSaveCardPreviewIpc,
   registerSaveCardMintIpc,
+  registerSaveCardAttributionResolutionIpc,
   registerSaveCardFinalizeIpc,
   registerSaveCardAttentionIpc,
   type SaveCardRoutes,
@@ -289,6 +290,10 @@ export function registerIpcHandlers(
   // registered" error is exactly a channel that was defined but never registered.
   registerSaveCardPreviewIpc(ipcMain, () => saveCardPreviewRoutes);
   registerSaveCardMintIpc(ipcMain, () => saveCardMintRoutes);
+  registerSaveCardAttributionResolutionIpc(ipcMain, () =>
+    process.env.LARES_INTENT_PACKAGING === '1' && saveCardMintRoutes?.persistAttributionResolution ? {
+      persistAttributionResolution: saveCardMintRoutes.persistAttributionResolution,
+    } : null);
   registerSaveCardFinalizeIpc(ipcMain, () => saveCardFinalizeRoutes);
   registerCommitCoordinatorIpc(ipcMain, () => commitCoordinatorRoutes);
   registerSaveSweepIpc(ipcMain, () => saveSweepService);

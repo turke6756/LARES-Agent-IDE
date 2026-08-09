@@ -130,7 +130,6 @@ function makeSnapshot(opts: SnapshotOptions): CandidateTokenSnapshot {
       selectedComponentIds: ['comp-1'],
       selectedUnattributedEntryIds: [],
       finalizationIds: ['f1'],
-      acknowledgeTopologyDigest: opts.topologyDigest ?? 'topo-1',
       acknowledgeUnattributedEntryIds: [],
     },
     componentTopologyDigest: opts.topologyDigest ?? 'topo-1',
@@ -288,6 +287,8 @@ interface HarnessOverrides {
   readMemberRepresentation?: CommitCoordinatorDeps['readMemberRepresentation'];
   composeLocks?: ComposeLockRegistry;
   queue?: CheckpointQueue;
+  writeIntentLedger?: CommitCoordinatorDeps['writeIntentLedger'];
+  contractVersion?: number;
 }
 
 function fakeHarness(snapshot: CandidateTokenSnapshot, git: ReturnType<typeof makeFakeGit>, overrides: HarnessOverrides = {}) {
@@ -317,6 +318,8 @@ function fakeHarness(snapshot: CandidateTokenSnapshot, git: ReturnType<typeof ma
     locateRepository: () => ({ repoRoot: 'X:/repo', gitExe: undefined }),
     now: () => 1000,
     newAttemptId: () => 'attempt-1',
+    writeIntentLedger: overrides.writeIntentLedger,
+    contractVersion: overrides.contractVersion,
   });
   return { coordinator, tokens, attempts, composeLocks };
 }
@@ -494,6 +497,40 @@ test('committed: parent + tree verified, index integrity verified, attempt ledge
   assert.equal(res.identifiedCommitOid, 'b'.repeat(40));
   assert.equal(tokens.state, 'consumed');
   assert.equal(composeLocks.isHeld(REPOSITORY_KEY), false);
+});
+
+test('v2 committed outcome writes the intent ledger once after the verified HEAD CAS', async () => {
+  const legacySnapshot = makeSnapshot({
+    contractVersion: 2,
+    members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }],
+  });
+  const snapshot: CandidateTokenSnapshot = {
+    ...legacySnapshot,
+    candidate: {
+      ...legacySnapshot.candidate,
+      saveIntentIds: ['intent-1'],
+      attributionResolutions: [{
+        resolutionId: 'resolution-1', evidenceDigest: 'evidence-1', resolution: 'commit-together',
+        affectedPathBytesBase64: [pathOf('a.txt').pathBytesBase64], intentIds: ['intent-1', 'intent-2'],
+      }],
+    },
+    normalizedRequest: {
+      selectedIntentIds: ['intent-1'], selectedNamedSaveSetIds: [], resolutionIds: ['resolution-1'],
+      finalizationIds: ['f1'],
+    },
+  };
+  const ledgerWrites: import('../database').IntentCommitLedgerWrite[] = [];
+  const { coordinator } = fakeHarness(snapshot, makeFakeGit(committedGit()), {
+    writeIntentLedger: (write) => { ledgerWrites.push(write); },
+    contractVersion: 2,
+  });
+  const result = await coordinator.commit({ tokenId: 'tok-1', message: 'Save task' });
+  assert.equal((result as any).outcome.status, 'committed');
+  assert.equal(ledgerWrites.length, 1);
+  assert.equal(ledgerWrites[0].record.commitOid, 'b'.repeat(40));
+  assert.deepEqual(ledgerWrites[0].intentLinks.map((link) => link.intentId), ['intent-1']);
+  assert.deepEqual(ledgerWrites[0].consumedResolutions.map((row) => row.id), ['resolution-1']);
+  assert.deepEqual(ledgerWrites[0].finalizationIds, ['f1']);
 });
 
 test('marked commit with unexpected parent → repository-state-uncertain, OID preserved, no drift-into-committed', async () => {

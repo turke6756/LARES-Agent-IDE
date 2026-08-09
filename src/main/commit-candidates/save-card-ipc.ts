@@ -18,6 +18,7 @@ import {
   SAVECARD_ADOPT_BASELINE_CHANNEL,
   SAVECARD_PREVIEW_CHANNEL,
   COMMIT_CANDIDATE_MINT_CHANNEL,
+  SAVECARD_ATTRIBUTION_RESOLUTION_CHANNEL,
   SAVECARD_FINALIZE_CHANNEL,
   SAVECARD_ATTENTION_CHANNEL,
   SAVECARD_ATTENTION_CHANGED_CHANNEL,
@@ -29,6 +30,9 @@ import {
   type SaveCardPreviewResponse,
   type SaveCardMintRequest,
   type SaveCardMintResponse,
+  type SaveCardMintRequestV2,
+  type SaveCardAttributionResolutionRequest,
+  type SaveCardAttributionResolutionResponse,
   type SaveCardPinnedSelection,
   type SaveCardFleetAdhocMarkDoneRequest,
   type SaveCardFleetAdhocMarkDoneResponse,
@@ -72,7 +76,8 @@ function requireChallengeAtoms(value: unknown): ReviewChallengeAtom[] | undefine
       throw new SaveCardIpcError('acknowledgedChallengeAtoms contains an invalid atom', 'save-card-bad-request');
     }
     const record = atom as Record<string, unknown>;
-    if ((record.kind !== 'unattributed' && record.kind !== 'overlap')
+    if ((record.kind !== 'unattributed' && record.kind !== 'cross-intent'
+          && !Array.isArray(record.memberPathBytesBase64))
         || typeof record.atomId !== 'string'
         || typeof record.digest !== 'string') {
       throw new SaveCardIpcError('acknowledgedChallengeAtoms contains an invalid atom', 'save-card-bad-request');
@@ -409,10 +414,17 @@ export interface SaveCardPreviewRoutes {
 }
 
 export interface SaveCardMintRoutes {
-  mintCandidate(req: SaveCardMintRequest): Promise<{
+  mintCandidate(req: any): Promise<{
     candidate: CommitCandidate | SelectionPreview;
     context: CandidateBuildContext;
   }>;
+  persistAttributionResolution?: SaveCardAttributionResolutionRoutes['persistAttributionResolution'];
+}
+
+export interface SaveCardAttributionResolutionRoutes {
+  persistAttributionResolution(
+    req: SaveCardAttributionResolutionRequest,
+  ): Promise<SaveCardAttributionResolutionResponse>;
 }
 
 function requirePreviewRoutes(routes: SaveCardPreviewRoutes | null): SaveCardPreviewRoutes {
@@ -464,11 +476,10 @@ function requirePreviewRequest(raw: unknown): SaveCardPreviewRequest {
 
 const MINT_REQUEST_FIELDS = new Set([
   'workspaceId',
-  'selectedComponentIds',
-  'selectedUnattributedEntryIds',
+  'selectedIntentIds',
+  'selectedNamedSaveSetIds',
+  'resolutionIds',
   'finalizationIds',
-  'acknowledgeTopologyDigest',
-  'acknowledgeUnattributedEntryIds',
   'reviewedManifestDigest',
   'acknowledgedChallengeAtoms',
 ]);
@@ -478,6 +489,18 @@ function requireMintRequest(raw: unknown): SaveCardMintRequest {
     throw new SaveCardIpcError('a mint request is required', 'save-card-bad-request');
   }
   const record = raw as Record<string, unknown>;
+  if (process.env.LARES_INTENT_PACKAGING !== '1'
+      && Array.isArray(record.selectedComponentIds)
+      && Array.isArray(record.selectedUnattributedEntryIds)) {
+    const legacyFields = new Set([
+      'workspaceId', 'selectedComponentIds', 'selectedUnattributedEntryIds', 'finalizationIds',
+      'acknowledgeUnattributedEntryIds', 'reviewedManifestDigest', 'acknowledgedChallengeAtoms',
+      ['acknowledge', 'TopologyDigest'].join(''),
+    ]);
+    const unexpected = Object.keys(record).find((field) => !legacyFields.has(field));
+    if (unexpected) throw new SaveCardIpcError(`unexpected mint request field: ${unexpected}`, 'save-card-bad-request');
+    return record as unknown as SaveCardMintRequest;
+  }
   const unexpected = Object.keys(record).filter((field) => !MINT_REQUEST_FIELDS.has(field));
   if (unexpected.length > 0) {
     throw new SaveCardIpcError(`unexpected mint request field: ${unexpected[0]}`, 'save-card-bad-request');
@@ -492,20 +515,12 @@ function requireMintRequest(raw: unknown): SaveCardMintRequest {
     }
     return value as string[];
   };
-  if (record.acknowledgeTopologyDigest !== null
-      && typeof record.acknowledgeTopologyDigest !== 'string') {
-    throw new SaveCardIpcError(
-      'acknowledgeTopologyDigest must be a string or null',
-      'save-card-bad-request',
-    );
-  }
   return {
     workspaceId: record.workspaceId,
-    selectedComponentIds: strings('selectedComponentIds'),
-    selectedUnattributedEntryIds: strings('selectedUnattributedEntryIds'),
+    selectedIntentIds: strings('selectedIntentIds'),
+    selectedNamedSaveSetIds: strings('selectedNamedSaveSetIds'),
+    resolutionIds: strings('resolutionIds'),
     finalizationIds: strings('finalizationIds'),
-    acknowledgeTopologyDigest: record.acknowledgeTopologyDigest,
-    acknowledgeUnattributedEntryIds: strings('acknowledgeUnattributedEntryIds'),
     ...(record.reviewedManifestDigest !== undefined
       ? { reviewedManifestDigest: requireOptionalDigest(record.reviewedManifestDigest) }
       : {}),
@@ -655,6 +670,27 @@ export function deriveDefaultMessageBody(
   candidate: CommitCandidate | SelectionPreview,
   context: CandidateBuildContext,
 ): string {
+  if (isCommitCandidate(candidate) && candidate.contractVersion === 2) {
+    const selected = (context.intentUnits ?? []).filter((unit) =>
+      candidate.saveIntentIds?.includes(unit.intentId));
+    if (selected.length > 0) {
+      const unitTitles = uniqueSorted(selected.map((unit) => sanitizeMessageMetadata(unit.title)).filter(Boolean));
+      const planTitles = uniqueSorted(selected.flatMap((unit) => unit.planTitle ? [sanitizeMessageMetadata(unit.planTitle)] : []));
+      const itemTitles = uniqueSorted(selected.flatMap((unit) => unit.planItemTitle ? [sanitizeMessageMetadata(unit.planItemTitle)] : []));
+      const taskTitles = uniqueSorted(selected.filter((unit) => unit.kind === 'task')
+        .map((unit) => sanitizeMessageMetadata(unit.title)).filter(Boolean));
+      const saveSetTitles = uniqueSorted(selected.filter((unit) => unit.kind === 'named-save-set')
+        .map((unit) => sanitizeMessageMetadata(unit.title)).filter(Boolean));
+      const subject = unitTitles.length === 1 ? unitTitles[0] : `Save ${selected.length} tasks`;
+      const details = [
+        ...planTitles.map((title) => `Plan: ${title}`),
+        ...itemTitles.map((title) => `Plan item: ${title}`),
+        ...taskTitles.map((title) => `Task: ${title}`),
+        ...saveSetTitles.map((title) => `Save set: ${title}`),
+      ];
+      return [boundMessageLength(subject), ...(details.length > 0 ? ['', ...details] : [])].join('\n');
+    }
+  }
   const selectedComponentIds = new Set(request.selectedComponentIds);
   const requestedFinalizationIds = new Set(request.finalizationIds);
   const selectedComponents = context.components.filter((component) =>
@@ -794,6 +830,7 @@ function toPreviewResponse(
   request: SaveCardPreviewRequest,
   candidate: CommitCandidate | SelectionPreview,
   context: CandidateBuildContext,
+  mint = false,
 ): SaveCardPreviewResponse {
   const defaultMessageBody = deriveDefaultMessageBody(request, candidate, context);
   const requestedIds = new Set(request.finalizationIds);
@@ -819,7 +856,7 @@ function toPreviewResponse(
         ...driftResult.drift.reAttributed,
       ])]
     : [];
-  const refusal = candidateRefusal(candidate, isCommitCandidate(candidate), request, blockingDriftPaths);
+  const refusal = candidateRefusal(candidate, isCommitCandidate(candidate), mint, blockingDriftPaths);
   return {
     candidate,
     isCandidate: isCommitCandidate(candidate),
@@ -840,10 +877,9 @@ function toPreviewResponse(
 function candidateRefusal(
   candidate: CommitCandidate | SelectionPreview,
   candidateBacked: boolean,
-  request: SaveCardPreviewRequest | SaveCardMintRequest,
+  mint: boolean,
   paths: string[],
 ): SaveRefusal | null {
-  const mint = 'acknowledgeTopologyDigest' in request;
   const stage: SaveRefusalStage = mint ? 'mint' : 'preview-verify';
   if (!candidateBacked) {
     return {
@@ -921,10 +957,41 @@ export function registerSaveCardMintIpc(
       );
     }
     const { candidate, context } = await routes.mintCandidate(request);
-    const response = toPreviewResponse(request, candidate, context) satisfies SaveCardMintResponse;
+    const responseRequest: SaveCardPreviewRequest = 'selectedIntentIds' in request ? {
+      workspaceId: request.workspaceId,
+      selectedComponentIds: candidate.componentIds,
+      selectedUnattributedEntryIds: candidate.selectedUnattributedEntryIds,
+      finalizationIds: request.finalizationIds,
+      reviewedManifestDigest: request.reviewedManifestDigest,
+      acknowledgedChallengeAtoms: request.acknowledgedChallengeAtoms,
+    } : request;
+    const response = toPreviewResponse(responseRequest, candidate, context, true) satisfies SaveCardMintResponse;
     telemetry(response.refusal
       ? { stage: response.refusal.stage, code: response.refusal.code }
       : { stage: 'mint', code: 'mint-token-issued' });
     return response;
+  });
+}
+
+/** Production picker persistence seam. The route re-resolves repository and
+ * evidence; this transport accepts no renderer-authored repository identity. */
+export function registerSaveCardAttributionResolutionIpc(
+  ipc: IpcLike,
+  getRoutes: () => SaveCardAttributionResolutionRoutes | null,
+): void {
+  ipc.handle(SAVECARD_ATTRIBUTION_RESOLUTION_CHANNEL, async (_event, raw: unknown) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new SaveCardIpcError('an attribution resolution request is required', 'save-card-bad-request');
+    }
+    const request = raw as SaveCardAttributionResolutionRequest;
+    if (!request.workspaceId || !request.atom || request.atom.kind !== 'cross-intent') {
+      throw new SaveCardIpcError('cross-intent evidence is required', 'save-card-bad-request');
+    }
+    if (!['commit-together', 'superseded-intentionally', 'restore-lost-work'].includes(request.resolution)) {
+      throw new SaveCardIpcError('invalid attribution resolution', 'save-card-bad-request');
+    }
+    const routes = getRoutes();
+    if (!routes) throw new SaveCardIpcError('save-card engine unavailable', 'save-card-engine-unavailable');
+    return routes.persistAttributionResolution(request);
   });
 }

@@ -314,7 +314,6 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
 
     const mintedResponse = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
       ...selection,
-      acknowledgeTopologyDigest: preview.componentTopologyDigest,
       acknowledgeUnattributedEntryIds: preview.unacknowledgedUnattributedEntryIds,
     });
     const minted = mintedResponse.candidate as CommitCandidate;
@@ -376,7 +375,7 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     const movedPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, movedSelection);
     fs.writeFileSync(path.join(repo, '.lares/proposals/moved-before-mint.md'), 'changed\n');
     const movedMint = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...movedSelection, acknowledgeTopologyDigest: movedPreview.componentTopologyDigest,
+      ...movedSelection,
       acknowledgeUnattributedEntryIds: movedSelection.selectedUnattributedEntryIds,
     });
     assert.deepEqual(movedMint.candidate.eligibility, { eligible: false, reason: 'byte-mismatch' });
@@ -424,7 +423,7 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     };
     const mixedPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, mixedSelection);
     const mixedMintResponse = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...mixedSelection, acknowledgeTopologyDigest: mixedPreview.componentTopologyDigest,
+      ...mixedSelection,
       acknowledgeUnattributedEntryIds: mixedSelection.selectedUnattributedEntryIds,
     });
     const mixedCandidate = mixedMintResponse.candidate as CommitCandidate;
@@ -449,7 +448,7 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     };
     const afterMintPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, afterMintSelection);
     const afterMintResponse = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...afterMintSelection, acknowledgeTopologyDigest: afterMintPreview.componentTopologyDigest,
+      ...afterMintSelection,
       acknowledgeUnattributedEntryIds: afterMintSelection.selectedUnattributedEntryIds,
     });
     const afterMintCandidate = afterMintResponse.candidate as CommitCandidate;
@@ -476,7 +475,7 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     };
     const expiryPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, expirySelection);
     const expiryMint = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...expirySelection, acknowledgeTopologyDigest: expiryPreview.componentTopologyDigest,
+      ...expirySelection,
       acknowledgeUnattributedEntryIds: expirySelection.selectedUnattributedEntryIds,
     });
     const expiryCandidate = expiryMint.candidate as CommitCandidate;
@@ -512,7 +511,7 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     };
     const hookPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, hookSelection);
     const hookMint = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...hookSelection, acknowledgeTopologyDigest: hookPreview.componentTopologyDigest,
+      ...hookSelection,
       acknowledgeUnattributedEntryIds: hookSelection.selectedUnattributedEntryIds,
     });
     const hookCandidate = hookMint.candidate as CommitCandidate;

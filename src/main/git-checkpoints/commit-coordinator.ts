@@ -55,8 +55,10 @@ import { BUNDLE_CONTRACT_VERSION } from '../../shared/constants';
 import type { CandidateTokenSnapshot } from '../commit-candidates/candidate-service';
 import type {
   CommitAttemptResolution,
+  IntentCommitLedgerWrite,
   PendingCommitAttempt,
 } from '../database';
+import { writeIntentCommitLedger } from '../database';
 import { encodeGitPath } from '../commit-candidates/dirty-inventory';
 import { parseStageEntries } from '../commit-candidates/commit-representation';
 import { ComposeLockRegistry } from '../commit-candidates/compose-lock-registry';
@@ -165,6 +167,8 @@ export interface CommitCoordinatorDeps {
   env?: NodeJS.ProcessEnv;
   /** Server-side message validation (default: trim, non-empty, bounded, no NUL). */
   validateMessage?(raw: string): string;
+  /** Production database transaction; injectable only to prove the post-CAS ledger boundary. */
+  writeIntentLedger?(write: IntentCommitLedgerWrite): void;
   /** Server-derived `Lares-*` trailers from the immutable snapshot (default below);
    *  NEVER renderer-trusted. */
   deriveTrailers?(snapshot: CandidateTokenSnapshot): string[];
@@ -390,7 +394,8 @@ export class CommitCoordinator {
     this.newAttemptId = deps.newAttemptId ?? (() => randomUUID());
     this.validateMessage = deps.validateMessage ?? defaultValidateMessage;
     this.deriveTrailers = deps.deriveTrailers ?? defaultDeriveTrailers;
-    this.contractVersion = deps.contractVersion ?? BUNDLE_CONTRACT_VERSION;
+    this.contractVersion = deps.contractVersion
+      ?? (process.env.LARES_INTENT_PACKAGING === '1' ? 2 : BUNDLE_CONTRACT_VERSION);
   }
 
   /**
@@ -546,6 +551,60 @@ export class CommitCoordinator {
             ...(indexMismatchedPaths ? { indexMismatchedPaths } : {}),
             ...(drift ? { currentHeadDrift: drift } : {}),
           };
+        }
+        if (snapshot.token.contractVersion === 2) {
+          try {
+            const createdAt = this.now();
+            const resolutions = snapshot.candidate.attributionResolutions ?? [];
+            const resolutionForIntent = (intentId: string) => resolutions.find((resolution) =>
+              resolution.intentIds.includes(intentId));
+            (this.d.writeIntentLedger ?? writeIntentCommitLedger)({
+              record: {
+                repositoryKey: snapshot.repositoryKey, commitOid: locked.commitOid,
+                parentOid: pinnedHeadOid, observedAt: createdAt, source: 'lares',
+                pushedRemoteCount: 0, lastReconciledAt: createdAt,
+              },
+              turnLinks: [...new Map(snapshot.associations.flatMap((association) =>
+                association.contributingTurnIds.map((turnId) => [turnId, {
+                  repositoryKey: snapshot.repositoryKey, commitOid: locked.commitOid,
+                  turnId, planId: association.planId, planItemId: association.planItemId,
+                  relation: 'candidate_member' as const, captureQuality: null,
+                }] as const))).values()],
+              pathLinks: snapshot.candidate.members.map((member) => ({
+                repositoryKey: snapshot.repositoryKey, commitOid: locked.commitOid,
+                pathBytesBase64: member.path.pathBytesBase64,
+                expectedState: member.expectedWorktreeState,
+                rawBlobOidAtCommit: member.rawWorktreeBlobOid,
+                commitBlobOid: member.expectedCommitBlobOid, commitMode: member.expectedCommitMode,
+                contributingTurnIds: snapshot.associations
+                  .filter((association) => association.memberEntryIds.includes(member.entryId))
+                  .flatMap((association) => association.contributingTurnIds),
+                overlapCount: snapshot.associations.filter((association) =>
+                  association.memberEntryIds.includes(member.entryId)).length,
+              })),
+              intentLinks: (snapshot.candidate.saveIntentIds ?? []).map((intentId) => {
+                const resolution = resolutionForIntent(intentId);
+                const superseded = resolution?.resolution === 'superseded-intentionally'
+                  && resolution.intentIds[0] === intentId;
+                return {
+                  repositoryKey: snapshot.repositoryKey, commitOid: locked.commitOid, intentId,
+                  disposition: superseded ? 'superseded' as const : 'committed' as const,
+                  resolutionId: resolution?.resolutionId ?? null, createdAt,
+                };
+              }),
+              consumedResolutions: resolutions.map((resolution) => ({
+                id: resolution.resolutionId, evidenceDigest: resolution.evidenceDigest,
+                candidateId: snapshot.candidate.candidateId,
+              })),
+              finalizationIds: snapshot.candidate.finalizations.map((row) => row.finalizationId),
+            });
+          } catch {
+            resolveAttempt(locked.resolvedHeadOid, locked.commitOid, 'repository-state-uncertain');
+            return {
+              status: 'repository-state-uncertain', pinnedHeadOid: pinnedHeadOid ?? '',
+              resolvedHeadOid: locked.resolvedHeadOid, attemptId,
+            };
+          }
         }
         resolveAttempt(locked.resolvedHeadOid, locked.commitOid, 'committed');
         return {

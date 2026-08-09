@@ -31,6 +31,7 @@ for (const binding of [
   'preview: (req) => ipcRenderer.invoke(SAVECARD_PREVIEW_CHANNEL, req)',
   'markDone: (req) => ipcRenderer.invoke(SAVECARD_FINALIZE_CHANNEL, req)',
   'sweep: (req) => ipcRenderer.invoke(SAVE_SWEEP_CHANNEL, req)',
+  'resolveAttribution: (req) => ipcRenderer.invoke(SAVECARD_ATTRIBUTION_RESOLUTION_CHANNEL, req)',
   'mint: (req) => ipcRenderer.invoke(COMMIT_CANDIDATE_MINT_CHANNEL, req)',
   'commit: (req) => ipcRenderer.invoke(COMMIT_COORDINATOR_CHANNEL, req)',
 ]) {
@@ -38,6 +39,7 @@ for (const binding of [
 }
 
 assert.ok(saveCard.includes('window.api.saveCard.getInventory('));
+assert.ok(saveCard.includes('window.api.saveCard.resolveAttribution('));
 for (const surface of [saveCard, plan, missionBoard]) {
   assert.ok(surface.includes('createCandidateSubmitter'));
   assert.equal(surface.includes('window.api.commitCoordinator.commit('), false);

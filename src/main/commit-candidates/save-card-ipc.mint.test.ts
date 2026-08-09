@@ -4,6 +4,7 @@ import {
   COMMIT_CANDIDATE_MINT_CHANNEL,
   SAVECARD_PREVIEW_CHANNEL,
   type SaveCardMintRequest,
+  type LegacySaveCardMintRequest,
   type SaveCardMintResponse,
 } from '../../shared/types';
 import type {
@@ -149,7 +150,6 @@ function harness(
         selectedComponentIds: req.selectedComponentIds,
         selectedUnattributedEntryIds: req.selectedUnattributedEntryIds,
         finalizationIds: req.finalizationIds,
-        acknowledgeTopologyDigest: req.acknowledgeTopologyDigest,
         acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
         reviewedManifestDigest: req.reviewedManifestDigest,
         acknowledgedChallengeAtoms: req.acknowledgedChallengeAtoms,
@@ -204,7 +204,6 @@ function overlapHarness(previewCtx: CandidateBuildContext, mintCtx: CandidateBui
         selectedComponentIds: req.selectedComponentIds,
         selectedUnattributedEntryIds: req.selectedUnattributedEntryIds,
         finalizationIds: req.finalizationIds,
-        acknowledgeTopologyDigest: req.acknowledgeTopologyDigest,
         acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
         reviewedManifestDigest: req.reviewedManifestDigest,
         acknowledgedChallengeAtoms: req.acknowledgedChallengeAtoms,
@@ -223,10 +222,6 @@ function request(ctx: CandidateBuildContext, unattributed = false): SaveCardMint
   return {
     workspaceId: 'ws-1', selectedComponentIds, selectedUnattributedEntryIds,
     finalizationIds: ['fin-1'],
-    acknowledgeTopologyDigest: computeCandidateTopologyDigest(
-      ctx, selectedComponentIds,
-      ctx.inventory.entries.filter((item) => selectedUnattributedEntryIds.includes(item.entryId)),
-    ),
     acknowledgeUnattributedEntryIds: selectedUnattributedEntryIds,
   };
 }
@@ -247,13 +242,14 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   const minted = candidate(response);
   assert.equal(minted.eligibility.eligible, true);
   assert.ok(minted.token);
+  const legacyRequest = request(ctx) as LegacySaveCardMintRequest;
   const previewed = buildCandidate({
-    selectedComponentIds: request(ctx).selectedComponentIds,
+    selectedComponentIds: legacyRequest.selectedComponentIds,
     selectedUnattributedEntryIds: [],
     finalizationIds: ['fin-1'],
   }, ctx) as CommitCandidate;
   assert.equal(minted.candidateId, previewed.candidateId);
-  assert.equal(response.componentTopologyDigest, request(ctx).acknowledgeTopologyDigest);
+  assert.equal(response.componentTopologyDigest, computeCandidateTopologyDigest(ctx, ['component-1'], []));
   assert.equal(service.resolveCandidateToken(minted.token!.tokenId)?.candidate.candidateId, minted.candidateId);
 
   // WP-4: operational identity moves with HEAD, while the separately versioned
@@ -274,7 +270,6 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   assert.deepEqual(reviewed.durableFinalizationIntent?.map((intent) => intent.finalizationId), ['fin-1']);
   const carried = await mint(carryIpc, {
     ...carrySelection,
-    acknowledgeTopologyDigest: reviewed.componentTopologyDigest,
     acknowledgeUnattributedEntryIds: [],
     reviewedManifestDigest: reviewed.reviewedManifest!.reviewedManifestDigest,
     acknowledgedChallengeAtoms: reviewed.reviewedManifest!.challengeAtoms,
@@ -285,7 +280,6 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
 
   const unknownReview = await mint(carryIpc, {
     ...carrySelection,
-    acknowledgeTopologyDigest: reviewed.componentTopologyDigest,
     acknowledgeUnattributedEntryIds: [],
     reviewedManifestDigest: 'f'.repeat(64),
     acknowledgedChallengeAtoms: reviewed.reviewedManifest!.challengeAtoms,
@@ -305,7 +299,6 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   assert.equal(unattributedReview.reviewedManifest?.challengeAtoms.length, 1);
   const rendererClaimWithoutAtom = await mint(unattributedCarryIpc, {
     ...unattributedSelection,
-    acknowledgeTopologyDigest: unattributedReview.componentTopologyDigest,
     acknowledgeUnattributedEntryIds: ['entry-1'],
     reviewedManifestDigest: unattributedReview.reviewedManifest!.reviewedManifestDigest,
     acknowledgedChallengeAtoms: [],
@@ -320,15 +313,10 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   assert.deepEqual(telemetry, [{ stage: 'mint', code: 'mint-token-issued' }]);
   assert.deepEqual(Object.keys(telemetry[0]).sort(), ['code', 'stage']);
 
-  const staleResponse = await mint(ipc, { ...request(ctx), acknowledgeTopologyDigest: 'stale' });
+  const staleResponse = await mint(ipc, request(ctx));
   const stale = candidate(staleResponse);
-  assert.deepEqual(stale.eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
-  assert.equal(stale.token, null);
-  assert.equal(staleResponse.refusal?.stage, 'mint');
-  assert.equal(staleResponse.refusal?.code, 'acknowledgement-stale');
-  const missing = candidate(await mint(ipc, { ...request(ctx), acknowledgeTopologyDigest: null }));
-  assert.deepEqual(missing.eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
-  assert.equal(missing.token, null);
+  assert.equal(stale.eligibility.eligible, true);
+  assert.ok(stale.token);
 
   const unattributed = context(true);
   const unattributedHarness = harness(unattributed);
@@ -367,7 +355,6 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   assert.equal(overlapPreview.requiresOverlapAck, true);
   const overlapMint = await mint(stableIpc, {
     ...overlapSelection,
-    acknowledgeTopologyDigest: overlapPreview.componentTopologyDigest,
     acknowledgeUnattributedEntryIds: overlapPreview.unacknowledgedUnattributedEntryIds,
   });
   assert.ok(candidate(overlapMint).token, 'preview challenge echoed through a separate context mints');
@@ -377,12 +364,10 @@ async function mint(ipc: FakeIpc, req: SaveCardMintRequest): Promise<SaveCardMin
   const beforeMove = await movedIpc.invoke(SAVECARD_PREVIEW_CHANNEL, overlapSelection) as import('../../shared/types').SaveCardPreviewResponse;
   const moved = await mint(movedIpc, {
     ...overlapSelection,
-    acknowledgeTopologyDigest: beforeMove.componentTopologyDigest,
     acknowledgeUnattributedEntryIds: beforeMove.unacknowledgedUnattributedEntryIds,
   });
-  assert.equal(moved.refusal?.code, 'acknowledgement-stale');
-  assert.deepEqual(candidate(moved).eligibility, { eligible: false, reason: 'overlap-not-acknowledged' });
-  assert.equal(candidate(moved).token, null);
+  assert.equal(moved.refusal, null);
+  assert.ok(candidate(moved).token);
   console.log('All save-card mint IPC tests passed');
 })().catch((error) => {
   console.error(error instanceof Error ? error.stack : String(error));

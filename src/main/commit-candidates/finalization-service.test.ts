@@ -24,11 +24,14 @@ import type { CommitRepresentationEntry } from './commit-representation';
 import type { EncodedGitPath } from '../../shared/commit-candidates';
 import {
   finalizePackage,
+  finalizeSaveUnit,
   type FinalizationStore,
   type FinalizePackageRequest,
   type FinalizationRefWriter,
   type MemberFreezer,
+  type SaveIntentFinalizationStore,
 } from './finalization-service';
+import type { SaveIntentFinalization } from '../database';
 import { finalizationRef } from '../git-checkpoints/finalization-refs';
 
 interface TestCase { name: string; run(): void | Promise<void>; }
@@ -157,6 +160,30 @@ function planRequest(over: Partial<FinalizePackageRequest> = {}): FinalizePackag
     ...over,
   };
 }
+
+test('v2 task finalization preserves freeze-ref-transaction ordering without a legacy package row', async () => {
+  const rows = new Map<string, SaveIntentFinalization>();
+  const events: string[] = [];
+  const store: SaveIntentFinalizationStore = {
+    getActive: (id) => [...rows.values()].find((row) => row.saveUnitId === id && row.lifecycleStatus === 'active') ?? null,
+    maxRevision: (id) => Math.max(0, ...[...rows.values()].filter((row) => row.saveUnitId === id).map((row) => row.revision)),
+    insert: (row) => { events.push(`insert:${row.id}`); rows.set(row.id, structuredClone(row)); },
+    supersede: (id, by) => { const row = rows.get(id)!; rows.set(id, { ...row, lifecycleStatus: 'superseded', supersededByFinalizationId: by }); },
+    setBoundaryStatus: (id, status) => { rows.set(id, { ...rows.get(id)!, boundaryStatus: status }); },
+    transact: (fn) => fn(),
+  };
+  const result = await finalizeSaveUnit({
+    saveUnitId: 'intent-1', saveUnitKind: 'task', repositoryKey: 'repo-1',
+    finalizedBy: 'human-ipc', boundaryOid: OID_A, members: [member('src/a.ts')],
+    repoRoot: '/unused', pinnedHeadOid: null,
+  }, {
+    store, freeze: fakeFreeze, now: () => 100, newId: () => 'intent-fin-1',
+    writeRef: async () => { events.push('ref'); return { ok: true }; },
+  });
+  assert.equal(result.finalization.saveUnitKind, 'task');
+  assert.equal(result.finalization.revision, 1);
+  assert.deepEqual(events, ['ref', 'insert:intent-fin-1']);
+});
 
 // ── ordering + fresh create ──────────────────────────────────────────────────────
 

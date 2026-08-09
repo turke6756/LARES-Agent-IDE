@@ -53,9 +53,16 @@ import {
   insertPackageFinalization as dbInsert,
   supersedePackageFinalization as dbSupersede,
   setPackageFinalizationBoundaryStatus as dbSetBoundaryStatus,
+  getActiveSaveIntentFinalization as dbGetActiveIntent,
+  maxSaveIntentFinalizationRevision as dbMaxIntentRevision,
+  insertSaveIntentFinalization as dbInsertIntent,
+  supersedeSaveIntentFinalization as dbSupersedeIntent,
+  setSaveIntentFinalizationBoundaryStatus as dbSetIntentBoundaryStatus,
   type FinalizationBoundaryStatus,
   type FinalizationKind,
   type PackageFinalization,
+  type SaveIntentFinalization,
+  type SaveUnitKind,
 } from '../database';
 
 /** One frozen manifest member — the per-path evidence pinned at finalize time.
@@ -156,6 +163,41 @@ export interface FinalizePackageDeps {
   onReady?: (finalization: PackageFinalization) => void;
 }
 
+export interface SaveIntentFinalizationStore {
+  getActive(saveUnitId: string): SaveIntentFinalization | null;
+  maxRevision(saveUnitId: string): number;
+  insert(value: SaveIntentFinalization): void;
+  supersede(id: string, supersededBy: string): void;
+  setBoundaryStatus(id: string, status: SaveIntentFinalization['boundaryStatus']): void;
+  transact<T>(fn: () => T): T;
+}
+
+export const DATABASE_SAVE_INTENT_FINALIZATION_STORE: SaveIntentFinalizationStore = {
+  getActive: dbGetActiveIntent,
+  maxRevision: dbMaxIntentRevision,
+  insert: dbInsertIntent,
+  supersede: dbSupersedeIntent,
+  setBoundaryStatus: dbSetIntentBoundaryStatus,
+  transact: <T>(fn: () => T): T => getDb().transaction(fn)() as T,
+};
+
+export type FinalizeSaveUnitRequest = Omit<FinalizePackageRequest,
+  'packageId' | 'packageRevision' | 'finalizationKind' | 'planId' | 'planItemId'
+  | 'checkpointTurnId' | 'contractVersion' | 'createdFromWorkspaceId'> & {
+    saveUnitId: string;
+    saveUnitKind: SaveUnitKind;
+  };
+
+export interface FinalizeSaveUnitDeps extends Omit<FinalizePackageDeps, 'store' | 'onReady'> {
+  store?: SaveIntentFinalizationStore;
+}
+
+export interface FinalizeSaveUnitResult {
+  finalization: SaveIntentFinalization;
+  outcome: FinalizeOutcome;
+  memberManifestJson: string;
+}
+
 let idSeq = 0;
 function defaultId(): string {
   idSeq += 1;
@@ -164,7 +206,7 @@ function defaultId(): string {
 
 /** Freeze the request's members into a path-sorted, JCS-canonical manifest. */
 async function freezeManifest(
-  request: FinalizePackageRequest,
+  request: Pick<FinalizePackageRequest, 'members'>,
   freeze: MemberFreezer,
 ): Promise<string> {
   const seen = new Set<string>();
@@ -342,4 +384,71 @@ export async function finalizePackage(
     deps.onReady?.(row);
   });
   return { finalization: row, outcome: latest ? 'superseded' : 'created', memberManifestJson };
+}
+
+/** Intent-first finalization. It preserves finalizePackage's freeze -> ref -> txn
+ * failure ordering while writing only the v2 table. Legacy package rows remain a
+ * read-only adapter and are never created for task or named-save-set units. */
+export async function finalizeSaveUnit(
+  request: FinalizeSaveUnitRequest,
+  deps: FinalizeSaveUnitDeps = {},
+): Promise<FinalizeSaveUnitResult> {
+  if (!request.saveUnitId) throw new Error('finalize requires a saveUnitId');
+  if (!/^[0-9a-f]{40,64}$/.test(request.boundaryOid)) {
+    throw new Error(`finalize requires a valid boundary oid, got ${request.boundaryOid}`);
+  }
+  const store = deps.store ?? DATABASE_SAVE_INTENT_FINALIZATION_STORE;
+  const now = deps.now ?? Date.now;
+  const newId = deps.newId ?? defaultId;
+  const writeRef = deps.writeRef ?? ((ref: string, oid: string) => forceCreateFinalizationRef({
+    repoRoot: request.repoRoot, gitExe: request.gitExe, deadlineAt: request.deadlineAt,
+    runGit: request.runGit, ref, oid,
+  }));
+  const freeze = deps.freeze ?? ((entry: CommitRepresentationEntry) => readCurrentCommitRepresentation({
+    repoRoot: request.repoRoot, pinnedHeadOid: request.pinnedHeadOid, entry,
+    gitExe: request.gitExe, deadlineAt: request.deadlineAt, runGit: request.runGit,
+    runGitBytes: request.runGitBytes, queue: request.queue,
+    commonDirQueueKey: request.commonDirQueueKey,
+  }));
+  const memberManifestJson = await freezeManifest(request, freeze);
+  const identity = boundaryIdentity(request.boundaryOid, memberManifestJson);
+  const latest = store.getActive(request.saveUnitId);
+  const identical = latest !== null
+    && boundaryIdentity(latest.checkpointOid, latest.memberManifestJson) === identity;
+  if (identical && latest.boundaryStatus === 'ready') {
+    return { finalization: latest, outcome: 'existing-unchanged', memberManifestJson };
+  }
+  if (identical && latest.boundaryStatus !== 'ready') {
+    const ref = latest.boundaryRef ?? finalizationRef(request.saveUnitId, latest.revision);
+    const write = await writeRef(ref, request.boundaryOid);
+    if (!write.ok) return { finalization: latest, outcome: 'boundary-unavailable', memberManifestJson };
+    store.transact(() => store.setBoundaryStatus(latest.id, 'ready'));
+    return {
+      finalization: { ...latest, boundaryStatus: 'ready' },
+      outcome: 'reattached-ready', memberManifestJson,
+    };
+  }
+  const revision = store.maxRevision(request.saveUnitId) + 1;
+  const ref = finalizationRef(request.saveUnitId, revision);
+  const write = await writeRef(ref, request.boundaryOid);
+  const row = (lifecycleStatus: SaveIntentFinalization['lifecycleStatus'],
+    boundaryStatus: SaveIntentFinalization['boundaryStatus'],
+    failureReason: string | null): SaveIntentFinalization => ({
+    id: newId(), saveUnitId: request.saveUnitId, saveUnitKind: request.saveUnitKind,
+    revision, repositoryKey: request.repositoryKey, memberManifestJson,
+    checkpointOid: request.boundaryOid, boundaryRef: ref, boundaryStatus,
+    lifecycleStatus, finalizedAt: now(), finalizedBy: request.finalizedBy,
+    supersededByFinalizationId: null, failureReason,
+  });
+  if (!write.ok) {
+    const failed = row('abandoned', 'unavailable', write.error ?? 'boundary-ref-creation-failed');
+    store.transact(() => store.insert(failed));
+    return { finalization: failed, outcome: 'boundary-unavailable', memberManifestJson };
+  }
+  const ready = row('active', 'ready', null);
+  store.transact(() => {
+    if (latest) store.supersede(latest.id, ready.id);
+    store.insert(ready);
+  });
+  return { finalization: ready, outcome: latest ? 'superseded' : 'created', memberManifestJson };
 }

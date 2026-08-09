@@ -427,6 +427,8 @@ const PackageSaveGesture = forwardRef<PackageSaveGestureHandle, {
           authoritativeResponse={gesture.status === 'refused' ? (gesture.latestPreview ?? null) : null}
           onDraftChange={updateDraft}
           onBusyChange={setPreviewBusy}
+          onCrossIntentResolution={(atom, resolution) =>
+            window.api.saveCard.resolveAttribution({ workspaceId, atom, resolution }).then(() => undefined)}
           onClose={() => setDetailsOpen(false)}
         />
       )}

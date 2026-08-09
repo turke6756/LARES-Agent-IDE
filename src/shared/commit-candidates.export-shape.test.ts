@@ -28,6 +28,7 @@ import type {
   RepositoryIdentity,
   RequestedPlanBinding,
   ResolvedPlanStamp,
+  ReviewedAttributionResolution,
   SaveRefusal,
   SelectionPreview,
   TurnCaptureState,
@@ -108,6 +109,9 @@ type ExportShapes = [
     finalizations: FinalizationRef[];
     eligibility: CommitEligibility;
     token: CommitCandidateToken | null;
+    saveIntentIds?: string[];
+    selectedNamedSaveSetIds?: string[];
+    attributionResolutions?: ReviewedAttributionResolution[];
   }>>,
   Assert<Equal<SelectionPreview, {
     componentIds: string[];
@@ -142,7 +146,9 @@ type ExportShapes = [
         eligible: false;
         reason:
           'byte-mismatch' | 'package-not-finalized' | 'checkpoint-unavailable'
-          | 'finalization-conflict' | 'component-subset-not-allowed' | 'extraneous-finalization'
+          | 'component-subset-not-allowed'
+          | 'finalization-conflict' | 'extraneous-finalization'
+          | 'intent-revision-stale' | 'resolution-required' | 'resolution-stale'
           | 'unattributed-not-acknowledged' | 'overlap-not-acknowledged'
           | 'compose-in-flight' | 'unsupported-git-state';
       }>>,
@@ -178,8 +184,8 @@ type ExportShapes = [
     selectedComponentIds: string[];
     selectedUnattributedEntryIds: string[];
     finalizationIds: string[];
-    acknowledgeTopologyDigest: string | null;
     acknowledgeUnattributedEntryIds: string[];
+    [legacyCompatibilityField: string]: unknown;
   }>>,
   Assert<Equal<CommitCandidateToken, {
     tokenId: string;

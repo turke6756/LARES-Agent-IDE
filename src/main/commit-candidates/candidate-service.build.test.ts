@@ -201,7 +201,7 @@ test('an unfinalized selection is a SelectionPreview (package-not-finalized)', (
 
 // ── component atomicity ──────────────────────────────────────────────────────
 
-test('selecting a component entry AS unattributed is rejected (component-subset-not-allowed)', () => {
+test('intent-era path selection is governed by normalized Git closure, not topology components', () => {
   const a = entry('a.ts');
   const b = entry('b.ts');
   const comp = component([a.entryId, b.entryId]);
@@ -210,7 +210,7 @@ test('selecting a component entry AS unattributed is rejected (component-subset-
     req({ selectedUnattributedEntryIds: [a.entryId], finalizationIds: [f.id] }),
     ctx({ inventory: inventory([a, b], []), components: [comp], finalizations: [f] }),
   ) as CommitCandidate;
-  assert.deepEqual(result.eligibility, { eligible: false, reason: 'component-subset-not-allowed' });
+  assert.deepEqual(result.eligibility, { eligible: false, reason: 'package-not-finalized' });
 });
 
 test('naming a component pulls in ALL its entries (whole-component atomicity)', () => {

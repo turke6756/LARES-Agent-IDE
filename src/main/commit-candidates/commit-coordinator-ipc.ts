@@ -140,6 +140,12 @@ export async function consumeCommitCoordinatorForSweep(
     telemetry({ stage: 'token-consume', code: 'token-unresolved-or-expired' });
     return { attempt: { created: false }, reconciliation: 'not-applicable', response };
   }
+  if (process.env.LARES_INTENT_PACKAGING === '1'
+      && snapshot.token.contractVersion !== 2) {
+    const response = passthroughResult({ kind: 'token-unresolved' });
+    telemetry({ stage: 'token-consume', code: 'v2-token-required' });
+    return { attempt: { created: false }, reconciliation: 'not-applicable', response };
+  }
 
   const coordinated = await routes.coordinator.commit({
     tokenId: request.tokenId,
@@ -181,6 +187,29 @@ export async function consumeCommitCoordinatorForSweep(
       },
       reconciliation: 'not-applicable',
       response,
+    };
+  }
+
+  if (snapshot.token.contractVersion === 2) {
+    const response = {
+      kind: 'saved',
+      outcome: coordinated.outcome,
+      finalizations: snapshot.candidate.finalizations.map((row) => ({
+        finalizationId: row.finalizationId,
+        closed: true,
+        lifecycleStatus: 'committed' as const,
+        members: snapshot.candidate.members
+          .filter((member) => member.coveringFinalizationIds.includes(row.finalizationId))
+          .map((member) => ({
+            pathBytesBase64: member.path.pathBytesBase64,
+            disposition: { state: 'selected-in-candidate' as const, entryId: member.entryId },
+          })),
+      })),
+    } satisfies CommitCoordinatorConsumeResponse;
+    telemetry({ stage: 'reconciliation', code: 'save-verified' });
+    return {
+      attempt: { created: true, attemptId: coordinated.outcome.attemptId, commitOid: coordinated.outcome.commitOid },
+      reconciliation: 'succeeded', response,
     };
   }
 

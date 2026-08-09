@@ -2299,6 +2299,7 @@ export interface SaveCardAttentionChangedPayload {
 // mutates nothing.
 export const SAVECARD_PREVIEW_CHANNEL = 'savecard:preview' as const;
 export const COMMIT_CANDIDATE_MINT_CHANNEL = 'savecard:mint' as const;
+export const SAVECARD_ATTRIBUTION_RESOLUTION_CHANNEL = 'savecard:resolveAttribution' as const;
 
 /** Renderer request to preview a candidate for one explicit selection. Component
  *  ids expand server-side to ALL their entries; unattributed entries are
@@ -2317,17 +2318,36 @@ export interface SaveCardPreviewRequest {
 
 /** Dedicated token-issuing transition. Preview remains strictly read-only; the
  * renderer may only echo server identities and explicit human acknowledgements. */
-export interface SaveCardMintRequest {
+export interface SaveCardMintRequestV2 {
   workspaceId: string;
-  selectedComponentIds: string[];
-  selectedUnattributedEntryIds: string[];
+  selectedIntentIds: string[];
+  selectedNamedSaveSetIds: string[];
+  resolutionIds: string[];
   finalizationIds: string[];
-  acknowledgeTopologyDigest: string | null;
-  acknowledgeUnattributedEntryIds: string[];
   /** Optional prior main-issued review identity used by a fresh carry check. */
   reviewedManifestDigest?: string;
   /** Exact atoms the human saw and acknowledged; never an equivalence claim. */
   acknowledgedChallengeAtoms?: import('./commit-candidates').ReviewChallengeAtom[];
+}
+
+/** Read-only v1 transport adapter retained until WP-7 cuts renderer selection over. */
+export interface LegacySaveCardMintRequest extends SaveCardPreviewRequest {
+  acknowledgeUnattributedEntryIds: string[];
+  [legacyCompatibilityField: string]: unknown;
+}
+
+export type SaveCardMintRequest = SaveCardMintRequestV2 | LegacySaveCardMintRequest;
+
+export interface SaveCardAttributionResolutionRequest {
+  workspaceId: string;
+  atom: import('./commit-candidates').CrossIntentChallengeAtom;
+  resolution: import('./commit-candidates').CrossIntentResolution;
+}
+
+export interface SaveCardAttributionResolutionResponse {
+  resolutionId: string;
+  evidenceDigest: string;
+  resolution: import('./commit-candidates').CrossIntentResolution;
 }
 
 /** Path-byte-authoritative movement between a frozen finalization manifest and
@@ -2377,8 +2397,7 @@ export interface SaveCardPreviewResponse {
   unacknowledgedUnattributedEntryIds: string[];
   /** SC-WP-W6 — the server-computed union topology digest for this exact selection.
    *  Stable across previews of the same selected set (a hash of the selection, not
-   *  the bytes). The renderer echoes it back as `acknowledgeTopologyDigest` when it
-   *  forwards a mint intent for an overlapping package. */
+   *  the bytes). Retained read-only until the WP-7 renderer cutover. */
   componentTopologyDigest: string;
   selectionDrift: SelectionDrift;
   /** Display-only names keyed by authoritative path bytes. */
@@ -3553,6 +3572,9 @@ export interface IpcApi {
       req: SaveCardAdoptBaselineRequest,
     ) => Promise<SaveCardAdoptBaselineResponse>;
     preview: (req: SaveCardPreviewRequest) => Promise<SaveCardPreviewResponse>;
+    resolveAttribution: (
+      req: SaveCardAttributionResolutionRequest,
+    ) => Promise<SaveCardAttributionResolutionResponse>;
     /** Explicitly freeze and pin a fleet-adhoc package boundary. */
     markDone: (
       req: SaveCardFleetAdhocMarkDoneRequest,

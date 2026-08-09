@@ -97,6 +97,10 @@ export interface CommitCandidate {
   finalizations: FinalizationRef[];
   eligibility: CommitEligibility;
   token: CommitCandidateToken | null;
+  /** Present on the intent-first v2 contract. Legacy v1 readers omit these. */
+  saveIntentIds?: string[];
+  selectedNamedSaveSetIds?: string[];
+  attributionResolutions?: ReviewedAttributionResolution[];
 }
 
 export interface SelectionPreview {
@@ -121,6 +125,7 @@ export interface CandidateMember {
 
 /** Schema versions for the main-owned review contract and its challenge atoms. */
 export const REVIEWED_SEMANTIC_MANIFEST_VERSION = 1 as const;
+export const REVIEWED_SEMANTIC_MANIFEST_VERSION_V2 = 2 as const;
 export const REVIEW_CHALLENGE_VERSION = 1 as const;
 
 export interface ReviewedFrozenMember {
@@ -138,6 +143,24 @@ export interface ReviewedFinalizationIntent {
   boundaryStatus: 'ready';
   frozenMemberManifestDigest: string;
   frozenMembers: ReviewedFrozenMember[];
+}
+
+export interface ReviewedSaveIntent {
+  intentId: string;
+  kind: 'task' | 'named-save-set';
+  revision: number;
+  title: string;
+  planId: string | null;
+  planItemId: string | null;
+  finalizationId: string;
+}
+
+export interface ReviewedAttributionResolution {
+  resolutionId: string;
+  evidenceDigest: string;
+  resolution: 'commit-together' | 'superseded-intentionally';
+  affectedPathBytesBase64: string[];
+  intentIds: string[];
 }
 
 export type CommitEffectOperation = 'write' | 'delete' | 'retain';
@@ -221,10 +244,12 @@ export type ReviewChallengeAtom =
       memberEffectDigest: string;
     }
   | {
-      kind: 'overlap';
+      /** Read-only v1 adapter. New manifests never emit this topology atom. */
+      kind: string;
       atomId: string;
       digest: string;
       reasonVersion: 1;
+      pathBytesBase64?: undefined;
       memberPathBytesBase64: string[];
       contributors: AttributionContributor[];
       ownershipGroupKeys: string[];
@@ -248,6 +273,24 @@ export interface ReviewedSemanticManifest {
   challengeVersion: typeof REVIEW_CHALLENGE_VERSION;
   challengeAtoms: ReviewChallengeAtom[];
 }
+
+export interface ReviewedSemanticManifestV2 {
+  manifestVersion: typeof REVIEWED_SEMANTIC_MANIFEST_VERSION_V2;
+  candidateContractVersion: 2;
+  repositoryKey: string;
+  objectDatabaseKey: string;
+  gitObjectFormat: 'sha1' | 'sha256';
+  finalizations: ReviewedFinalizationIntent[];
+  members: ReviewedSemanticMember[];
+  saveIntents: ReviewedSaveIntent[];
+  attributionResolutions: ReviewedAttributionResolution[];
+  attributionTopology: ReviewedAttributionTopology;
+  closureObligations: ReviewedClosureObligation[];
+  challengeVersion: typeof REVIEW_CHALLENGE_VERSION;
+  challengeAtoms: ReviewChallengeAtom[];
+}
+
+export type AnyReviewedSemanticManifest = ReviewedSemanticManifest | ReviewedSemanticManifestV2;
 
 export type CommitEffectChangeKind = 'write' | 'delete' | 'rename' | 'copy' | 'mode-change';
 
@@ -361,9 +404,9 @@ function sortedByJcs<T>(values: T[]): T[] {
 }
 
 /** Sort every set-like collection before JCS encoding; input order is not identity. */
-export function normalizeReviewedSemanticManifest(
-  manifest: ReviewedSemanticManifest,
-): ReviewedSemanticManifest {
+export function normalizeReviewedSemanticManifest<T extends AnyReviewedSemanticManifest>(
+  manifest: T,
+): T {
   return {
     ...manifest,
     finalizations: sortedByJcs(manifest.finalizations.map((finalization) => ({
@@ -389,7 +432,7 @@ export function normalizeReviewedSemanticManifest(
         sortedStrings(manifest.attributionTopology.selectedUnattributedPathBytesBase64),
     },
     closureObligations: sortedByJcs(manifest.closureObligations),
-    challengeAtoms: sortedByJcs(manifest.challengeAtoms.map((atom) => atom.kind === 'overlap'
+    challengeAtoms: sortedByJcs(manifest.challengeAtoms.map((atom) => 'memberPathBytesBase64' in atom
       ? {
           ...atom,
           memberPathBytesBase64: sortedStrings(atom.memberPathBytesBase64),
@@ -397,11 +440,19 @@ export function normalizeReviewedSemanticManifest(
           ownershipGroupKeys: [...atom.ownershipGroupKeys].sort(),
         }
       : { ...atom })),
-  };
+    ...('saveIntents' in manifest ? {
+      saveIntents: sortedByJcs(manifest.saveIntents),
+      attributionResolutions: sortedByJcs(manifest.attributionResolutions.map((resolution) => ({
+        ...resolution,
+        affectedPathBytesBase64: sortedStrings(resolution.affectedPathBytesBase64),
+        intentIds: [...resolution.intentIds].sort(),
+      }))),
+    } : {}),
+  } as T;
 }
 
 /** JCS bytes used by main for a typed manifest comparison or SHA-256 digest. */
-export function canonicalizeReviewedSemanticManifest(manifest: ReviewedSemanticManifest): string {
+export function canonicalizeReviewedSemanticManifest(manifest: AnyReviewedSemanticManifest): string {
   return canonicalize(normalizeReviewedSemanticManifest(manifest));
 }
 
@@ -422,7 +473,9 @@ export type CommitEligibility =
       eligible: false;
       reason:
         'byte-mismatch' | 'package-not-finalized' | 'checkpoint-unavailable'
-        | 'finalization-conflict' | 'component-subset-not-allowed' | 'extraneous-finalization'
+        | 'component-subset-not-allowed'
+        | 'finalization-conflict' | 'extraneous-finalization'
+        | 'intent-revision-stale' | 'resolution-required' | 'resolution-stale'
         | 'unattributed-not-acknowledged' | 'overlap-not-acknowledged'
         | 'compose-in-flight' | 'unsupported-git-state';
     };
@@ -466,8 +519,17 @@ export interface MintCandidateTokenRequest {
   selectedComponentIds: string[];
   selectedUnattributedEntryIds: string[];
   finalizationIds: string[];
-  acknowledgeTopologyDigest: string | null;
   acknowledgeUnattributedEntryIds: string[];
+  /** Legacy callers may carry ignored compatibility keys until WP-7 removes them. */
+  [legacyCompatibilityField: string]: unknown;
+}
+
+export interface MintCandidateTokenRequestV2 {
+  selectedIntentIds: string[];
+  selectedNamedSaveSetIds: string[];
+  resolutionIds: string[];
+  finalizationIds: string[];
+  acknowledgeUnattributedEntryIds?: string[];
 }
 
 export interface CommitCandidateToken {

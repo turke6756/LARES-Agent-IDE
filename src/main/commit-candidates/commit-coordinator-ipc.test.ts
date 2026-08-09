@@ -73,7 +73,6 @@ function snapshotFixture(candidateId = 'candidate-1', tokenId = 'token-1'): Cand
       selectedComponentIds: [],
       selectedUnattributedEntryIds: [],
       finalizationIds: [],
-      acknowledgeTopologyDigest: 'topology-1',
       acknowledgeUnattributedEntryIds: [],
     },
     componentTopologyDigest: 'topology-1',
