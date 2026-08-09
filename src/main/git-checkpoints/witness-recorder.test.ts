@@ -34,6 +34,13 @@ test('normalizeWitnessPath: absolute in-scope path → repo-relative POSIX', () 
   assert.equal(normalizeWitnessPath(target, path.join(REPO, 'src', 'a.ts')), 'src/a.ts');
 });
 
+test('normalizeWitnessPath: trims ingress whitespace before canonicalization', () => {
+  const target: WitnessTarget = { turnId: 't1', repoRoot: REPO, workspacePrefix: '' };
+  const canonical = path.join(REPO, 'plans', '2026-08-08-work-packages.md');
+  assert.equal(normalizeWitnessPath(target, `   ${canonical}      `), 'plans/2026-08-08-work-packages.md');
+  assert.equal(normalizeWitnessPath(target, '      '), null);
+});
+
 test('normalizeWitnessPath: workspacePrefix keeps the path repo-relative (incl. the prefix)', () => {
   const target: WitnessTarget = { turnId: 't1', repoRoot: REPO, workspacePrefix: 'sub' };
   // In-scope (under <repo>/sub) → repo-relative includes the prefix.

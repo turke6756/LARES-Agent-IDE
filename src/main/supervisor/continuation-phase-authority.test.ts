@@ -60,6 +60,7 @@ interface Harness {
   supervisor: AgentSupervisorType;
   agent: Agent;
   signals: ContinuationPhaseSignal[];
+  handoffResults: Array<{ command: { resultKind: string; handoffAttemptId: string }; witness: { outcome: string } }>;
   cleanup(): void;
 }
 
@@ -67,13 +68,23 @@ function setup(): Harness {
   const agent = makeAgent('sup-phase-1', { status: 'restarting' });
   const agentsMap = new Map<string, Agent>([[agent.id, agent]]);
   const restoreDb = patchDb(agentsMap);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const ledger = require('../plans/package-ledger') as Record<string, unknown>;
+  const originalRecordHandoffResult = ledger.recordHandoffResult;
+  const handoffResults: Harness['handoffResults'] = [];
+  ledger.recordHandoffResult = (command: Harness['handoffResults'][number]['command'], witness: Harness['handoffResults'][number]['witness']) => {
+    handoffResults.push({ command, witness });
+  };
   const supervisor = new AgentSupervisor();
   const priv = supervisor as unknown as Record<string, unknown>;
   priv.writeAgentRegistry = () => {};
   priv.releaseChatRing = () => {};
   const signals: ContinuationPhaseSignal[] = [];
   supervisor.on('continuationPhaseChanged', (s: ContinuationPhaseSignal) => { signals.push(s); });
-  return { supervisor, agent, signals, cleanup: () => { restoreDb(); } };
+  return {
+    supervisor, agent, signals, handoffResults,
+    cleanup: () => { ledger.recordHandoffResult = originalRecordHandoffResult; restoreDb(); },
+  };
 }
 
 /** Read the private map directly. `listContinuationPhases` is the read the
@@ -88,12 +99,14 @@ function rawPhases(supervisor: AgentSupervisorType): Map<string, ContinuationPha
 async function runLaunchTail(
   h: Harness,
   launch: () => Promise<void>,
+  attemptId?: string,
 ): Promise<void> {
   const priv = h.supervisor as unknown as Record<string, unknown>;
   priv.launchWindowsAgent = launch;
   priv.launchWslAgent = launch;
   priv.notifyTerminalRebound = () => {};
-  (priv.continuationLaunchTail as (id: string, s: string) => void).call(h.supervisor, h.agent.id, 'sess-new');
+  (priv.continuationLaunchTail as (id: string, s: string, attemptId?: string) => void)
+    .call(h.supervisor, h.agent.id, 'sess-new', attemptId);
   // The tail is a detached setTimeout(…, 1000); give it room to run to its
   // finally block.
   await new Promise((r) => setTimeout(r, 1400));
@@ -152,10 +165,12 @@ test('launch tail SUCCESS clears the phase (and only after the launch resolves)'
       assert.equal(rawPhases(h.supervisor).has(h.agent.id), true,
         'the phase must survive until the launch actually resolves');
       launchResolved = true;
-    });
+    }, 'att-start-success');
     assert.equal(launchResolved, true, 'the stub launch ran');
     assert.equal(rawPhases(h.supervisor).has(h.agent.id), false, 'success clears the phase');
     assert.deepEqual(h.signals[h.signals.length - 1], { agentId: h.agent.id, phase: null });
+    assert.deepEqual(h.handoffResults.map((r) => [r.command.resultKind, r.command.handoffAttemptId, r.witness.outcome]),
+      [['successor_started', 'att-start-success', 'succeeded']]);
   } finally { h.cleanup(); }
 });
 
@@ -163,7 +178,7 @@ test('launch tail CATCH sets a persistent `failed` carrying the launch error', a
   const h = setup();
   try {
     h.supervisor.publishContinuationPhase({ agentId: h.agent.id, phase: 'launching', updatedAt: 1 });
-    await runLaunchTail(h, async () => { throw new Error('claude CLI not found on PATH'); });
+    await runLaunchTail(h, async () => { throw new Error('claude CLI not found on PATH'); }, 'att-start-failed');
 
     const state = rawPhases(h.supervisor).get(h.agent.id);
     assert.ok(state, 'the failure must leave a phase behind — a blank card IS the original bug');
@@ -175,6 +190,8 @@ test('launch tail CATCH sets a persistent `failed` carrying the launch error', a
     assert.deepEqual(h.supervisor.listContinuationPhases().map((p) => p.phase), ['failed']);
     assert.equal(h.signals.some((s) => s.phase === null), false,
       'a failed tail must NOT emit the completion clear');
+    assert.deepEqual(h.handoffResults.map((r) => [r.command.resultKind, r.command.handoffAttemptId, r.witness.outcome]),
+      [['successor_started', 'att-start-failed', 'failed']]);
   } finally { h.cleanup(); }
 });
 

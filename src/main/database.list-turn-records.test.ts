@@ -102,6 +102,7 @@ type DbModule = {
   allocateAndInsertTurn(workspaceId: string, fields: Record<string, unknown>): TurnRecord;
   updateTurnRecord(id: string, updates: Record<string, unknown>): TurnRecord | null;
   listTurnRecords(workspaceId: string, opts?: ListOpts): TurnRecord[];
+  listOpenTurnRecords(workspaceId: string): TurnRecord[];
 };
 let dbm: DbModule;
 
@@ -170,6 +171,15 @@ test('default limit is 50; rows come back ascending by turn_seq', () => {
   assert.deepEqual(def[def.length - 1].turnSeq, 60, 'ascending — last row is the newest');
   // Explicit small limit bounds the newest-N window, still ascending.
   assert.deepEqual(seqs(dbm.listTurnRecords(ws, { limit: 3 })), [58, 59, 60]);
+});
+
+test('listOpenTurnRecords is unbounded for startup reconciliation', () => {
+  const ws = freshWorkspace();
+  for (let i = 0; i < 60; i++) seedTurn(ws, i, null);
+  assert.equal(dbm.listTurnRecords(ws).length, 50, 'control: ordinary accessor is paged');
+  const open = dbm.listOpenTurnRecords(ws);
+  assert.equal(open.length, 60, 'every dangling row is enumerated, including the oldest');
+  assert.deepEqual(seqs(open).slice(0, 2), [1, 2]);
 });
 
 // ── Runner ────────────────────────────────────────────────────────────────────

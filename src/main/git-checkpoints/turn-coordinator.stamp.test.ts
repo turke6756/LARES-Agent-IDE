@@ -41,6 +41,7 @@ class RecordingStore implements CoordinatorTurnStore {
   }
   getTurnRecord(): TurnRecord | null { return null; }
   listTurnRecords(): TurnRecord[] { return []; }
+  listOpenTurnRecords(): TurnRecord[] { return []; }
 }
 
 class Completion implements CompletionSubscription {

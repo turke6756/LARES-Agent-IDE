@@ -324,6 +324,7 @@ interface FakeWorld {
     handoffFailedRecovery: Array<{ agentId: string; attemptId: string }>;
     pageHuman: Array<{ agentId: string; message: string }>;
     getEscapeBudget: number;
+    handoffResults: Array<{ command: { handoffAttemptId: string; resultKind: string; brickId?: string | null }; witness: { outcome: string } }>;
     log: string[];
   };
 }
@@ -354,6 +355,7 @@ function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
       openAttempt: [], requestNote: [], brickPolls: 0, deferralPolls: 0, relaunch: [],
       relaunchNone: [], abortAttempt: [], handoffFailedRecovery: [], pageHuman: [],
       getEscapeBudget: 0, log: [],
+      handoffResults: [],
     },
     ...overrides,
   };
@@ -410,6 +412,7 @@ function makeEffects(w: FakeWorld): ContinuationWatcherEffects {
     },
     pageHuman: (agentId, message) => { w.calls.pageHuman.push({ agentId, message }); },
     publishPhase: (signal) => { w.phases.push(signal); },
+    recordHandoffResult: (command, witness) => { w.calls.handoffResults.push({ command, witness }); },
     log: (message) => { w.calls.log.push(message); },
   };
 }
@@ -446,6 +449,9 @@ test('idle@100% + committed note → normal continue (no escape, no abort)', asy
   assert.equal(w.calls.relaunchNone.length, 0, 'no note-less escape when a note committed');
   assert.equal(w.calls.abortAttempt.length, 0);
   assert.equal(watcher.getAgentState(SELF).backoffUntil, 0, 'success clears backoff');
+  assert.deepEqual(w.calls.handoffResults.map((r) => [r.command.resultKind, r.witness.outcome]),
+    [['brick_saved', 'succeeded']]);
+  assert.equal(w.calls.handoffResults[0].command.brickId, 'b1');
 });
 
 test('working@100% → not fired (idle gate holds it back before any attempt)', async () => {
@@ -467,6 +473,8 @@ test('handshake FAILED is pre-attempt: recovery runs, attempt stays open, no rel
   const st = watcher.getAgentState(SELF);
   assert.equal(st.openAttempt?.attemptId, 'att-1', 'attempt carried for the retry');
   assert.ok(st.backoffUntil > w.now.value - 1, 'backoff armed');
+  assert.deepEqual(w.calls.handoffResults.map((r) => [r.command.resultKind, r.witness.outcome]),
+    [['brick_saved', 'failed']]);
   assert.equal(st.lastBackoffMs, CONTINUATION_BACKOFF_MS);
 });
 
@@ -538,6 +546,8 @@ test('idle@100%, no note, budget NOT exhausted (aborts<MAX && alive<MAX_MS) → 
   assert.equal(w.calls.relaunchNone.length, 0, 'budget not spent → no note-less escape');
   assert.deepEqual(w.calls.abortAttempt.map(c => c.attemptId), ['att-1']);
   assert.equal(w.calls.pageHuman.length, 1, 'human paged on the failed cycle');
+  assert.deepEqual(w.calls.handoffResults.map((r) => [r.command.resultKind, r.witness.outcome]),
+    [['brick_saved', 'timed_out']]);
   const st = watcher.getAgentState(SELF);
   assert.equal(st.openAttempt, null, 'aborted attempt not reused');
   assert.equal(st.lastBackoffMs, CONTINUATION_BACKOFF_MS);

@@ -9141,6 +9141,15 @@ export function listTurnRecords(
   return rows;
 }
 
+/** Startup reconciliation is intentionally unbounded; dangling rows can be
+ * older than the paged UI accessor's newest-50 default. */
+export function listOpenTurnRecords(workspaceId: string): TurnRecord[] {
+  return queryAll(
+    `SELECT * FROM turn_records WHERE workspace_id = ? AND status = 'open' ORDER BY turn_seq`,
+    [workspaceId],
+  ).map(rowToTurnRecord);
+}
+
 // ── SC-WP-1A: query-only turn witness reads (bundle contract §3) ─────────────
 //
 // An IMMUTABLE, read-only projection of `turn_records` for the Save-card

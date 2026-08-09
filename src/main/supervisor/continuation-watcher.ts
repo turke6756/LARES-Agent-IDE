@@ -17,6 +17,11 @@ import {
   CONTINUATION_POST_NOTE_IDLE_POLLS,
   HANDSHAKE_TIMEOUT_MS,
 } from '../../shared/constants';
+import {
+  recordHandoffResult as recordDurableHandoffResult,
+  type HandoffResultCommand,
+  type HandoffResultWitness,
+} from '../plans/package-ledger';
 
 /** Context-brick Inc 5B — the continuation lifecycle watcher.
  *
@@ -346,6 +351,8 @@ export interface ContinuationWatcherEffects {
    *  leaves the phase at `relaunching` and the supervisor's launch tail owns
    *  the clear/`failed` outcome (§2.4). */
   publishPhase(signal: ContinuationPhaseSignal): void;
+  /** Test seam; production defaults to the package ledger's durable recorder. */
+  recordHandoffResult?: (command: HandoffResultCommand, witness: HandoffResultWitness) => unknown;
   log(message: string): void;
 }
 
@@ -367,6 +374,10 @@ export class ContinuationWatcher {
   private state = new Map<string, AgentWatchState>();
 
   constructor(private readonly fx: ContinuationWatcherEffects) {}
+
+  private recordHandoff(command: HandoffResultCommand, witness: HandoffResultWitness): void {
+    (this.fx.recordHandoffResult ?? recordDurableHandoffResult)(command, witness);
+  }
 
   /** One periodic pass over the watched (supervisor) agent ids. Rides the
    *  StatusMonitor poll tick — synchronous decision, async attempt cycle
@@ -576,6 +587,15 @@ export class ContinuationWatcher {
       // later with the attempt still open (don't burn HANDSHAKE_TIMEOUT_MS
       // on a swallowed submit).
       this.fx.log(`[continuation-watcher] note-request handshake FAILED for ${agentId} (pre-attempt); attempt ${attempt.attemptId} stays open`);
+      this.recordHandoff({
+        handoffAttemptId: attempt.attemptId,
+        idempotencyKey: 'brick_saved:failed',
+        resultKind: 'brick_saved',
+      }, {
+        outcome: 'failed',
+        witnessedAt: this.fx.now(),
+        detail: { reason: 'note-request-not-delivered' },
+      });
       await this.fx.handoffFailedRecovery(agentId, attempt.attemptId);
       this.backoff(st);
       this.publishBackoff(agentId, st, 'the note request was not delivered');
@@ -595,6 +615,16 @@ export class ContinuationWatcher {
     for (;;) {
       const brick = await this.fx.getCommittedToolBrick(agentId, attempt.attemptId);
       if (isKillAuthorized(brick, attempt.startedAt)) {
+        this.recordHandoff({
+          handoffAttemptId: attempt.attemptId,
+          idempotencyKey: `brick_saved:${brick!.id}`,
+          resultKind: 'brick_saved',
+          brickId: brick!.id,
+        }, {
+          outcome: 'succeeded',
+          witnessedAt: Date.parse(brick!.writtenAt),
+          detail: { writtenAt: brick!.writtenAt, source: 'tool' },
+        });
         st.committedReady = true;
         this.publish(agentId, 'note-committed', { attemptId: attempt.attemptId });
         // BUG-39: the commit is kill-AUTHORIZATION, not kill-TIMING. The author
@@ -632,6 +662,15 @@ export class ContinuationWatcher {
     //    generation. The budget is read BEFORE aborting, so the current attempt
     //    is not yet counted among the aborts.
     const budget = this.fx.getEscapeBudget(agentId);
+    this.recordHandoff({
+      handoffAttemptId: attempt.attemptId,
+      idempotencyKey: 'brick_saved:timed_out',
+      resultKind: 'brick_saved',
+    }, {
+      outcome: 'timed_out',
+      witnessedAt: this.fx.now(),
+      detail: { timeoutMs: HANDSHAKE_TIMEOUT_MS },
+    });
     if (isEscapeBudgetExhausted(budget, this.fx.now())) {
       // Effort budget spent: proceed with the "none" Block C so an idle
       // supervisor that never authors a note is never left alive+expensive

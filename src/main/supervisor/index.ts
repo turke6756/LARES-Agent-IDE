@@ -96,8 +96,9 @@ import {
 } from '../scaffold-writer';
 import { resolveLaunchCommand } from './launch-command';
 import { TurnEvidenceTracker } from './turn-evidence';
-import type { TurnCoordinator, TurnContext } from '../git-checkpoints/turn-coordinator';
+import type { TurnCoordinator, TurnContext, TurnClosedEvent } from '../git-checkpoints/turn-coordinator';
 import type { TurnCompletionTracker } from './turn-completion-tracker';
+import { recordHandoffResult } from '../plans/package-ledger';
 import {
   resolveRequestedPlanBinding,
   withResolvedIntentStamp,
@@ -691,6 +692,7 @@ export class SubmitNotConfirmedError extends Error {
 // status inside this window (stuck launch, crash loop) must not receive a
 // stale selection prompt minutes later.
 const INITIAL_USER_PROMPT_TTL_MS = 10 * 60_000;
+const CONTINUATION_ORIENTATION_TIMEOUT_MS = 3 * 60_000;
 
 // WP-P3B-core — the trusted binding for a promotion-lane launch. This is
 // deliberately MAIN-PROCESS-ONLY and is NEVER placed on the public
@@ -711,6 +713,14 @@ interface PendingInitialPrompt {
   text: string;
   expiresAt: number;
   dispatch: DispatchContext;
+  continuation?: { attemptId: string; successorSessionId: string };
+}
+
+interface PendingContinuationOrientation {
+  attemptId: string;
+  successorSessionId: string;
+  kickoffTurnId: string | null;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -2136,6 +2146,7 @@ export class AgentSupervisor extends EventEmitter {
   // risk of duplicating or reordering launch instructions. Entries expire
   // after INITIAL_USER_PROMPT_TTL_MS and are cleared on agent stop/delete.
   private pendingInitialPrompts = new PendingInitialPromptMap();
+  private pendingContinuationOrientations = new Map<string, PendingContinuationOrientation>();
 
   // Context-brick Inc 4 — brick handed to the in-flight continuation launch.
   // Set just before the relaunch timer, consumed by the sysprompt builders,
@@ -2617,6 +2628,7 @@ export class AgentSupervisor extends EventEmitter {
     this.checkpointEngine = engine;
     if (this.checkpointEvidenceWired) return;
     this.checkpointEvidenceWired = true;
+    engine.coordinator.onTurnClosed((event) => this.onCheckpointTurnClosed(event));
     // All hook / session-log / terminal / status transports converge on the
     // supervisor's public 'statusChanged' emission, so it is the single seam for
     // forwarding turn lifecycle evidence. 'working' is correlated START evidence
@@ -2647,6 +2659,82 @@ export class AgentSupervisor extends EventEmitter {
         default:
           break;
       }
+    });
+  }
+
+  private safeRecordHandoff(
+    command: Parameters<typeof recordHandoffResult>[0],
+    witness: Parameters<typeof recordHandoffResult>[1],
+  ): void {
+    try {
+      recordHandoffResult(command, witness);
+    } catch (err) {
+      console.error(`[continuation] failed to record ${command.resultKind} for ${command.handoffAttemptId}:`, err);
+    }
+  }
+
+  private beginContinuationOrientation(
+    agentId: string,
+    continuation: NonNullable<PendingInitialPrompt['continuation']>,
+  ): void {
+    const prior = this.pendingContinuationOrientations.get(agentId);
+    if (prior) clearTimeout(prior.timer);
+    const timer = setTimeout(() => {
+      const state = this.pendingContinuationOrientations.get(agentId);
+      if (!state || state.attemptId !== continuation.attemptId) return;
+      this.pendingContinuationOrientations.delete(agentId);
+      this.safeRecordHandoff({
+        handoffAttemptId: state.attemptId,
+        idempotencyKey: `successor_oriented:${state.successorSessionId}:timed_out`,
+        resultKind: 'successor_oriented',
+        successorSessionId: state.successorSessionId,
+        kickoffTurnId: state.kickoffTurnId,
+      }, {
+        outcome: 'timed_out', witnessedAt: Date.now(),
+        detail: { timeoutMs: CONTINUATION_ORIENTATION_TIMEOUT_MS },
+      });
+    }, CONTINUATION_ORIENTATION_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingContinuationOrientations.set(agentId, {
+      ...continuation, kickoffTurnId: null, timer,
+    });
+  }
+
+  private bindContinuationKickoffTurn(agentId: string, turnId: string): void {
+    const state = this.pendingContinuationOrientations.get(agentId);
+    if (state && state.kickoffTurnId === null) state.kickoffTurnId = turnId;
+  }
+
+  private failContinuationOrientation(agentId: string, reason: string): void {
+    const state = this.pendingContinuationOrientations.get(agentId);
+    if (!state) return;
+    clearTimeout(state.timer);
+    this.pendingContinuationOrientations.delete(agentId);
+    this.safeRecordHandoff({
+      handoffAttemptId: state.attemptId,
+      idempotencyKey: `successor_oriented:${state.successorSessionId}:failed`,
+      resultKind: 'successor_oriented',
+      successorSessionId: state.successorSessionId,
+      kickoffTurnId: state.kickoffTurnId,
+    }, { outcome: 'failed', witnessedAt: Date.now(), detail: { reason } });
+  }
+
+  private onCheckpointTurnClosed(event: TurnClosedEvent): void {
+    const state = this.pendingContinuationOrientations.get(event.agentId);
+    if (!state || state.kickoffTurnId !== event.turnId) return;
+    clearTimeout(state.timer);
+    this.pendingContinuationOrientations.delete(event.agentId);
+    this.safeRecordHandoff({
+      handoffAttemptId: state.attemptId,
+      idempotencyKey: `successor_oriented:${state.successorSessionId}:${event.turnId}:${event.status}`,
+      resultKind: 'successor_oriented',
+      successorSessionId: state.successorSessionId,
+      kickoffTurnId: event.turnId,
+    }, {
+      outcome: event.status === 'accepted' ? 'succeeded' : 'failed',
+      witnessedAt: Date.now(),
+      completionQuality: event.afterQuality,
+      detail: { checkpointStatus: event.status },
     });
   }
 
@@ -7245,13 +7333,14 @@ export class AgentSupervisor extends EventEmitter {
         text: buildContinuationKickoffMessage(),
         expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
         dispatch: continuationDispatch,
+        continuation: { attemptId: attempt.id, successorSessionId: newSession },
       });
 
       // Step 7 — the runner-launch tail (and ONLY the launch). The phase moves
       // to `launching` HERE, not inside the tail's timer, so the card is never
       // dark across the 1 s gap between the session mint and the launch.
       this.publishContinuationPhase({ agentId, phase: 'launching', updatedAt: Date.now() });
-      this.continuationLaunchTail(agentId, newSession);
+      this.continuationLaunchTail(agentId, newSession, attempt.id, agent.resumeSessionId ?? null);
     } catch (err) {
       // A step threw before the launch tail was scheduled → its finally will
       // never clear the predicate. Clear it here so the swap flag does not leak.
@@ -7263,10 +7352,27 @@ export class AgentSupervisor extends EventEmitter {
   /** Context-brick Inc 4 (4.1 step 7 / 4.9) — the idempotent runner-launch
    *  tail of a continuation. Shared by continuationRelaunch and the boot
    *  reconcile re-drive; MUST NOT touch the atomic transaction. */
-  private continuationLaunchTail(agentId: string, sessionId: string): void {
+  private continuationLaunchTail(
+    agentId: string,
+    sessionId: string,
+    handoffAttemptId?: string,
+    sourceSessionId: string | null = null,
+  ): void {
     setTimeout(async () => {
       const latest = getAgent(agentId);
-      if (!latest) return;
+      if (!latest) {
+        if (handoffAttemptId) {
+          this.safeRecordHandoff({
+            handoffAttemptId,
+            idempotencyKey: `successor_started:${sessionId}:failed`,
+            resultKind: 'successor_started',
+            sourceSessionId,
+            successorSessionId: sessionId,
+          }, { outcome: 'failed', witnessedAt: Date.now(), detail: { reason: 'agent-row-missing' } });
+          this.failContinuationOrientation(agentId, 'agent-row-missing');
+        }
+        return;
+      }
       try {
         const pathType = detectPathType(latest.workingDirectory);
         if (pathType === 'windows') {
@@ -7278,6 +7384,15 @@ export class AgentSupervisor extends EventEmitter {
           // the predecessor's original task on the fresh session.
           await this.launchWslAgent(latest, false, null, undefined, sessionId, true);
         }
+        if (handoffAttemptId) {
+          this.safeRecordHandoff({
+            handoffAttemptId,
+            idempotencyKey: `successor_started:${sessionId}:succeeded`,
+            resultKind: 'successor_started',
+            sourceSessionId,
+            successorSessionId: sessionId,
+          }, { outcome: 'succeeded', witnessedAt: Date.now() });
+        }
         // BUG-38 — a continuation mints a fresh session and swaps the PTY under
         // the same agent id; the renderer's cached terminal is bound to the
         // retired session's dead bridge. Notify AFTER launch resolves, on
@@ -7288,6 +7403,19 @@ export class AgentSupervisor extends EventEmitter {
         // still throw below and crash the agent.
         this.publishContinuationPhase({ agentId, phase: null });
       } catch (err) {
+        if (handoffAttemptId) {
+          this.safeRecordHandoff({
+            handoffAttemptId,
+            idempotencyKey: `successor_started:${sessionId}:failed`,
+            resultKind: 'successor_started',
+            sourceSessionId,
+            successorSessionId: sessionId,
+          }, {
+            outcome: 'failed', witnessedAt: Date.now(),
+            detail: { reason: err instanceof Error ? err.message : String(err) },
+          });
+          this.failContinuationOrientation(agentId, 'successor-launch-failed');
+        }
         const tContFail = applyStatusTransition(agentId, 'crashed');
         this.emit('statusChanged', { agentId, status: 'crashed', fromStatus: tContFail?.prior, source: 'continuation-failed' } satisfies StatusChangedEvent);
         // A PERSISTENT phase: unlike `backoff` there is no automatic retry from
@@ -7442,6 +7570,10 @@ export class AgentSupervisor extends EventEmitter {
     if (!pending) return;
     if (Date.now() > pending.expiresAt) {
       this.pendingInitialPrompts.delete(agentId);
+      if (pending.continuation) {
+        this.beginContinuationOrientation(agentId, pending.continuation);
+        this.failContinuationOrientation(agentId, 'kickoff-prompt-expired');
+      }
       console.warn(`[initial-prompt] Pending initial prompt for ${agentId} expired undelivered`);
       return;
     }
@@ -7449,7 +7581,9 @@ export class AgentSupervisor extends EventEmitter {
     // inside the TTL window can still deliver it, and stop/delete clear it.
     if (!this.hasRunner(agentId)) return;
     this.pendingInitialPrompts.delete(agentId);
+    if (pending.continuation) this.beginContinuationOrientation(agentId, pending.continuation);
     this.sendInput(agentId, pending.text, {}, pending.dispatch).catch((err: Error) => {
+      if (pending.continuation) this.failContinuationOrientation(agentId, err.message);
       console.error(`[initial-prompt] Delivery to ${agentId} failed:`, err);
       this.emit('sendInputError', { agentId, error: err.message });
     });
@@ -8167,6 +8301,7 @@ export class AgentSupervisor extends EventEmitter {
     // contract, and even a thrown context-build is swallowed here — delivery is
     // never blocked by the checkpoint (released by the WP-G1.5 wall-clock bound).
     let openedTurn = false;
+    let openedTurnId: string | null = null;
     if (submit && this.checkpointEngine) {
       try {
         const ctx = await this.checkpointEngine.buildTurnContext(
@@ -8177,8 +8312,10 @@ export class AgentSupervisor extends EventEmitter {
           // WP3 (defect-2): supply the raw send text so `openTurn` can derive a
           // task_label when the dispatch carried no explicit brief (`taskLabel`).
           ctx.promptText = text;
-          await this.checkpointEngine.coordinator.beforeCheckpoint(agentId, ctx);
+          const opened = await this.checkpointEngine.coordinator.beforeCheckpoint(agentId, ctx);
           openedTurn = true;
+          openedTurnId = opened.turnId;
+          this.bindContinuationKickoffTurn(agentId, opened.turnId);
         }
       } catch (err) {
         console.warn(`[checkpoint] before-checkpoint failed for ${agentId} (delivery proceeds):`, err);
@@ -8192,6 +8329,7 @@ export class AgentSupervisor extends EventEmitter {
       // `failed` path; hook/confirmation gaps never are.
       // Close the just-opened turn `delivery_failed` (never leave it `open`).
       if (openedTurn) this.checkpointEngine?.coordinator.onDeliveryFailed(agentId);
+      if (openedTurnId) this.failContinuationOrientation(agentId, 'kickoff-delivery-failed');
       return this.recordSendOutcome({
         disposition: 'failed', agentId, delivered: false,
         reason: 'delivery-failed', completedAt: Date.now(),
@@ -9137,6 +9275,7 @@ export class AgentSupervisor extends EventEmitter {
                   text: buildContinuationKickoffMessage(),
                   expiresAt: Date.now() + INITIAL_USER_PROMPT_TTL_MS,
                   dispatch: continuationDispatch,
+                  continuation: { attemptId: relaunched.id, successorSessionId: agent.resumeSessionId },
                 });
               } else {
                 // Migrated pre-stamping attempts are explicitly unavailable.
@@ -9144,7 +9283,7 @@ export class AgentSupervisor extends EventEmitter {
                 // attribution from agents.plan_id or the latest turn record.
                 console.warn(`[reconcile] Continuation attempt ${relaunched.id} has no frozen binding; kickoff omitted`);
               }
-              this.continuationLaunchTail(agent.id, agent.resumeSessionId);
+              this.continuationLaunchTail(agent.id, agent.resumeSessionId, relaunched.id);
               await new Promise(r => setTimeout(r, AgentSupervisor.RECONCILE_STAGGER_MS));
               continue;
             }

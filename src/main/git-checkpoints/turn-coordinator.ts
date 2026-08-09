@@ -40,6 +40,7 @@ import {
   closeTurn as dbCloseTurn,
   getTurnRecord as dbGetTurnRecord,
   listTurnRecords as dbListTurnRecords,
+  listOpenTurnRecords as dbListOpenTurnRecords,
 } from '../database';
 import type { GitCapability, ResolvedIntentStamp } from '../../shared/types';
 import { deriveTaskLabel } from './dispatch-context';
@@ -62,6 +63,7 @@ export interface CoordinatorTurnStore {
   ): TurnRecord | null;
   getTurnRecord(id: string): TurnRecord | null;
   listTurnRecords(workspaceId: string, opts?: { agentId?: string }): TurnRecord[];
+  listOpenTurnRecords(workspaceId: string): TurnRecord[];
 }
 
 const DEFAULT_STORE: CoordinatorTurnStore = {
@@ -70,6 +72,7 @@ const DEFAULT_STORE: CoordinatorTurnStore = {
   closeTurn: (id, status, extra, endedAt) => dbCloseTurn(id, status, extra as never, endedAt),
   getTurnRecord: dbGetTurnRecord,
   listTurnRecords: dbListTurnRecords,
+  listOpenTurnRecords: dbListOpenTurnRecords,
 };
 
 /** The `CheckpointService.captureEdge` shape — the ONLY git touch this layer makes.
@@ -153,6 +156,14 @@ interface AgentTurnState {
   /** Latched the instant a terminal transition begins, so a racing completion /
    *  crash / delivery-reject event can never double-close the same turn. */
   closing: boolean;
+  closePromise: Promise<void> | null;
+}
+
+export interface TurnClosedEvent {
+  agentId: string;
+  turnId: string;
+  status: Exclude<TurnStatus, 'open'>;
+  afterQuality: AfterQuality | 'none';
 }
 
 export class TurnCoordinator {
@@ -165,6 +176,7 @@ export class TurnCoordinator {
 
   /** EXACTLY ONE entry per agent while a turn is open — the never-two-open ledger. */
   private readonly openByAgent = new Map<string, AgentTurnState>();
+  private readonly turnClosedListeners = new Set<(event: TurnClosedEvent) => void>();
 
   constructor(opts: TurnCoordinatorOptions) {
     this.capture = opts.capture;
@@ -182,6 +194,11 @@ export class TurnCoordinator {
    *  Re-pointed automatically whenever the active turn changes (overlap / close). */
   currentOpenTurnId(agentId: string): string | null {
     return this.openByAgent.get(agentId)?.turnId ?? null;
+  }
+
+  onTurnClosed(listener: (event: TurnClosedEvent) => void): () => void {
+    this.turnClosedListeners.add(listener);
+    return () => this.turnClosedListeners.delete(listener);
   }
 
   /** The full pull target the witness recorder (WP-G1.7) needs to normalize a
@@ -211,6 +228,10 @@ export class TurnCoordinator {
   async beforeCheckpoint(agentId: string, ctx: TurnContext): Promise<BeforeCheckpointResult> {
     const existing = this.openByAgent.get(agentId);
     if (existing) {
+      if (existing.closing) {
+        await existing.closePromise;
+        return this.beforeCheckpoint(agentId, ctx);
+      }
       // Overlap: never two open. Close the prior first, then open one degraded row.
       await this.closePriorForOverlap(existing);
       return this.openTurn(agentId, ctx, { quality: 'degraded', mandatedReason: 'overlapping-active-turn' });
@@ -241,7 +262,7 @@ export class TurnCoordinator {
       startedAt: this.now(),
       status: 'open',
     });
-    const state: AgentTurnState = { agentId, turnId: turn.id, ctx, closing: false };
+    const state: AgentTurnState = { agentId, turnId: turn.id, ctx, closing: false, closePromise: null };
     this.openByAgent.set(agentId, state);
     // 2. Re-point the witness recorder BEFORE delivery so writes route to this row.
     this.completion.beginTurn(agentId);
@@ -314,14 +335,18 @@ export class TurnCoordinator {
   private async completeTurn(state: AgentTurnState, quality: AfterQuality): Promise<void> {
     if (state.closing) return; // a racing signal already owns this close
     state.closing = true;
-    try {
-      await this.tryAfterSnapshot(state, quality);
-    } finally {
-      // Close `accepted`, stamping after_quality = the completion source. after_ready
-      // (set by the snapshot) is an independent record of whether bytes were captured.
-      this.store.closeTurn(state.turnId, 'accepted', { afterQuality: quality }, this.now());
-      this.clearAgent(state.agentId);
-    }
+    state.closePromise = (async () => {
+      try {
+        await this.tryAfterSnapshot(state, quality);
+      } finally {
+        // Close `accepted`, stamping after_quality = the completion source. after_ready
+        // (set by the snapshot) is an independent record of whether bytes were captured.
+        this.store.closeTurn(state.turnId, 'accepted', { afterQuality: quality }, this.now());
+        this.emitTurnClosed(state, 'accepted', quality);
+        this.clearAgent(state);
+      }
+    })();
+    await state.closePromise;
   }
 
   // ── crash / stop / shutdown ──────────────────────────────────────────────────────
@@ -346,12 +371,13 @@ export class TurnCoordinator {
     if (!state) return;
     if (state.closing) return;
     state.closing = true;
-    void (async () => {
+    state.closePromise = (async () => {
       try {
         await this.tryAfterSnapshot(state, 'none');
       } finally {
         this.store.closeTurn(state.turnId, status, { afterQuality: 'none' }, this.now());
-        this.clearAgent(state.agentId);
+        this.emitTurnClosed(state, status, 'none');
+        this.clearAgent(state);
       }
     })();
   }
@@ -361,9 +387,11 @@ export class TurnCoordinator {
   onDeliveryFailed(agentId: string): string | null {
     const state = this.openByAgent.get(agentId);
     if (!state) return null;
+    if (state.closing) return null;
     state.closing = true;
     this.store.closeTurn(state.turnId, 'delivery_failed', undefined, this.now());
-    this.clearAgent(state.agentId);
+    this.emitTurnClosed(state, 'delivery_failed', 'none');
+    this.clearAgent(state);
     return state.turnId;
   }
 
@@ -371,17 +399,20 @@ export class TurnCoordinator {
 
   private async closePriorForOverlap(prior: AgentTurnState): Promise<void> {
     if (prior.closing) {
-      // Already terminating on another path — just drop it from the ledger.
-      this.clearAgent(prior.agentId);
+      await prior.closePromise;
       return;
     }
     prior.closing = true;
-    // Best-effort degraded after-snapshot of the prior turn WHILE it is still open, so
-    // the (partial) after state is recoverable; failure does not block. after_quality
-    // stays 'none' — an interrupted turn never completed cleanly.
-    await this.tryAfterSnapshot(prior, 'none');
-    this.store.closeTurn(prior.turnId, 'interrupted', { afterQuality: 'none' }, this.now());
-    this.clearAgent(prior.agentId);
+    prior.closePromise = (async () => {
+      // Best-effort degraded after-snapshot of the prior turn WHILE it is still open, so
+      // the (partial) after state is recoverable; failure does not block. after_quality
+      // stays 'none' — an interrupted turn never completed cleanly.
+      await this.tryAfterSnapshot(prior, 'none');
+      this.store.closeTurn(prior.turnId, 'interrupted', { afterQuality: 'none' }, this.now());
+      this.emitTurnClosed(prior, 'interrupted', 'none');
+      this.clearAgent(prior);
+    })();
+    await prior.closePromise;
   }
 
   // ── startup reconciliation ───────────────────────────────────────────────────────
@@ -394,14 +425,13 @@ export class TurnCoordinator {
    */
   reconcileOpenTurns(workspaceId: string): number {
     let closed = 0;
-    for (const row of this.store.listTurnRecords(workspaceId)) {
-      if (row.status !== 'open') continue;
+    for (const row of this.store.listOpenTurnRecords(workspaceId)) {
       this.store.closeTurn(row.id, 'crashed', { afterQuality: 'none' }, this.now());
       closed++;
     }
     // Drop any stale in-memory state for this workspace (fresh process has none).
-    for (const [agentId, state] of this.openByAgent) {
-      if (state.ctx.workspaceId === workspaceId) this.clearAgent(agentId);
+    for (const state of this.openByAgent.values()) {
+      if (state.ctx.workspaceId === workspaceId) this.clearAgent(state);
     }
     // SEAM (WP-G1.8): ref/DB crash-consistency reconciliation lives in
     // `reconciler.ts`. `reconciler.reconcileWorkspace` runs the edge reconciliation
@@ -421,12 +451,16 @@ export class TurnCoordinator {
     for (const state of states) {
       if (state.closing) continue;
       state.closing = true;
-      try {
-        await this.tryAfterSnapshot(state, 'none');
-      } finally {
-        this.store.closeTurn(state.turnId, 'interrupted', { afterQuality: 'none' }, this.now());
-        this.clearAgent(state.agentId);
-      }
+      state.closePromise = (async () => {
+        try {
+          await this.tryAfterSnapshot(state, 'none');
+        } finally {
+          this.store.closeTurn(state.turnId, 'interrupted', { afterQuality: 'none' }, this.now());
+          this.emitTurnClosed(state, 'interrupted', 'none');
+          this.clearAgent(state);
+        }
+      })();
+      await state.closePromise;
     }
     this.unsubscribe();
   }
@@ -450,10 +484,22 @@ export class TurnCoordinator {
     }
   }
 
-  private clearAgent(agentId: string): void {
-    this.openByAgent.delete(agentId);
-    this.completion.reset(agentId);
-    this.witnessRouter?.setActiveTurn(agentId, null);
+  private clearAgent(expected: AgentTurnState): void {
+    if (this.openByAgent.get(expected.agentId) !== expected) return;
+    this.openByAgent.delete(expected.agentId);
+    this.completion.reset(expected.agentId);
+    this.witnessRouter?.setActiveTurn(expected.agentId, null);
+  }
+
+  private emitTurnClosed(
+    state: AgentTurnState,
+    status: Exclude<TurnStatus, 'open'>,
+    afterQuality: AfterQuality | 'none',
+  ): void {
+    const event = { agentId: state.agentId, turnId: state.turnId, status, afterQuality };
+    for (const listener of this.turnClosedListeners) {
+      try { listener(event); } catch { /* observers never break checkpoint closure */ }
+    }
   }
 
   /** updateTurnRecord that swallows the terminal-immutability throw — used only on

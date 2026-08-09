@@ -108,6 +108,12 @@ class FakeStore implements CoordinatorTurnStore {
     return [...this.rows.values()].filter((r) => r.workspaceId === workspaceId).map((r) => ({ ...r }));
   }
 
+  listOpenTurnRecords(workspaceId: string): TurnRecord[] {
+    return [...this.rows.values()]
+      .filter((r) => r.workspaceId === workspaceId && r.status === 'open')
+      .map((r) => ({ ...r }));
+  }
+
   openCount(): number {
     return [...this.rows.values()].filter((r) => r.status === 'open').length;
   }
@@ -338,6 +344,41 @@ test('overlapping submit closes prior `interrupted` and opens ONE new `degraded`
   );
 });
 
+test('pending AFTER capture serializes the successor as a normal turn and old cleanup cannot clear it', async () => {
+  const store = new FakeStore();
+  const comp = new FakeCompletion();
+  let releaseAfter!: () => void;
+  let afterStarted!: () => void;
+  const afterStartedPromise = new Promise<void>((resolve) => { afterStarted = resolve; });
+  const afterGate = new Promise<void>((resolve) => { releaseAfter = resolve; });
+  const baseCapture = makeCapture(store);
+  const capture: CaptureEdgeFn = async (p) => {
+    if (p.edge === 'after' && p.turnId === 'turn-1') {
+      afterStarted();
+      await afterGate;
+    }
+    return baseCapture.fn(p);
+  };
+  const co = new TurnCoordinator({ capture, completion: comp, store, now: () => 1000 });
+
+  const first = await co.beforeCheckpoint(A, mkCtx());
+  comp.emit(A, 'idle-fallback');
+  await afterStartedPromise;
+
+  const successorPending = co.beforeCheckpoint(A, mkCtx());
+  await flush();
+  assert.equal(store.rows.size, 1, 'successor waits until the closing AFTER capture is durable');
+
+  releaseAfter();
+  const successor = await successorPending;
+  assert.equal(store.getTurnRecord(first.turnId)!.status, 'accepted');
+  assert.equal(successor.quality, 'guaranteed');
+  assert.equal(successor.failureReason, null);
+  assert.equal(co.currentOpenTurnId(A), successor.turnId,
+    'compare-and-delete cleanup for the old turn cannot erase its successor');
+  assert.equal(store.openCount(), 1);
+});
+
 test('completion (fake tracker) closes `accepted` with after_quality = source; repeats dedup', async () => {
   const store = new FakeStore();
   const cap = makeCapture(store);
@@ -411,8 +452,11 @@ test('stop marks the open turn `stopped`', async () => {
 
 test('startup reconciliation closes dangling open rows `crashed`, idempotently', async () => {
   const store = new FakeStore();
-  // Two dangling open rows + one already-terminal row (must be left untouched).
+  // Put an old dangling row beyond the UI accessor's newest-50 window.
   const open1 = store.allocateAndInsertTurn(WS, { agentId: A, status: 'open' });
+  for (let i = 0; i < 55; i++) {
+    store.allocateAndInsertTurn(WS, { agentId: `terminal-${i}`, status: 'accepted' });
+  }
   const open2 = store.allocateAndInsertTurn(WS, { agentId: 'agent-B', status: 'open' });
   const done = store.allocateAndInsertTurn(WS, { agentId: 'agent-C', status: 'accepted' });
   const co = new TurnCoordinator({ capture: makeCapture(store).fn, completion: new FakeCompletion(), store, now: () => 1000 });

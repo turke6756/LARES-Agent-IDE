@@ -65,12 +65,20 @@ interface FakeEngine {
   beforeThrows: boolean;
   onDeliveryFailedCalls: number;
   ctxToReturn: unknown;
+  closeListener: ((event: { agentId: string; turnId: string; status: 'accepted'; afterQuality: 'idle-fallback' }) => void) | null;
 }
 
 function setup(opts: { alive?: boolean; deliveredValue?: boolean; buildThrows?: boolean; beforeThrows?: boolean } = {}) {
   const agent = makeAgent('cp-1', { provider: 'claude', status: 'idle', isSupervised: false, workingDirectory: 'C:\\tmp' });
   const agentsMap = new Map<string, Agent>([[agent.id, agent]]);
   const restoreDb = patchDb(agentsMap);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const ledger = require('../plans/package-ledger') as Record<string, unknown>;
+  const originalRecordHandoffResult = ledger.recordHandoffResult;
+  const handoffResults: Array<{ command: { resultKind: string; handoffAttemptId: string; kickoffTurnId?: string | null }; witness: { outcome: string; completionQuality?: string | null } }> = [];
+  ledger.recordHandoffResult = (command: typeof handoffResults[number]['command'], witness: typeof handoffResults[number]['witness']) => {
+    handoffResults.push({ command, witness });
+  };
 
   const origWinLaunch = (WindowsRunner.prototype as { launch: unknown }).launch;
   const origWslLaunch = (WslRunner.prototype as { launch: unknown }).launch;
@@ -93,6 +101,7 @@ function setup(opts: { alive?: boolean; deliveredValue?: boolean; buildThrows?: 
     order: [], builtWith: [], deliveredValue: opts.deliveredValue !== false,
     buildThrows: !!opts.buildThrows, beforeThrows: !!opts.beforeThrows,
     onDeliveryFailedCalls: 0,
+    closeListener: null,
     ctxToReturn: { workspaceId: 'ws-1', agentId: agent.id, capability: {}, quality: 'guaranteed' },
   };
   const coordinator = {
@@ -104,6 +113,7 @@ function setup(opts: { alive?: boolean; deliveredValue?: boolean; buildThrows?: 
     onDeliveryFailed: (_id: string) => { engine.order.push('onDeliveryFailed'); engine.onDeliveryFailedCalls++; return 't1'; },
     markCrashed: () => {}, markInterrupted: () => {}, markStopped: () => {},
     currentWitnessTarget: () => null,
+    onTurnClosed: (listener: NonNullable<FakeEngine['closeListener']>) => { engine.closeListener = listener; return () => {}; },
     shutdown: async () => {},
   };
   const completionTracker = { noteStart: () => {}, noteIdle: () => {}, noteTerminalExit: () => {}, disposeAll: () => {} };
@@ -124,10 +134,11 @@ function setup(opts: { alive?: boolean; deliveredValue?: boolean; buildThrows?: 
     async () => 'session-log';
 
   return {
-    supervisor, engine, agent,
+    supervisor, engine, agent, handoffResults,
     cleanup: () => {
       (WindowsRunner.prototype as { launch: unknown }).launch = origWinLaunch;
       (WslRunner.prototype as { launch: unknown }).launch = origWslLaunch;
+      ledger.recordHandoffResult = originalRecordHandoffResult;
       restoreDb();
     },
   };
@@ -196,6 +207,31 @@ test('no dispatch → defaults to a human-terminal context', async () => {
   try {
     await h.supervisor.sendInput(h.agent.id, 'hi', { submit: true });
     assert.equal(h.engine.builtWith[0]?.origin, 'human-terminal');
+  } finally { h.cleanup(); }
+});
+
+test('attempt-correlated kickoff records successor_oriented only when its exact checkpoint turn completes', async () => {
+  const h = setup();
+  try {
+    const priv = h.supervisor as unknown as {
+      beginContinuationOrientation(id: string, c: { attemptId: string; successorSessionId: string }): void;
+    };
+    priv.beginContinuationOrientation(h.agent.id, { attemptId: 'att-oriented', successorSessionId: 'sess-new' });
+    await h.supervisor.sendInput(h.agent.id, 'orientation kickoff', { submit: true });
+    assert.equal(h.handoffResults.length, 0, 'delivery/start confirmation is not orientation completion');
+
+    h.engine.closeListener?.({
+      agentId: h.agent.id, turnId: 'some-other-turn', status: 'accepted', afterQuality: 'idle-fallback',
+    });
+    assert.equal(h.handoffResults.length, 0, 'an unrelated terminal turn cannot satisfy the handoff');
+
+    h.engine.closeListener?.({
+      agentId: h.agent.id, turnId: 't1', status: 'accepted', afterQuality: 'idle-fallback',
+    });
+    assert.deepEqual(h.handoffResults.map((r) => [
+      r.command.resultKind, r.command.handoffAttemptId, r.command.kickoffTurnId,
+      r.witness.outcome, r.witness.completionQuality,
+    ]), [['successor_oriented', 'att-oriented', 't1', 'succeeded', 'idle-fallback']]);
   } finally { h.cleanup(); }
 });
 

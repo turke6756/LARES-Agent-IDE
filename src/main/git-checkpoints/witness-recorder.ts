@@ -51,6 +51,7 @@ export function normalizeWitnessPath(
   target: WitnessTarget,
   rawPath: string,
 ): string | null {
+  rawPath = rawPath.trim();
   if (!rawPath) return null;
   const repoRoot = target.repoRoot;
   // WSL / POSIX-rooted paths captured on Windows can never be normalized against a
