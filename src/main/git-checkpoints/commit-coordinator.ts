@@ -46,6 +46,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import type {
+  CandidateCommitPolicy,
   CandidateMember,
   CommitOutcome,
   EncodedGitPath,
@@ -61,6 +62,14 @@ import type {
 import { writeIntentCommitLedger } from '../database';
 import { encodeGitPath } from '../commit-candidates/dirty-inventory';
 import { parseStageEntries } from '../commit-candidates/commit-representation';
+import {
+  candidateCommitSigningArgs,
+  readCandidateCommitPolicy,
+  validateCandidateTree,
+  type CandidatePolicyInput,
+  type CandidateTreeValidationInput,
+  type CandidateTreeValidationResult,
+} from '../commit-candidates/candidate-validation';
 import { ComposeLockRegistry } from '../commit-candidates/compose-lock-registry';
 import { CheckpointQueue, type SkippedDeadline } from './checkpoint-queue';
 import { advancePlanningActivityHead as advanceActivityHead } from './planning-worktree-service';
@@ -174,6 +183,10 @@ export interface CommitCoordinatorDeps {
   /** Server-derived `Lares-*` trailers from the immutable snapshot (default below);
    *  NEVER renderer-trusted. */
   deriveTrailers?(snapshot: CandidateTokenSnapshot): string[] | Promise<string[]>;
+  /** WP-D6 seams default to the production local-repository policy and exact-tree
+   * validator. Tests may inject them to isolate refusal ordering. */
+  resolveCandidateCommitPolicy?(input: CandidatePolicyInput): Promise<CandidateCommitPolicy>;
+  validateCandidateTree?(input: CandidateTreeValidationInput): Promise<CandidateTreeValidationResult>;
   contractVersion?: number;
   /** WP-6 production Save seam: activity repositories advance detached HEAD and
    * their durable activity ref in one CAS, then eagerly promote after ledgering. */
@@ -756,9 +769,39 @@ export class CommitCoordinator {
         throw new Error(`constructed tree diverged at ${constructionMismatches.map((entry) => entry.displayPath).join(', ')}`);
       }
 
-      // Hook/signing bypass is intentional: commit-tree neither runs commit hooks nor
-      // signs unless explicitly passed -S, which this save path never does.
-      const commitArgs = ['commit-tree', treeOid, ...(pinnedHeadOid ? ['-p', pinnedHeadOid] : []), '-F', messageFile];
+      // WP-D6 is architecture-flagged and independently OFF by default per repo.
+      // Validation sees a materialized copy of this exact tree OID, after construction
+      // proof and before commit-object creation / ref CAS. It may only accept or refuse.
+      const policy = process.env.LARES_INTENT_PACKAGING === '1'
+        ? await (this.d.resolveCandidateCommitPolicy ?? readCandidateCommitPolicy)({
+          repoRoot, gitExe, runGit: this.d.runGit,
+        })
+        : {
+          validation: { enabled: false, commands: [], timeoutMs: 0 },
+          signing: { enabled: false, signingKey: null },
+        };
+      const validation = await (this.d.validateCandidateTree ?? validateCandidateTree)({
+        repoRoot,
+        gitExe,
+        runGit: this.d.runGit,
+        treeOid,
+        policy: policy.validation,
+        env: baseEnv,
+        tmpDir: this.d.tmpDir,
+      });
+      if (!validation.ok) {
+        const command = validation.command ? ` (${validation.command})` : '';
+        return {
+          kind: 'aborted-error',
+          reason: `candidate-tree validation refused${command}: ${validation.diagnostic}`,
+          resolvedHeadOid: await this.readHead(repoRoot, gitExe),
+        };
+      }
+
+      // Hooks remain bypassed. Explicit Lares repo policy may ask commit-tree to sign
+      // the commit object; -S never changes the already-verified tree OID.
+      const signingArgs = candidateCommitSigningArgs(policy.signing);
+      const commitArgs = ['commit-tree', treeOid, ...(pinnedHeadOid ? ['-p', pinnedHeadOid] : []), ...signingArgs, '-F', messageFile];
       const commitResult = await this.d.runGit(repoRoot, commitArgs, {
         gitExe,
         mode: 'user-commit',

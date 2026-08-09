@@ -89,6 +89,27 @@ export interface WitnessedCommitProvenance {
   localCheckpointRefs: string[];
 }
 
+/** Local repository policy for validating and optionally signing Lares commits.
+ * Validation is deliberately command-based and OFF unless `enabled` is true;
+ * commands run against a materialized copy of the exact constructed tree. */
+export interface CandidateTreeValidationPolicy {
+  enabled: boolean;
+  commands: string[];
+  timeoutMs: number;
+}
+
+/** Signing is independent of Git's ordinary `commit.gpgsign` setting because the
+ * Lares save path bypasses signing unless this explicit repo policy opts in. */
+export interface CandidateCommitSigningPolicy {
+  enabled: boolean;
+  signingKey: string | null;
+}
+
+export interface CandidateCommitPolicy {
+  validation: CandidateTreeValidationPolicy;
+  signing: CandidateCommitSigningPolicy;
+}
+
 export interface BundleOverlap {
   componentId: string;
   contributingAgentCount: number;
