@@ -277,6 +277,31 @@ export function initDatabase(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_continuation_deferrals_agent_generation
            ON continuation_deferrals (dashboard_agent_id, generation, deferred_at DESC)`);
 
+  // Planning-surface mechanics D1: append-only handoff results are evidence
+  // keyed by attempt, not a second vocabulary for checkpoint turn status. There
+  // are deliberately no FKs: evidence survives deletion of its source rows.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS continuation_handoff_result_events (
+      id                   TEXT PRIMARY KEY,
+      handoff_attempt_id   TEXT NOT NULL,
+      result_kind          TEXT NOT NULL,
+      outcome              TEXT NOT NULL,
+      dashboard_agent_id   TEXT NOT NULL,
+      generation           INTEGER NOT NULL,
+      brick_id             TEXT,
+      source_session_id    TEXT,
+      successor_session_id TEXT,
+      kickoff_turn_id      TEXT,
+      completion_quality   TEXT,
+      detail_json          TEXT,
+      witnessed_at         INTEGER NOT NULL,
+      CHECK (result_kind IN ('brick_saved','successor_started','successor_oriented')),
+      CHECK (outcome IN ('succeeded','failed','timed_out'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_handoff_results_attempt
+    ON continuation_handoff_result_events (handoff_attempt_id, result_kind, witnessed_at)`);
+
   // Context-brick Phase 1 (D1) — durable session lineage. One dashboard agent
   // id spans many sessions across continuations and `/clear` rotations. This is
   // the durable map agent id → ordered generations→session ids that survives
@@ -1694,6 +1719,8 @@ function initContextOptimizerSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_plan_work_packages_plan ON plan_work_packages(plan_id);
   `);
 
+  try { db.exec(`ALTER TABLE plan_work_packages ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
+
   // Save-card SC-WP-3B — package_finalizations (§5 of the shared bundle contract):
   // the finalization boundary frozen by an explicit human/supervisor plan-package
   // `done` transition or a DISTINCT fleet-adhoc mark-done/mint step. No boundary is
@@ -2137,9 +2164,60 @@ function initContextOptimizerSchema(): void {
       actor       TEXT NOT NULL,
       reason      TEXT,
       ts          INTEGER NOT NULL,
-      CHECK (to_state IN ('ready','executing','blocked','archived'))
+      CHECK (to_state IN ('ready','executing','blocked','done','archived'))
     )
   `);
+  // Legacy P5B databases reject `done`. Probe the actual constraint in a
+  // rolled-back savepoint, then perform SQLite's table-rebuild migration only
+  // when required. The probe leaves no rows behind; on subsequent starts it
+  // succeeds, so the rebuild runs at most once.
+  const lifecycleProbeSuffix = uuidv4();
+  let lifecycleAdmitsDone = false;
+  db.exec(`SAVEPOINT plan_wp_done_probe`);
+  try {
+    db.prepare(
+      `INSERT INTO plan_work_packages
+         (id, workspace_id, plan_id, title, acceptance_condition, state,
+          assignee_agent_id, revision, created_at, updated_at, intent_id)
+       VALUES (?, ?, ?, ?, NULL, 'ready', NULL, 1, 0, 0, NULL)`,
+    ).run(`__probe_pkg_${lifecycleProbeSuffix}`, '__probe_ws', '__probe_plan', '__probe');
+    db.prepare(
+      `INSERT INTO plan_wp_lifecycle_events
+         (id, package_id, plan_id, from_state, to_state, actor, reason, ts)
+       VALUES (?, ?, ?, 'blocked', 'done', '__schema_probe', NULL, 0)`,
+    ).run(`__probe_event_${lifecycleProbeSuffix}`, `__probe_pkg_${lifecycleProbeSuffix}`, '__probe_plan');
+    lifecycleAdmitsDone = true;
+  } catch { /* the legacy CHECK rejected done */ }
+  finally {
+    db.exec(`ROLLBACK TO plan_wp_done_probe`);
+    db.exec(`RELEASE plan_wp_done_probe`);
+  }
+
+  if (!lifecycleAdmitsDone) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE plan_wp_lifecycle_events__new (
+          id          TEXT PRIMARY KEY,
+          package_id  TEXT NOT NULL REFERENCES plan_work_packages(id) ON DELETE CASCADE,
+          plan_id     TEXT NOT NULL,
+          from_state  TEXT NOT NULL,
+          to_state    TEXT NOT NULL,
+          actor       TEXT NOT NULL,
+          reason      TEXT,
+          ts          INTEGER NOT NULL,
+          CHECK (to_state IN ('ready','executing','blocked','done','archived'))
+        );
+        INSERT INTO plan_wp_lifecycle_events__new
+          SELECT * FROM plan_wp_lifecycle_events;
+        DROP TABLE plan_wp_lifecycle_events;
+        ALTER TABLE plan_wp_lifecycle_events__new RENAME TO plan_wp_lifecycle_events;
+        CREATE INDEX idx_plan_wp_lifecycle_pkg
+          ON plan_wp_lifecycle_events(package_id, ts);
+        CREATE INDEX idx_plan_wp_lifecycle_plan
+          ON plan_wp_lifecycle_events(plan_id, ts);
+      `);
+    })();
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_wp_lifecycle_pkg
     ON plan_wp_lifecycle_events(package_id, ts)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_wp_lifecycle_plan
@@ -2204,6 +2282,111 @@ function initContextOptimizerSchema(): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_dispatch_attempts_reconcile
     ON plan_dispatch_attempts(state, created_at)`);
+
+  // Mechanics D1: freeze the dispatched revision and explicit orchestration /
+  // session correlations. Legacy rows remain nullable unless an exact key join
+  // below can bind them.
+  try { db.exec(`ALTER TABLE plan_dispatch_attempts ADD COLUMN package_revision INTEGER`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plan_dispatch_attempts ADD COLUMN orchestration_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plan_dispatch_attempts ADD COLUMN target_session_id TEXT`); } catch { /* exists */ }
+
+  db.exec(`
+    UPDATE plan_dispatch_attempts
+       SET package_revision = (
+         SELECT wp.revision FROM plan_work_packages wp
+          WHERE wp.id = plan_dispatch_attempts.package_id
+       )
+     WHERE package_revision IS NULL
+       AND EXISTS (
+         SELECT 1 FROM plan_work_packages wp
+          WHERE wp.id = plan_dispatch_attempts.package_id
+       );
+
+    UPDATE plan_work_packages AS wp
+       SET intent_id = (
+         SELECT MIN(o.planning_intent_id)
+           FROM plan_dispatch_attempts d
+           JOIN orchestrations o ON o.run_id = d.orchestration_id
+           JOIN plan_intents pi
+             ON pi.plan_id = o.plan_id AND pi.intent_id = o.planning_intent_id
+          WHERE d.package_id = wp.id
+            AND o.plan_id = wp.plan_id
+            AND o.planning_intent_id IS NOT NULL
+          HAVING COUNT(DISTINCT o.planning_intent_id) = 1
+       )
+     WHERE wp.intent_id IS NULL
+       AND EXISTS (
+         SELECT 1
+           FROM plan_dispatch_attempts d
+           JOIN orchestrations o ON o.run_id = d.orchestration_id
+           JOIN plan_intents pi
+             ON pi.plan_id = o.plan_id AND pi.intent_id = o.planning_intent_id
+          WHERE d.package_id = wp.id
+            AND o.plan_id = wp.plan_id
+            AND o.planning_intent_id IS NOT NULL
+       );
+  `);
+
+  // Mechanics D1: server-witnessed execution evidence. These definitions are
+  // intentionally FK-free (and therefore cascade-free) so deletion of mutable
+  // plan/agent rows cannot erase historical evidence.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_package_gate_attempts (
+      id                 TEXT PRIMARY KEY,
+      workspace_id       TEXT NOT NULL,
+      plan_id            TEXT NOT NULL,
+      plan_artifact_id   TEXT NOT NULL,
+      intent_id          TEXT,
+      package_id         TEXT NOT NULL,
+      package_revision   INTEGER NOT NULL,
+      gate_key           TEXT NOT NULL,
+      gate_revision      INTEGER NOT NULL DEFAULT 1,
+      attempt_no         INTEGER NOT NULL,
+      outcome            TEXT NOT NULL,
+      finalization_id    TEXT,
+      witness_agent_id   TEXT,
+      witness_session_id TEXT,
+      witness_turn_id    TEXT,
+      evidence_json      TEXT,
+      decided_at         INTEGER,
+      created_at         INTEGER NOT NULL,
+      UNIQUE (package_id, package_revision, gate_key, attempt_no),
+      CHECK (outcome IN ('pending','passed','failed','cancelled')),
+      CHECK (package_revision > 0 AND gate_revision > 0 AND attempt_no > 0)
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_attempts_pkg
+      ON plan_package_gate_attempts (package_id, package_revision, gate_key);
+
+    CREATE TABLE IF NOT EXISTS plan_package_gate_commit_links (
+      gate_attempt_id  TEXT NOT NULL,
+      repository_key   TEXT NOT NULL,
+      commit_oid       TEXT NOT NULL,
+      created_at       INTEGER NOT NULL,
+      PRIMARY KEY (gate_attempt_id, repository_key, commit_oid),
+      CHECK (length(commit_oid) = 40)
+    );
+
+    CREATE TABLE IF NOT EXISTS plan_package_deployment_events (
+      id                 TEXT PRIMARY KEY,
+      workspace_id       TEXT NOT NULL,
+      plan_id            TEXT NOT NULL,
+      package_id         TEXT NOT NULL,
+      package_revision   INTEGER NOT NULL,
+      environment        TEXT NOT NULL,
+      state              TEXT NOT NULL,
+      repository_key     TEXT,
+      commit_oid         TEXT,
+      witness_agent_id   TEXT,
+      witness_session_id TEXT,
+      detail_json        TEXT,
+      occurred_at        INTEGER NOT NULL,
+      CHECK (state IN ('not_required','not_deployed','deploying','deployed','failed','rolled_back')),
+      CHECK (commit_oid IS NULL OR length(commit_oid) = 40),
+      CHECK (package_revision > 0)
+    );
+    CREATE INDEX IF NOT EXISTS idx_deploy_events_pkg
+      ON plan_package_deployment_events (package_id, package_revision, environment, occurred_at);
+  `);
 
   // Planning-surface WP-B: disk work-package provenance and the shared plan-folder
   // projection status row. These are companions; plan_work_packages stays frozen.
@@ -3858,6 +4041,26 @@ export interface ContinuationDeferralRow {
   deferredAt: string;
 }
 
+export type ContinuationHandoffResultKind =
+  | 'brick_saved' | 'successor_started' | 'successor_oriented';
+export type ContinuationHandoffResultOutcome = 'succeeded' | 'failed' | 'timed_out';
+
+export interface ContinuationHandoffResultEvent {
+  id: string;
+  handoffAttemptId: string;
+  resultKind: ContinuationHandoffResultKind;
+  outcome: ContinuationHandoffResultOutcome;
+  dashboardAgentId: string;
+  generation: number;
+  brickId: string | null;
+  sourceSessionId: string | null;
+  successorSessionId: string | null;
+  kickoffTurnId: string | null;
+  completionQuality: string | null;
+  detailJson: string | null;
+  witnessedAt: number;
+}
+
 function rowToContinuationAttempt(row: any): ContinuationHandoffAttempt {
   return {
     id: row.id,
@@ -4071,6 +4274,52 @@ export function getContinuationEscapeBudget(
     abortedCount: (abortRow?.aborted_count as number) ?? 0,
     firstAttemptStartedAt: (clockRow?.first_started_at as string | null) ?? null,
   };
+}
+
+function rowToContinuationHandoffResultEvent(row: any): ContinuationHandoffResultEvent {
+  return {
+    id: row.id,
+    handoffAttemptId: row.handoff_attempt_id,
+    resultKind: row.result_kind,
+    outcome: row.outcome,
+    dashboardAgentId: row.dashboard_agent_id,
+    generation: row.generation,
+    brickId: row.brick_id ?? null,
+    sourceSessionId: row.source_session_id ?? null,
+    successorSessionId: row.successor_session_id ?? null,
+    kickoffTurnId: row.kickoff_turn_id ?? null,
+    completionQuality: row.completion_quality ?? null,
+    detailJson: row.detail_json ?? null,
+    witnessedAt: row.witnessed_at,
+  };
+}
+
+/** Append one witnessed handoff result. There is intentionally no update/delete
+ * accessor: a timeout followed by a later success remains two historical rows. */
+export function insertContinuationHandoffResultEvent(
+  event: ContinuationHandoffResultEvent,
+): void {
+  run(
+    `INSERT INTO continuation_handoff_result_events (
+       id, handoff_attempt_id, result_kind, outcome, dashboard_agent_id,
+       generation, brick_id, source_session_id, successor_session_id,
+       kickoff_turn_id, completion_quality, detail_json, witnessed_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [event.id, event.handoffAttemptId, event.resultKind, event.outcome,
+      event.dashboardAgentId, event.generation, event.brickId,
+      event.sourceSessionId, event.successorSessionId, event.kickoffTurnId,
+      event.completionQuality, event.detailJson, event.witnessedAt],
+  );
+}
+
+export function listContinuationHandoffResultEvents(
+  handoffAttemptId: string,
+): ContinuationHandoffResultEvent[] {
+  return queryAll(
+    `SELECT * FROM continuation_handoff_result_events
+      WHERE handoff_attempt_id = ? ORDER BY witnessed_at, id`,
+    [handoffAttemptId],
+  ).map(rowToContinuationHandoffResultEvent);
 }
 
 function rowToContinuationDeferral(row: any): ContinuationDeferralRow {
@@ -5220,6 +5469,8 @@ export interface PlanWorkPackage {
   id: string;
   workspaceId: string;
   planId: string;
+  /** Null/omitted only for legacy-unbound packages. */
+  intentId?: string | null;
   title: string;
   acceptanceCondition: string | null;
   state: PlanWorkPackageState;
@@ -5234,6 +5485,7 @@ function rowToPlanWorkPackage(row: any): PlanWorkPackage {
     id: row.id,
     workspaceId: row.workspace_id,
     planId: row.plan_id,
+    intentId: row.intent_id ?? null,
     title: row.title,
     acceptanceCondition: row.acceptance_condition ?? null,
     state: row.state,
@@ -5248,15 +5500,17 @@ export function upsertPlanWorkPackage(pkg: PlanWorkPackage): void {
   run(
     `INSERT INTO plan_work_packages (
        id, workspace_id, plan_id, title, acceptance_condition, state,
-       assignee_agent_id, revision, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       assignee_agent_id, revision, created_at, updated_at, intent_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        workspace_id = excluded.workspace_id, plan_id = excluded.plan_id,
+       intent_id = COALESCE(excluded.intent_id, plan_work_packages.intent_id),
        title = excluded.title, acceptance_condition = excluded.acceptance_condition,
        state = excluded.state, assignee_agent_id = excluded.assignee_agent_id,
        revision = excluded.revision, updated_at = excluded.updated_at`,
     [pkg.id, pkg.workspaceId, pkg.planId, pkg.title, pkg.acceptanceCondition,
-      pkg.state, pkg.assigneeAgentId, pkg.revision, pkg.createdAt, pkg.updatedAt],
+      pkg.state, pkg.assigneeAgentId, pkg.revision, pkg.createdAt, pkg.updatedAt,
+      pkg.intentId ?? null],
   );
 }
 
@@ -6783,6 +7037,9 @@ export interface PlanDispatchAttempt {
   planId: string;
   executionRunId: string;
   targetAgentId: string | null;
+  packageRevision: number | null;
+  orchestrationId: string | null;
+  targetSessionId: string | null;
   requestedPlanItemId: string;
   confirmedTurnId: string | null;
   state: PlanDispatchAttemptState;
@@ -6798,6 +7055,9 @@ function rowToPlanDispatchAttempt(row: any): PlanDispatchAttempt {
     planId: row.plan_id,
     executionRunId: row.execution_run_id,
     targetAgentId: row.target_agent_id ?? null,
+    packageRevision: row.package_revision ?? null,
+    orchestrationId: row.orchestration_id ?? null,
+    targetSessionId: row.target_session_id ?? null,
     requestedPlanItemId: row.requested_plan_item_id,
     confirmedTurnId: row.confirmed_turn_id ?? null,
     state: row.state,
@@ -6818,6 +7078,8 @@ export function insertPlanDispatchAttempt(input: {
   targetAgentId: string | null;
   requestedPlanItemId: string;
   createdAt: number;
+  orchestrationId?: string | null;
+  targetSessionId?: string | null;
 }): PlanDispatchAttempt {
   return getDb().transaction((): PlanDispatchAttempt => {
     const pkg = getPlanWorkPackage(input.packageId);
@@ -6835,10 +7097,12 @@ export function insertPlanDispatchAttempt(input: {
       `INSERT INTO plan_dispatch_attempts
          (id, package_id, plan_id, execution_run_id, target_agent_id,
           requested_plan_item_id, confirmed_turn_id, state, created_at,
-          confirmed_at, reconciled_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, NULL, NULL)`,
+          confirmed_at, reconciled_at, package_revision, orchestration_id,
+          target_session_id)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, NULL, NULL, ?, ?, ?)`,
       [input.id, input.packageId, input.planId, input.executionRunId,
-        input.targetAgentId, input.requestedPlanItemId, input.createdAt],
+        input.targetAgentId, input.requestedPlanItemId, input.createdAt, pkg.revision,
+        input.orchestrationId ?? null, input.targetSessionId ?? null],
     );
     return getPlanDispatchAttempt(input.id)!;
   })();
@@ -6929,10 +7193,11 @@ export function confirmPlanDispatchAttempt(input: {
     const reconciled = input.reconciledAt !== undefined && input.reconciledAt !== null;
     run(
       `UPDATE plan_dispatch_attempts
-          SET state = ?, confirmed_turn_id = ?, confirmed_at = ?, reconciled_at = ?
+          SET state = ?, confirmed_turn_id = ?, confirmed_at = ?, reconciled_at = ?,
+              target_session_id = COALESCE(target_session_id, ?)
         WHERE id = ?`,
       [reconciled ? 'reconciled' : 'delivered', input.confirmedTurnId,
-        input.confirmedAt, input.reconciledAt ?? null, input.attemptId],
+        input.confirmedAt, input.reconciledAt ?? null, turn.sessionId, input.attemptId],
     );
     transitionPlanWorkPackageStateInTransaction({
       eventId: input.eventId,
@@ -7006,6 +7271,251 @@ export function reconcilePlanDispatchAttempts(
 // the single-row lifecycle transitions (supersede / boundary-status / committed-release).
 // The ordering, JCS re-finalization comparison, ref creation, and restart reconciler
 // that COMPOSE these primitives are WP-3C's finalization service, not this layer.
+
+// -- Planning-surface mechanics D1: append-only package evidence ledger --------
+
+const FULL_COMMIT_OID_RE = /^[0-9a-f]{40}$/i;
+
+function assertFullCommitOid(commitOid: string, field: string): void {
+  if (!FULL_COMMIT_OID_RE.test(commitOid)) {
+    throw new Error(`${field} must be a full 40-hex commit OID`);
+  }
+}
+
+export type PlanPackageGateOutcome = 'pending' | 'passed' | 'failed' | 'cancelled';
+export interface PlanPackageGateAttempt {
+  id: string;
+  workspaceId: string;
+  planId: string;
+  planArtifactId: string;
+  intentId: string | null;
+  packageId: string;
+  packageRevision: number;
+  gateKey: string;
+  gateRevision: number;
+  attemptNo: number;
+  outcome: PlanPackageGateOutcome;
+  finalizationId: string | null;
+  witnessAgentId: string | null;
+  witnessSessionId: string | null;
+  witnessTurnId: string | null;
+  evidenceJson: string | null;
+  decidedAt: number | null;
+  createdAt: number;
+}
+
+function rowToPlanPackageGateAttempt(row: any): PlanPackageGateAttempt {
+  return {
+    id: row.id, workspaceId: row.workspace_id, planId: row.plan_id,
+    planArtifactId: row.plan_artifact_id, intentId: row.intent_id ?? null,
+    packageId: row.package_id, packageRevision: row.package_revision,
+    gateKey: row.gate_key, gateRevision: row.gate_revision,
+    attemptNo: row.attempt_no, outcome: row.outcome,
+    finalizationId: row.finalization_id ?? null,
+    witnessAgentId: row.witness_agent_id ?? null,
+    witnessSessionId: row.witness_session_id ?? null,
+    witnessTurnId: row.witness_turn_id ?? null,
+    evidenceJson: row.evidence_json ?? null, decidedAt: row.decided_at ?? null,
+    createdAt: row.created_at,
+  };
+}
+
+/** Insert-only: retries allocate a new attempt number and preserve prior outcomes. */
+export function insertPlanPackageGateAttempt(attempt: PlanPackageGateAttempt): void {
+  run(
+    `INSERT INTO plan_package_gate_attempts (
+       id, workspace_id, plan_id, plan_artifact_id, intent_id, package_id,
+       package_revision, gate_key, gate_revision, attempt_no, outcome,
+       finalization_id, witness_agent_id, witness_session_id, witness_turn_id,
+       evidence_json, decided_at, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [attempt.id, attempt.workspaceId, attempt.planId, attempt.planArtifactId,
+      attempt.intentId, attempt.packageId, attempt.packageRevision, attempt.gateKey,
+      attempt.gateRevision, attempt.attemptNo, attempt.outcome, attempt.finalizationId,
+      attempt.witnessAgentId, attempt.witnessSessionId, attempt.witnessTurnId,
+      attempt.evidenceJson, attempt.decidedAt, attempt.createdAt],
+  );
+}
+
+export function getPlanPackageGateAttempt(id: string): PlanPackageGateAttempt | null {
+  const row = queryOne(`SELECT * FROM plan_package_gate_attempts WHERE id = ?`, [id]);
+  return row ? rowToPlanPackageGateAttempt(row) : null;
+}
+
+export function listPlanPackageGateAttempts(
+  packageId: string, packageRevision: number,
+): PlanPackageGateAttempt[] {
+  return queryAll(
+    `SELECT * FROM plan_package_gate_attempts
+      WHERE package_id = ? AND package_revision = ?
+      ORDER BY gate_key, attempt_no, created_at, id`,
+    [packageId, packageRevision],
+  ).map(rowToPlanPackageGateAttempt);
+}
+
+/** DB-only current gate projection. Absence remains an empty result, never pass. */
+export function listLatestPlanPackageGateAttempts(
+  packageId: string, packageRevision: number,
+): PlanPackageGateAttempt[] {
+  return queryAll(
+    `SELECT g.* FROM plan_package_gate_attempts g
+      WHERE g.package_id = ? AND g.package_revision = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM plan_package_gate_attempts newer
+           WHERE newer.package_id = g.package_id
+             AND newer.package_revision = g.package_revision
+             AND newer.gate_key = g.gate_key
+             AND (newer.attempt_no > g.attempt_no OR
+               (newer.attempt_no = g.attempt_no AND newer.id > g.id))
+        )
+      ORDER BY g.gate_key`,
+    [packageId, packageRevision],
+  ).map(rowToPlanPackageGateAttempt);
+}
+
+export interface PlanPackageGateCommitLink {
+  gateAttemptId: string;
+  repositoryKey: string;
+  commitOid: string;
+  createdAt: number;
+}
+
+function rowToPlanPackageGateCommitLink(row: any): PlanPackageGateCommitLink {
+  return {
+    gateAttemptId: row.gate_attempt_id, repositoryKey: row.repository_key,
+    commitOid: row.commit_oid, createdAt: row.created_at,
+  };
+}
+
+export function insertPlanPackageGateCommitLink(link: PlanPackageGateCommitLink): void {
+  assertFullCommitOid(link.commitOid, 'commitOid');
+  run(
+    `INSERT INTO plan_package_gate_commit_links
+       (gate_attempt_id, repository_key, commit_oid, created_at)
+     VALUES (?, ?, ?, ?)`,
+    [link.gateAttemptId, link.repositoryKey, link.commitOid, link.createdAt],
+  );
+}
+
+export function listPlanPackageGateCommitLinks(
+  gateAttemptId: string,
+): PlanPackageGateCommitLink[] {
+  return queryAll(
+    `SELECT * FROM plan_package_gate_commit_links
+      WHERE gate_attempt_id = ? ORDER BY created_at, repository_key, commit_oid`,
+    [gateAttemptId],
+  ).map(rowToPlanPackageGateCommitLink);
+}
+
+export type PlanPackageDeploymentState =
+  | 'not_required' | 'not_deployed' | 'deploying' | 'deployed' | 'failed' | 'rolled_back';
+export interface PlanPackageDeploymentEvent {
+  id: string;
+  workspaceId: string;
+  planId: string;
+  packageId: string;
+  packageRevision: number;
+  environment: string;
+  state: PlanPackageDeploymentState;
+  repositoryKey: string | null;
+  commitOid: string | null;
+  witnessAgentId: string | null;
+  witnessSessionId: string | null;
+  detailJson: string | null;
+  occurredAt: number;
+}
+
+function rowToPlanPackageDeploymentEvent(row: any): PlanPackageDeploymentEvent {
+  return {
+    id: row.id, workspaceId: row.workspace_id, planId: row.plan_id,
+    packageId: row.package_id, packageRevision: row.package_revision,
+    environment: row.environment, state: row.state,
+    repositoryKey: row.repository_key ?? null, commitOid: row.commit_oid ?? null,
+    witnessAgentId: row.witness_agent_id ?? null,
+    witnessSessionId: row.witness_session_id ?? null,
+    detailJson: row.detail_json ?? null, occurredAt: row.occurred_at,
+  };
+}
+
+/** Insert-only deployment observation; no row means unknown, not not_required. */
+export function insertPlanPackageDeploymentEvent(event: PlanPackageDeploymentEvent): void {
+  if (event.commitOid !== null) assertFullCommitOid(event.commitOid, 'commitOid');
+  run(
+    `INSERT INTO plan_package_deployment_events (
+       id, workspace_id, plan_id, package_id, package_revision, environment,
+       state, repository_key, commit_oid, witness_agent_id, witness_session_id,
+       detail_json, occurred_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [event.id, event.workspaceId, event.planId, event.packageId,
+      event.packageRevision, event.environment, event.state, event.repositoryKey,
+      event.commitOid, event.witnessAgentId, event.witnessSessionId,
+      event.detailJson, event.occurredAt],
+  );
+}
+
+export function listPlanPackageDeploymentEvents(
+  packageId: string, packageRevision: number,
+): PlanPackageDeploymentEvent[] {
+  return queryAll(
+    `SELECT * FROM plan_package_deployment_events
+      WHERE package_id = ? AND package_revision = ? ORDER BY occurred_at, id`,
+    [packageId, packageRevision],
+  ).map(rowToPlanPackageDeploymentEvent);
+}
+
+/** DB-only current deployment projection, one latest row per environment. */
+export function listLatestPlanPackageDeploymentEvents(
+  packageId: string, packageRevision: number,
+): PlanPackageDeploymentEvent[] {
+  return queryAll(
+    `SELECT d.* FROM plan_package_deployment_events d
+      WHERE d.package_id = ? AND d.package_revision = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM plan_package_deployment_events newer
+           WHERE newer.package_id = d.package_id
+             AND newer.package_revision = d.package_revision
+             AND newer.environment = d.environment
+             AND (newer.occurred_at > d.occurred_at OR
+               (newer.occurred_at = d.occurred_at AND newer.id > d.id))
+        )
+      ORDER BY d.environment`,
+    [packageId, packageRevision],
+  ).map(rowToPlanPackageDeploymentEvent);
+}
+
+export interface PlanPackageEvidenceProjection {
+  package: PlanWorkPackage;
+  dispatchAttempts: PlanDispatchAttempt[];
+  gateAttempts: PlanPackageGateAttempt[];
+  latestGateAttempts: PlanPackageGateAttempt[];
+  gateCommitLinks: PlanPackageGateCommitLink[];
+  deploymentEvents: PlanPackageDeploymentEvent[];
+  latestDeploymentEvents: PlanPackageDeploymentEvent[];
+}
+
+/** Canonical database-only package evidence read. No filesystem-derived fields
+ * or fallback joins are admitted here. */
+export function getPlanPackageEvidenceProjection(
+  packageId: string, packageRevision?: number,
+): PlanPackageEvidenceProjection | null {
+  const pkg = getPlanWorkPackage(packageId);
+  if (!pkg) return null;
+  const revision = packageRevision ?? pkg.revision;
+  const gateAttempts = listPlanPackageGateAttempts(packageId, revision);
+  return {
+    package: pkg,
+    dispatchAttempts: queryAll(
+      `SELECT * FROM plan_dispatch_attempts
+        WHERE package_id = ? AND package_revision = ? ORDER BY created_at, id`,
+      [packageId, revision],
+    ).map(rowToPlanDispatchAttempt),
+    gateAttempts,
+    latestGateAttempts: listLatestPlanPackageGateAttempts(packageId, revision),
+    gateCommitLinks: gateAttempts.flatMap((gate) => listPlanPackageGateCommitLinks(gate.id)),
+    deploymentEvents: listPlanPackageDeploymentEvents(packageId, revision),
+    latestDeploymentEvents: listLatestPlanPackageDeploymentEvents(packageId, revision),
+  };
+}
 
 export type FinalizationKind = 'plan-package' | 'fleet-adhoc';
 export type FinalizationBoundaryStatus = 'ready' | 'unavailable' | 'pruned';

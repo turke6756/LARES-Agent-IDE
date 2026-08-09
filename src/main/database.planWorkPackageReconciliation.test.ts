@@ -116,12 +116,12 @@ function snapshot(planId: string): string {
   });
 }
 
-test('schema adds both companions and overview columns without changing the frozen package shape', () => {
+test('schema adds companions, overview columns, and the guarded intent binding', () => {
   const columns = (table: string) => rawRows(`PRAGMA table_info(${table})`)
     .map((row) => (row as { name: string }).name);
   assert.deepEqual(columns('plan_work_packages'), [
     'id', 'workspace_id', 'plan_id', 'title', 'acceptance_condition', 'state',
-    'assignee_agent_id', 'revision', 'created_at', 'updated_at',
+    'assignee_agent_id', 'revision', 'created_at', 'updated_at', 'intent_id',
   ]);
   assert.deepEqual(columns('plan_work_package_sources'), [
     'package_id', 'workspace_id', 'plan_id', 'source_rel_path', 'source_local_id',
