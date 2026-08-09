@@ -7,6 +7,7 @@ import {
   buildDispatchTurnContext,
   resolveRequestedPlanBinding,
   withResolvedIntentStamp,
+  withPlanningActivityBinding,
   withResolvedPlanStamp,
   type DispatchAgentInfo,
   type DispatchDeps,
@@ -135,6 +136,26 @@ test('trusted lifecycle factory can carry a source through the non-wire symbol p
   assert.deepEqual(ctx?.planStamp, {
     planId: 'plan-carried', planItemId: null, source: 'fork-carry',
   });
+});
+
+test('trusted planning activity binding resolves capability from the physical worktree', async () => {
+  let primaryCalls = 0;
+  let activityCalls = 0;
+  const dispatch = withPlanningActivityBinding({ origin: 'orchestration' }, {
+    executionRunId: 'run-1', path: '/app/planning-worktrees/run-1',
+    repositoryKey: 'activity-key', objectDatabaseKey: '/repo/.git',
+  });
+  assert.equal(JSON.stringify(dispatch).includes('planning-worktrees'), false);
+  const ctx = await buildDispatchTurnContext(deps({
+    resolveCapability: async () => { primaryCalls += 1; return capability(); },
+    resolveActivityCapability: async (binding) => {
+      activityCalls += 1;
+      return { ...capability(), repoRoot: binding.path };
+    },
+  }), 'worker', dispatch);
+  assert.equal(primaryCalls, 0);
+  assert.equal(activityCalls, 1);
+  assert.equal(ctx?.capability.repoRoot, '/app/planning-worktrees/run-1');
 });
 
 (async () => {

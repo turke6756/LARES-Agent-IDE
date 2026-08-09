@@ -36,28 +36,41 @@ export interface DispatchContext {
   requestedPlanBinding?: RequestedPlanBinding;
 }
 
+export interface PlanningActivityBinding {
+  executionRunId: string;
+  path: string;
+  repositoryKey: string;
+  objectDatabaseKey: string;
+}
+
 /** A symbol-keyed value cannot arrive through JSON or an object-shaped wire binding.
  * Lifecycle rails use `withResolvedPlanStamp`; ordinary callers use
  * `requestedPlanBinding` and are resolved against authoritative state below. */
 const TRUSTED_PLAN_STAMP: unique symbol = Symbol('lares.trusted-plan-stamp');
 const TRUSTED_INTENT_STAMP: unique symbol = Symbol('lares.trusted-intent-stamp');
+const TRUSTED_ACTIVITY_BINDING: unique symbol = Symbol('lares.trusted-activity-binding');
 type TrustedStampCarrier = { readonly [TRUSTED_PLAN_STAMP]?: ResolvedPlanStamp };
 type TrustedIntentCarrier = { readonly [TRUSTED_INTENT_STAMP]?: ResolvedIntentStamp };
+type TrustedActivityCarrier = { readonly [TRUSTED_ACTIVITY_BINDING]?: PlanningActivityBinding };
 
 function copyTrustedCarriers(
   source: DispatchContext,
   target: DispatchContext,
-  skip: 'plan' | 'intent',
+  skip: 'plan' | 'intent' | 'activity',
 ): void {
-  const trusted = source as DispatchContext & TrustedStampCarrier & TrustedIntentCarrier;
-  const targetTrusted = target as DispatchContext & TrustedStampCarrier & TrustedIntentCarrier;
+  const trusted = source as DispatchContext & TrustedStampCarrier & TrustedIntentCarrier & TrustedActivityCarrier;
+  const targetTrusted = target as DispatchContext & TrustedStampCarrier & TrustedIntentCarrier & TrustedActivityCarrier;
   const planStamp = trusted[TRUSTED_PLAN_STAMP];
   const intentStamp = trusted[TRUSTED_INTENT_STAMP];
+  const activity = trusted[TRUSTED_ACTIVITY_BINDING];
   if (planStamp && skip !== 'plan') Object.defineProperty(targetTrusted, TRUSTED_PLAN_STAMP, {
     value: planStamp, enumerable: false, writable: false, configurable: false,
   });
   if (intentStamp && skip !== 'intent') Object.defineProperty(targetTrusted, TRUSTED_INTENT_STAMP, {
     value: intentStamp, enumerable: false, writable: false, configurable: false,
+  });
+  if (activity && skip !== 'activity') Object.defineProperty(targetTrusted, TRUSTED_ACTIVITY_BINDING, {
+    value: activity, enumerable: false, writable: false, configurable: false,
   });
 }
 
@@ -105,6 +118,20 @@ export function withResolvedIntentStamp(
     enumerable: false,
     writable: false,
     configurable: false,
+  });
+  return trusted;
+}
+
+/** Attach the DB-resolved physical execution root. Private-symbol carriage prevents
+ * an API/request body from redirecting checkpoint capability to an arbitrary cwd. */
+export function withPlanningActivityBinding(
+  dispatch: DispatchContext,
+  binding: PlanningActivityBinding,
+): DispatchContext {
+  const trusted = { ...dispatch } as DispatchContext & TrustedActivityCarrier;
+  copyTrustedCarriers(dispatch, trusted, 'activity');
+  Object.defineProperty(trusted, TRUSTED_ACTIVITY_BINDING, {
+    value: Object.freeze({ ...binding }), enumerable: false, writable: false, configurable: false,
   });
   return trusted;
 }
@@ -173,6 +200,7 @@ export function deriveTaskLabel(promptText: string | null | undefined): string |
 /** The minimal agent shape the builder reads (a subset of the DB `Agent`). */
 export interface DispatchAgentInfo {
   workspaceId: string;
+  workingDirectory?: string;
   planId?: string | null;
   title?: string | null;
   resumeSessionId?: string | null;
@@ -186,6 +214,8 @@ export interface DispatchDeps {
    *  per-workspace probe). Returns null when the workspace is not a usable repo —
    *  the caller then skips the checkpoint entirely (delivery still proceeds). */
   resolveCapability: (agent: DispatchAgentInfo) => Promise<GitCapability | null>;
+  /** WP-5 trusted run binding; production probes this physical worktree path. */
+  resolveActivityCapability?: (binding: PlanningActivityBinding) => Promise<GitCapability | null>;
   /** Authoritative plan/workspace membership check. Required for an explicit plan;
    * optional during the 2B→2C wiring transition, where absence fails closed. */
   planInWorkspace?: (workspaceId: string, planId: string) => boolean;
@@ -352,7 +382,10 @@ export async function buildDispatchTurnContext(
   const agent = deps.getAgent(agentId);
   if (!agent) return null;
 
-  const capability = await deps.resolveCapability(agent);
+  const activityBinding = (dispatch as DispatchContext & TrustedActivityCarrier)[TRUSTED_ACTIVITY_BINDING];
+  const capability = activityBinding && deps.resolveActivityCapability
+    ? await deps.resolveActivityCapability(activityBinding)
+    : await deps.resolveCapability(agent);
   if (!capability || !capability.repoRoot) return null; // non-repo/unusable → skip
 
   // Owner is NULL for a human terminal; otherwise the caller-named owner, whose

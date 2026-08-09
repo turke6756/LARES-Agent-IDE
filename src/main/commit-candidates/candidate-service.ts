@@ -45,7 +45,11 @@ import { canonicalize } from './jcs';
 import type { CommitRepresentation } from './commit-representation';
 import type { FrozenManifestMember } from './finalization-service';
 import type { IndexFingerprintResult } from './index-fingerprint';
-import type { PackageFinalization } from '../database';
+import {
+  listPlanningActivityWorktrees,
+  type PackageFinalization,
+  type PlanningActivityWorktree,
+} from '../database';
 import type { GitCapability } from '../../shared/types';
 import type { RunGit } from '../git/git-runtime';
 import {
@@ -55,6 +59,7 @@ import {
 } from './dirty-inventory';
 import {
   discoverScopeForWorkspace,
+  enumeratePlanningActivityScopeInputs,
   type ScopeDiscoveryDeps,
   type WorkspaceScopeInput,
 } from './scope-discovery';
@@ -168,6 +173,8 @@ export interface CandidateServiceDeps {
   realpath?(path: string): string;
   fileExists?(path: string): boolean;
   tokenStore?: CandidateTokenStoreOptions;
+  /** WP-5 inventory roots. These are physical worktrees, not workspace rows. */
+  readActivePlanningWorktrees?: () => readonly PlanningActivityWorktree[];
 }
 
 function deepFreeze<T>(value: T): T {
@@ -475,14 +482,27 @@ export class CommitCandidateService {
       throw new Error(`unknown target workspace: ${request.targetWorkspaceId}`);
     }
 
-    const inputs = request.workspaces.map((workspace): WorkspaceScopeInput => ({
+    const primaryInputs = request.workspaces.map((workspace): WorkspaceScopeInput => ({
       workspaceId: workspace.workspaceId,
       workspaceDir: workspace.workspaceDir,
       capability: workspace.capability,
     }));
-    const workspaceByDir = new Map(
+    const activityRows = this.deps.readActivePlanningWorktrees
+      ? this.deps.readActivePlanningWorktrees()
+      : process.env.LARES_INTENT_PACKAGING === '1'
+        ? listPlanningActivityWorktrees(['active'])
+        : [];
+    const inputs = enumeratePlanningActivityScopeInputs(primaryInputs, activityRows.map((row) => ({
+      executionRunId: row.executionRunId,
+      logicalWorkspaceId: row.logicalWorkspaceId,
+      path: row.path,
+      repositoryKey: row.activityRepositoryKey,
+      objectDatabaseKey: row.objectDatabaseKey,
+    })));
+    const workspaceByDir = new Map<string, CandidateWorkspaceInput | undefined>(
       request.workspaces.map((workspace) => [workspace.workspaceDir, workspace]),
     );
+    for (const row of activityRows) workspaceByDir.set(row.path, undefined);
     // Request-local only: discoverScopeForWorkspace probes the target once to
     // identify its repository, then probes every input (including that target)
     // to assemble aliases. Share identical reads within this assembly without

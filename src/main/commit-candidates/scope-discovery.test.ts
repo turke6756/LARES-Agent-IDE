@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import {
   discoverRepositoryScopes,
   discoverScopeForWorkspace,
+  enumeratePlanningActivityScopeInputs,
   type ScopeDiscoveryDeps,
   type WorkspaceScopeInput,
 } from './scope-discovery';
@@ -193,6 +194,20 @@ test('discoverScopeForWorkspace returns null for a rejected / unknown target', a
   const inputs = [ws('ws-bare', 'C:\\Bare', '', 'c:\\bare.git', '')];
   assert.equal(await discoverScopeForWorkspace('ws-bare', inputs, deps), null, 'rejected target → null');
   assert.equal(await discoverScopeForWorkspace('ws-missing', inputs, deps), null, 'unknown target → null');
+});
+
+test('active planning worktrees enumerate as distinct physical roots without workspace registration', () => {
+  const inputs = [ws('ws-primary', 'C:\\Repo', '', 'c:\\repo\\.git', '')];
+  const roots = enumeratePlanningActivityScopeInputs(inputs, [{
+    executionRunId: 'run/one', logicalWorkspaceId: 'ws-primary',
+    path: 'C:\\AppData\\planning-worktrees\\run-one', repositoryKey: 'activity-key',
+    objectDatabaseKey: 'c:\\repo\\.git',
+  }]);
+  assert.equal(roots.length, 2);
+  assert.equal(roots[1].workspaceId, 'planning-activity:run/one');
+  assert.equal(roots[1].workspaceDir, 'C:\\AppData\\planning-worktrees\\run-one');
+  assert.equal(roots[1].capability.commonDirQueueKey, 'c:\\repo\\.git');
+  assert.equal(inputs.length, 1, 'the registered workspace list is not mutated');
 });
 
 // ── Runner ────────────────────────────────────────────────────────────────────

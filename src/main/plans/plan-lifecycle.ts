@@ -16,12 +16,14 @@
 
 import type { Plan, PlanTabKey } from '../../shared/types';
 import { createHash, randomUUID } from 'node:crypto';
+import * as path from 'node:path';
 import {
   archivePlanClosingRun,
   confirmPlanDispatchAttempt,
   getActivePlanExecutionRun,
   getAgent,
   getOwnerForWorker,
+  getActivePlanningActivityWorktree,
   getDb,
   getPlan,
   getPlanWorkPackage,
@@ -42,6 +44,7 @@ import {
 import {
   resolvePackageDispatchContext,
   withResolvedIntentStamp,
+  withPlanningActivityBinding,
   type DispatchContext,
   type DispatchDeps,
   type PlanBindingResolution,
@@ -80,6 +83,7 @@ export interface PackageDispatchInput {
 export interface PackageDispatchDeps {
   getPackage?: typeof getPlanWorkPackage;
   getActiveRun?: typeof getActivePlanExecutionRun;
+  getActiveActivity?: typeof getActivePlanningActivityWorktree;
   dispatchDeps?: DispatchDeps;
   insertAttempt?: typeof insertPlanDispatchAttempt;
   markFailed?: typeof markPlanDispatchAttemptFailed;
@@ -106,6 +110,8 @@ export type PackageDispatchFailure =
   | 'package-not-ready'
   | 'target-agent-not-found'
   | 'target-agent-workspace-mismatch'
+  | 'target-agent-worktree-mismatch'
+  | 'planning-activity-unavailable'
   | 'structured-plan-not-implemented'
   | PackageBindingFailure
   | 'send-failed'
@@ -148,6 +154,7 @@ export interface PlanPackageDispatchRouteDeps {
   newId?: () => string;
   now?: () => number;
   intentPackaging?: boolean;
+  getActiveActivity?: typeof getActivePlanningActivityWorktree;
   deliver: PackageDispatchDeps['deliver'];
 }
 
@@ -225,6 +232,21 @@ export async function dispatchPlanPackage(
   const confirmAttempt = deps.confirmAttempt ?? confirmPlanDispatchAttempt;
   const intentPackaging = deps.intentPackaging
     ?? process.env.LARES_INTENT_PACKAGING === '1';
+  const activity = intentPackaging
+    ? (deps.getActiveActivity ?? getActivePlanningActivityWorktree)(input.planId)
+    : null;
+  if (intentPackaging && (!activity || activity.executionRunId !== activeRun.id)) {
+    return { ok: false, attempt: null, disposition: null, failure: 'planning-activity-unavailable' };
+  }
+  if (activity) {
+    const normalize = (value: string) => {
+      const resolvedPath = path.resolve(value);
+      return process.platform === 'win32' ? resolvedPath.toLowerCase() : resolvedPath;
+    };
+    if (!agent.workingDirectory || normalize(agent.workingDirectory) !== normalize(activity.path)) {
+      return { ok: false, attempt: null, disposition: null, failure: 'target-agent-worktree-mismatch' };
+    }
+  }
   let attempt = insertAttempt({
     id: input.attemptId,
     packageId: input.packageId,
@@ -241,8 +263,16 @@ export async function dispatchPlanPackage(
       createdById: input.ownerAgentId,
     } : undefined,
   });
+  const activityDispatch = activity
+    ? withPlanningActivityBinding(resolved.dispatch, {
+        executionRunId: activity.executionRunId,
+        path: activity.path,
+        repositoryKey: activity.activityRepositoryKey,
+        objectDatabaseKey: activity.objectDatabaseKey,
+      })
+    : resolved.dispatch;
   const dispatch = intentPackaging && attempt.intentId
-    ? withResolvedIntentStamp(resolved.dispatch, {
+    ? withResolvedIntentStamp(activityDispatch, {
         intentId: attempt.intentId,
         kind: 'task',
         executionRunId: activeRun.id,
@@ -250,7 +280,7 @@ export async function dispatchPlanPackage(
         planItemId: input.planItemId,
         source: 'task-dispatch',
       })
-    : resolved.dispatch;
+    : activityDispatch;
   let delivery: PackageDeliveryResult;
   try {
     delivery = await deps.deliver({
@@ -340,6 +370,7 @@ export function registerPlanPackageDispatchIpc(
       createdAt: now(),
     }, {
       intentPackaging: deps.intentPackaging,
+      getActiveActivity: deps.getActiveActivity,
       deliver: deps.deliver,
     });
 

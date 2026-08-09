@@ -119,6 +119,16 @@ function openStampedTurn(
   });
 }
 
+function activeActivity(s: ReturnType<typeof seed>): import('../database').PlanningActivityWorktree {
+  return {
+    executionRunId: s.runId, planId: s.planId, logicalWorkspaceId: s.workspaceId,
+    objectDatabaseKey: '/r', activityRepositoryKey: `activity-${s.runId}`,
+    primaryRepositoryKey: `primary-${s.runId}`, path: `C:/w${serial}`,
+    baselineOid: 'b'.repeat(40), activityHeadRef: `refs/lares/activities/${s.runId}/head`,
+    promotedHeadOid: null, state: 'active', failureCode: null, createdAt: 1000, updatedAt: 1000,
+  };
+}
+
 test('schema has the exact dispatch-attempt columns and bounded states', () => {
   const rows = dbm.getDb().prepare('PRAGMA table_info(plan_dispatch_attempts)').all() as Array<{ name: string }>;
   assert.deepEqual(rows.map((r) => r.name), [
@@ -127,6 +137,23 @@ test('schema has the exact dispatch-attempt columns and bounded states', () => {
     'confirmed_at', 'reconciled_at', 'intent_id', 'package_revision',
     'orchestration_id', 'target_session_id',
   ]);
+});
+
+test('planning activity row persists before run activation and flips active atomically', () => {
+  const s = seed(false);
+  const provisioning = activeActivity(s);
+  provisioning.state = 'provisioning';
+  dbm.insertPlanningActivityWorktreeProvisioning(provisioning);
+  assert.equal(dbm.getPlanExecutionRun(s.runId), null);
+  assert.equal(dbm.getPlanningActivityWorktree(s.runId)?.state, 'provisioning');
+  dbm.insertPlanExecutionRunActivating({
+    id: s.runId, planId: s.planId, repositoryKey: provisioning.primaryRepositoryKey,
+    baselineKind: 'head', baselineHeadOid: provisioning.baselineOid,
+    baselineRef: provisioning.activityHeadRef, triggerSource: 'renderer-user-action',
+    triggeredAt: 1500, planningActivityExecutionRunId: s.runId,
+  });
+  assert.equal(dbm.getPlanningActivityWorktree(s.runId)?.state, 'active');
+  assert.equal(dbm.getPlan(s.planId)?.runState, 'executing');
 });
 
 test('pending precedes send; open turn confirmation moves ready→executing atomically', async () => {
@@ -139,6 +166,7 @@ test('pending precedes send; open turn confirmation moves ready→executing atom
     createdAt: 2000,
   }, {
     intentPackaging: true,
+    getActiveActivity: () => activeActivity(s),
     deliver: async ({ dispatch }) => {
       const row = dbm.getPlanDispatchAttempt(`attempt-${serial}`);
       sawPendingBeforeSend = row?.state === 'pending'
@@ -201,11 +229,11 @@ test('intent get-or-create is keyed by dispatch attempt while separate briefs mi
     seen.push(ctx.intentStamp.intentId);
     return { disposition: 'delivered-unconfirmed' as const };
   };
-  await svc.dispatchPlanPackage(input, { intentPackaging: true, deliver });
-  await svc.dispatchPlanPackage(input, { intentPackaging: true, deliver });
+  await svc.dispatchPlanPackage(input, { intentPackaging: true, getActiveActivity: () => activeActivity(s), deliver });
+  await svc.dispatchPlanPackage(input, { intentPackaging: true, getActiveActivity: () => activeActivity(s), deliver });
   await svc.dispatchPlanPackage({
     ...input, attemptId: `attempt-second-${serial}`, promptText: 'A second brief',
-  }, { intentPackaging: true, deliver });
+  }, { intentPackaging: true, getActiveActivity: () => activeActivity(s), deliver });
 
   assert.equal(seen[0], seen[1], 'one dispatch retry reuses one intent');
   assert.notEqual(seen[0], seen[2], 'two briefs under one item mint two intents');
@@ -226,6 +254,7 @@ test('production registrar obtains the package dispatch path and stamps the supe
     },
   }, {
     intentPackaging: true,
+    getActiveActivity: () => activeActivity(s),
     now: () => 3200,
     newId: () => `route-${serial}`,
     deliver: async ({ dispatch }) => {
@@ -281,6 +310,23 @@ test('pre-Implement package send is refused before attempt insertion or delivery
     targetAgentId: s.agentId, ownerAgentId: null, promptText: 'go', createdAt: 2300,
   }, { deliver: async () => { delivered = true; return { disposition: 'failed' }; } });
   assert.equal(result.failure, 'structured-plan-not-implemented');
+  assert.equal(delivered, false);
+  assert.equal(dbm.getPlanDispatchAttempt(`attempt-${serial}`), null);
+});
+
+test('wrong-cwd planning dispatch is refused before attempt insertion or delivery', async () => {
+  const s = seed();
+  let delivered = false;
+  const activity = { ...activeActivity(s), path: 'C:/app/planning-worktrees/ws/run' };
+  const result = await svc.dispatchPlanPackage({
+    attemptId: `attempt-${serial}`, lifecycleEventId: `event-${serial}`,
+    packageId: s.packageId, planId: s.planId, planItemId: s.packageId,
+    targetAgentId: s.agentId, ownerAgentId: null, promptText: 'go', createdAt: 2350,
+  }, {
+    intentPackaging: true, getActiveActivity: () => activity,
+    deliver: async () => { delivered = true; return { disposition: 'delivered-unconfirmed' }; },
+  });
+  assert.equal(result.failure, 'target-agent-worktree-mismatch');
   assert.equal(delivered, false);
   assert.equal(dbm.getPlanDispatchAttempt(`attempt-${serial}`), null);
 });

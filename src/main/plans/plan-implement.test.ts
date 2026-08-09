@@ -248,6 +248,42 @@ test('an unborn HEAD stores kind=unborn with no ref and never creates a ref', as
   assert.deepEqual(log, ['row']); // no ref created
 });
 
+test('intent-packaging refuses unborn HEAD before provisioning', async () => {
+  let provisioned = false;
+  const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'e' }, svcDeps({
+    intentPackaging: true,
+    probeBaseline: async () => ({ ok: true, kind: 'unborn' }),
+    provisionActivity: async () => { provisioned = true; return { ok: false, reason: 'worktree-provision-failed' }; },
+  }));
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.failures, ['worktree-requires-initial-commit']);
+  assert.equal(provisioned, false);
+});
+
+test('intent-packaging activates the run through the provisioned activity binding', async () => {
+  const log: SpyLog = [];
+  const activity = {
+    executionRunId: 'run-fixed', planId: 'plan-1', logicalWorkspaceId: 'ws-1',
+    objectDatabaseKey: 'objects', activityRepositoryKey: 'activity-key', primaryRepositoryKey: 'primary-key',
+    path: 'C:/app/planning-worktrees/ws/run', baselineOid: 'b'.repeat(40),
+    activityHeadRef: 'refs/lares/activities/cnVuLWZpeGVk/head', promotedHeadOid: null,
+    state: 'active' as const, failureCode: null, createdAt: 4242, updatedAt: 4242,
+  };
+  const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'e' }, svcDeps({
+    intentPackaging: true,
+    appUserDataPath: 'C:/app',
+    provisionActivity: async (_input: unknown, deps: { activate: (row: typeof activity) => void }) => {
+      log.push('provision');
+      deps.activate(activity);
+      return { ok: true, activity };
+    },
+  }, log));
+  assert.equal(res.ok, true);
+  assert.deepEqual(log, ['provision', 'row']);
+  assert.equal(res.run?.repositoryKey, 'primary-key');
+  assert.equal(res.run?.baselineRef, activity.activityHeadRef);
+});
+
 test('a ref-creation failure refuses the trigger and never inserts a run row', async () => {
   const log: SpyLog = [];
   const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'e' },

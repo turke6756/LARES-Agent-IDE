@@ -2324,6 +2324,33 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_exec_runs_plan
     ON plan_execution_runs(plan_id, lifecycle_state)`);
 
+  // Save-card architecture WP-5 — a durable, pre-activation record for the one
+  // app-owned worktree assigned to an execution run. The row intentionally has a
+  // `provisioning` state so startup can finish/quarantine filesystem or ref work
+  // left by a process crash before the plan run becomes active.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS planning_activity_worktrees (
+      execution_run_id        TEXT PRIMARY KEY REFERENCES plan_execution_runs(id) ON DELETE CASCADE,
+      plan_id                 TEXT NOT NULL,
+      logical_workspace_id    TEXT NOT NULL,
+      object_database_key     TEXT NOT NULL,
+      activity_repository_key TEXT NOT NULL,
+      primary_repository_key  TEXT NOT NULL,
+      path                    TEXT NOT NULL,
+      baseline_oid            TEXT NOT NULL,
+      activity_head_ref       TEXT NOT NULL,
+      promoted_head_oid       TEXT,
+      state                   TEXT NOT NULL CHECK (state IN
+        ('provisioning','active','merge-pending','merge-conflicted','merged',
+         'cleanup-pending','cleaned','recovery-required')),
+      failure_code            TEXT,
+      created_at              INTEGER NOT NULL,
+      updated_at              INTEGER NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_planning_activity_worktrees_state
+    ON planning_activity_worktrees(state, logical_workspace_id)`);
+
   // Planning-surface WP-P5-dispatch — durable send-before-confirmation ledger.
   // The pending row is committed before any worker bytes are sent. A confirmed
   // turn id then anchors the ready→executing transition and restart reconciliation;
@@ -2430,6 +2457,7 @@ function initContextOptimizerSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_named_save_set_members_digest
       ON named_save_set_members(save_intent_id, inventory_digest);
   `);
+
   try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_stamp_source TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE plan_dispatch_attempts ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
@@ -7429,6 +7457,9 @@ export interface InsertPlanExecutionRunInput {
   triggerSource: string;
   appUserId?: string | null;
   triggeredAt: number;
+  /** WP-5: when present, activation also flips this already-provisioned activity
+   * row to active in the same transaction as the run insert + plan state flip. */
+  planningActivityExecutionRunId?: string;
 }
 
 /**
@@ -7465,6 +7496,20 @@ export function insertPlanExecutionRunActivating(
          WHERE id = ? AND run_state = 'ready'`,
       [input.planId],
     );
+    if (input.planningActivityExecutionRunId) {
+      if (input.planningActivityExecutionRunId !== input.id) {
+        throw new Error('insertPlanExecutionRunActivating: planning activity run id mismatch');
+      }
+      run(
+        `UPDATE planning_activity_worktrees
+            SET state = 'active', failure_code = NULL, updated_at = ?
+          WHERE execution_run_id = ? AND plan_id = ? AND state = 'provisioning'`,
+        [input.triggeredAt, input.id, input.planId],
+      );
+      if (getPlanningActivityWorktree(input.id)?.state !== 'active') {
+        throw new Error('insertPlanExecutionRunActivating: provisioning activity row missing');
+      }
+    }
     return getPlanExecutionRun(input.id)!;
   });
   return tx();
@@ -7575,6 +7620,132 @@ export interface SaveIntent {
   createdAt: number;
   readyAt: number | null;
   committedAt: number | null;
+}
+
+// ── Save-card architecture WP-5 — planning activity worktrees ─────────────────
+
+export type PlanningActivityWorktreeState =
+  | 'provisioning' | 'active' | 'merge-pending' | 'merge-conflicted' | 'merged'
+  | 'cleanup-pending' | 'cleaned' | 'recovery-required';
+
+export interface PlanningActivityWorktree {
+  executionRunId: string;
+  planId: string;
+  logicalWorkspaceId: string;
+  objectDatabaseKey: string;
+  activityRepositoryKey: string;
+  primaryRepositoryKey: string;
+  path: string;
+  baselineOid: string;
+  activityHeadRef: string;
+  promotedHeadOid: string | null;
+  state: PlanningActivityWorktreeState;
+  failureCode: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+function rowToPlanningActivityWorktree(row: any): PlanningActivityWorktree {
+  return {
+    executionRunId: row.execution_run_id,
+    planId: row.plan_id,
+    logicalWorkspaceId: row.logical_workspace_id,
+    objectDatabaseKey: row.object_database_key,
+    activityRepositoryKey: row.activity_repository_key,
+    primaryRepositoryKey: row.primary_repository_key,
+    path: row.path,
+    baselineOid: row.baseline_oid,
+    activityHeadRef: row.activity_head_ref,
+    promotedHeadOid: row.promoted_head_oid ?? null,
+    state: row.state,
+    failureCode: row.failure_code ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/** Persist the crash-recovery row before its execution-run parent is activated.
+ * SQLite cannot otherwise represent the approved child-before-parent sequence;
+ * FK enforcement is suspended only around this single insert and restored in a
+ * finally block. The activation transaction resolves the relationship. */
+export function insertPlanningActivityWorktreeProvisioning(
+  row: PlanningActivityWorktree,
+): PlanningActivityWorktree {
+  const database = getDb();
+  if (row.state !== 'provisioning') {
+    throw new Error('insertPlanningActivityWorktreeProvisioning: state must be provisioning');
+  }
+  database.pragma('foreign_keys = OFF');
+  try {
+    run(
+      `INSERT INTO planning_activity_worktrees
+        (execution_run_id, plan_id, logical_workspace_id, object_database_key,
+         activity_repository_key, primary_repository_key, path, baseline_oid,
+         activity_head_ref, promoted_head_oid, state, failure_code, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provisioning', ?, ?, ?)`,
+      [row.executionRunId, row.planId, row.logicalWorkspaceId, row.objectDatabaseKey,
+        row.activityRepositoryKey, row.primaryRepositoryKey, row.path, row.baselineOid,
+        row.activityHeadRef, row.promotedHeadOid, row.failureCode, row.createdAt, row.updatedAt],
+    );
+  } finally {
+    database.pragma('foreign_keys = ON');
+  }
+  return getPlanningActivityWorktree(row.executionRunId)!;
+}
+
+export function getPlanningActivityWorktree(executionRunId: string): PlanningActivityWorktree | null {
+  const row = queryOne(
+    'SELECT * FROM planning_activity_worktrees WHERE execution_run_id = ?',
+    [executionRunId],
+  );
+  return row ? rowToPlanningActivityWorktree(row) : null;
+}
+
+export function getActivePlanningActivityWorktree(planId: string): PlanningActivityWorktree | null {
+  const row = queryOne(
+    `SELECT w.* FROM planning_activity_worktrees w
+       JOIN plan_execution_runs r ON r.id = w.execution_run_id
+      WHERE w.plan_id = ? AND w.state = 'active' AND r.lifecycle_state = 'active'
+      ORDER BY r.triggered_at DESC, r.id DESC LIMIT 1`,
+    [planId],
+  );
+  return row ? rowToPlanningActivityWorktree(row) : null;
+}
+
+export function listPlanningActivityWorktrees(
+  states?: readonly PlanningActivityWorktreeState[],
+): PlanningActivityWorktree[] {
+  if (!states || states.length === 0) {
+    return queryAll('SELECT * FROM planning_activity_worktrees ORDER BY created_at, execution_run_id', [])
+      .map(rowToPlanningActivityWorktree);
+  }
+  const unique = [...new Set(states)];
+  return queryAll(
+    `SELECT * FROM planning_activity_worktrees WHERE state IN (${unique.map(() => '?').join(',')})
+      ORDER BY created_at, execution_run_id`, unique,
+  ).map(rowToPlanningActivityWorktree);
+}
+
+export function updatePlanningActivityWorktree(input: {
+  executionRunId: string;
+  activityRepositoryKey?: string;
+  objectDatabaseKey?: string;
+  state?: PlanningActivityWorktreeState;
+  failureCode?: string | null;
+  updatedAt: number;
+}): PlanningActivityWorktree {
+  const current = getPlanningActivityWorktree(input.executionRunId);
+  if (!current) throw new Error(`planning activity not found: ${input.executionRunId}`);
+  run(
+    `UPDATE planning_activity_worktrees SET activity_repository_key = ?, object_database_key = ?,
+       state = ?, failure_code = ?, updated_at = ? WHERE execution_run_id = ?`,
+    [input.activityRepositoryKey ?? current.activityRepositoryKey,
+      input.objectDatabaseKey ?? current.objectDatabaseKey,
+      input.state ?? current.state,
+      input.failureCode === undefined ? current.failureCode : input.failureCode,
+      input.updatedAt, input.executionRunId],
+  );
+  return getPlanningActivityWorktree(input.executionRunId)!;
 }
 
 function rowToSaveIntent(row: any): SaveIntent {

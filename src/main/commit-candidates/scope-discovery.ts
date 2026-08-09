@@ -28,6 +28,35 @@ export interface WorkspaceScopeInput {
   capability: Pick<GitCapability, 'commonDirQueueKey' | 'workspacePrefix'>;
 }
 
+export interface PlanningActivityScopeRoot {
+  executionRunId: string;
+  logicalWorkspaceId: string;
+  path: string;
+  repositoryKey: string;
+  objectDatabaseKey: string;
+}
+
+/** Add active planning worktrees as inventory roots without registering another
+ * logical workspace. The synthetic scope id is process-internal and deterministic;
+ * the durable logical workspace id remains available on the root metadata. */
+export function enumeratePlanningActivityScopeInputs(
+  inputs: readonly WorkspaceScopeInput[],
+  activities: readonly PlanningActivityScopeRoot[],
+): WorkspaceScopeInput[] {
+  const roots = inputs.slice();
+  const seenRuns = new Set<string>();
+  for (const activity of activities) {
+    if (seenRuns.has(activity.executionRunId)) continue;
+    seenRuns.add(activity.executionRunId);
+    roots.push({
+      workspaceId: `planning-activity:${activity.executionRunId}`,
+      workspaceDir: activity.path,
+      capability: { commonDirQueueKey: activity.objectDatabaseKey, workspacePrefix: '' },
+    });
+  }
+  return roots;
+}
+
 /** Per-workspace deps. `runGitFor` yields a `RunGit` bound to a given workspace
  *  dir (mirrors `makeRealRunGit(execPath, dir, platform)` in git-runtime); the
  *  rest of the seam is shared. */

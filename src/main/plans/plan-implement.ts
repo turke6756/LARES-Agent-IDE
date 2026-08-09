@@ -33,6 +33,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import * as os from 'os';
+import { app } from 'electron';
 
 import type { Plan, PlanTabKey } from '../../shared/types';
 import {
@@ -58,6 +59,10 @@ import {
 import { resolveInternalGit } from '../git/git-runtime';
 import { buildPlanDocuments } from './plan-documents';
 import { reconcilePlanFolderProjections } from './plan-folder-reconciler';
+import {
+  provisionPlanningActivity,
+  type ProvisionPlanningActivityResult,
+} from '../git-checkpoints/planning-worktree-service';
 
 export const IMPLEMENT_TRIGGER_SOURCE = 'renderer-user-action';
 
@@ -75,6 +80,8 @@ export type ImplementFailure =
   | 'no-app-user'
   | 'not-a-repository'
   | 'bare-repository'
+  | 'worktree-requires-initial-commit'
+  | 'worktree-provision-failed'
   | 'baseline-ref-failed'
   | 'run-persist-failed';
 
@@ -120,6 +127,9 @@ export interface ImplementPlanDeps {
   now?: () => number;
   /** Test seam for the one shared post-refresh readiness interpretation. */
   refreshAndGetReadiness?: typeof refreshAndGetPlanReadiness;
+  intentPackaging?: boolean;
+  appUserDataPath?: string;
+  provisionActivity?: typeof provisionPlanningActivity;
 }
 
 export type PlanReadinessFailure =
@@ -325,6 +335,7 @@ export async function implementPlan(
   const insertRun = deps.insertRun ?? insertPlanExecutionRunActivating;
   const newRunId = deps.newRunId ?? uuidv4;
   const now = deps.now ?? Date.now;
+  const intentPackaging = deps.intentPackaging ?? process.env.LARES_INTENT_PACKAGING === '1';
 
   const failures: ImplementFailure[] = [];
   let tabsMissingOverview: PlanTabKey[] = [];
@@ -367,6 +378,61 @@ export async function implementPlan(
 
   // ── pin the baseline: create ref BEFORE the run row (head only) ───────────────
   const runId = newRunId();
+  if (intentPackaging) {
+    if (probe.kind === 'unborn') {
+      failures.push('worktree-requires-initial-commit');
+      return fail();
+    }
+    let activatedRun: PlanExecutionRun | null = null;
+    const provisionResult: ProvisionPlanningActivityResult = await (
+      deps.provisionActivity ?? provisionPlanningActivity
+    )({
+      executionRunId: runId,
+      planId: plan.id,
+      logicalWorkspaceId: plan.workspaceId,
+      primaryRepoRoot: ctx.repoRoot,
+      appUserDataPath: deps.appUserDataPath ?? app.getPath('userData'),
+      createdAt: now(),
+      gitExe: ctx.gitExe,
+    }, {
+      recheckEligibility: async () => {
+        const fresh = await getReadiness(input.planId, {
+          getPlan,
+          listPackages: deps.listPackages,
+          getPopulatedTabs: deps.getPopulatedTabs,
+          hasOverview: deps.hasOverview,
+          hasValidResponsibleSupervisor: deps.hasValidResponsibleSupervisor,
+        });
+        return fresh.canImplement;
+      },
+      probeHead: async () => probe.headOid,
+      activate: (activity) => {
+        activatedRun = insertRun({
+          id: runId,
+          planId: plan.id,
+          repositoryKey: activity.primaryRepositoryKey,
+          baselineKind: 'head',
+          baselineHeadOid: probe.headOid,
+          baselineRef: activity.activityHeadRef,
+          triggerSource: IMPLEMENT_TRIGGER_SOURCE,
+          appUserId: input.appUserId,
+          triggeredAt: now(),
+          planningActivityExecutionRunId: runId,
+        });
+      },
+    });
+    if (!provisionResult.ok) {
+      failures.push(provisionResult.reason === 'worktree-requires-initial-commit'
+        ? 'worktree-requires-initial-commit' : 'worktree-provision-failed');
+      return fail();
+    }
+    if (!activatedRun) {
+      failures.push('worktree-provision-failed');
+      return fail();
+    }
+    return { ok: true, run: activatedRun, failures: [], tabsMissingOverview: [] };
+  }
+
   let baselineKind: PlanBaselineKind;
   let baselineHeadOid: string | null = null;
   let baselineRef: string | null = null;

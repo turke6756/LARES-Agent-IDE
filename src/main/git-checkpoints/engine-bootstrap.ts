@@ -28,8 +28,14 @@ import { CheckpointService } from './checkpoint-service';
 import { TurnCoordinator, type TurnContext } from './turn-coordinator';
 import { TurnCompletionTracker } from '../supervisor/turn-completion-tracker';
 import { WitnessRecorder } from './witness-recorder';
-import { buildDispatchTurnContext, type DispatchContext, type DispatchAgentInfo } from './dispatch-context';
+import {
+  buildDispatchTurnContext,
+  type DispatchContext,
+  type DispatchAgentInfo,
+  type PlanningActivityBinding,
+} from './dispatch-context';
 import { runCheckpointStartupMaintenance } from './reconciler';
+import { reconcilePlanningActivityWorktrees } from './planning-worktree-reconciler';
 import {
   runWorkspaceRetention,
   type RetentionDeps,
@@ -165,6 +171,23 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
   };
   const resolveCapability = (agent: DispatchAgentInfo): Promise<GitCapability | null> =>
     resolveCapabilityByWorkspace(agent.workspaceId);
+  const activityCapabilityCache = new Map<string, GitCapability | null>();
+  const resolveActivityCapability = async (
+    binding: PlanningActivityBinding,
+  ): Promise<GitCapability | null> => {
+    if (activityCapabilityCache.has(binding.executionRunId)) {
+      return activityCapabilityCache.get(binding.executionRunId) ?? null;
+    }
+    let capability: GitCapability | null = null;
+    try {
+      capability = await probeWorkspaceGit(canonicalDir(binding.path));
+      if (capability.commonDirQueueKey !== binding.objectDatabaseKey) capability = null;
+    } catch {
+      capability = null;
+    }
+    activityCapabilityCache.set(binding.executionRunId, capability);
+    return capability;
+  };
 
   // WP-G2.1 — the capability-bound HTTP checkpoint surface. Authorization (supervisor
   // capability, self-assertion, workspace scope) is enforced in ApiServer BEFORE any
@@ -377,7 +400,11 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
 
   const buildTurnContext = (agentId: string, dispatch: DispatchContext) =>
     buildDispatchTurnContext(
-      { getAgent: (id) => getAgent(id) as unknown as DispatchAgentInfo | null, resolveCapability },
+      {
+        getAgent: (id) => getAgent(id) as unknown as DispatchAgentInfo | null,
+        resolveCapability,
+        resolveActivityCapability,
+      },
       agentId,
       dispatch,
     );
@@ -387,12 +414,16 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
     record: (turnId, p, op) => recordWitnessedActivity(turnId, p, op),
   });
 
-  const runStartupMaintenance = () =>
-    runCheckpointStartupMaintenance({
+  const runStartupMaintenance = async () => {
+    await runCheckpointStartupMaintenance({
       workspaces: getWorkspaces(),
       // WP-G1.7 seam upgrade: dangling-open close runs through the LIVE coordinator.
       closeOpenTurns: (workspaceId: string) => coordinator.reconcileOpenTurns(workspaceId),
     });
+    if (process.env.LARES_INTENT_PACKAGING === '1') {
+      await reconcilePlanningActivityWorktrees({ gitExe });
+    }
+  };
 
   // WP-G3.3 — retention cycle. Each workspace resolves its git capability through the
   // shared per-workspace cache; a workspace with no usable repo (or no queue key) is
