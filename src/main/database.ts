@@ -2370,6 +2370,22 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_merge_attempts_run
     ON activity_merge_attempts(execution_run_id, started_at DESC)`);
   db.exec(`
+    CREATE TABLE IF NOT EXISTS promoted_checkpoint_refs (
+      primary_repository_key TEXT NOT NULL,
+      promoted_commit_oid    TEXT NOT NULL,
+      source_repository_key  TEXT NOT NULL,
+      source_commit_oid      TEXT NOT NULL,
+      turn_id                TEXT NOT NULL,
+      edge                   TEXT NOT NULL CHECK (edge IN ('before','after')),
+      checkpoint_ref         TEXT NOT NULL,
+      checkpoint_oid         TEXT NOT NULL,
+      created_at             INTEGER NOT NULL,
+      PRIMARY KEY (primary_repository_key, promoted_commit_oid, checkpoint_ref)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_promoted_checkpoint_refs_turn
+    ON promoted_checkpoint_refs(turn_id, checkpoint_ref)`);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS activity_merge_conflicts (
       attempt_id          TEXT NOT NULL REFERENCES activity_merge_attempts(id) ON DELETE CASCADE,
       path_bytes_base64   TEXT NOT NULL,
@@ -8165,6 +8181,91 @@ export function updateActivityMergeAttempt(input: {
       input.proposedCommitOid === undefined ? current.proposedCommitOid : input.proposedCommitOid,
       input.endedAt === undefined ? current.endedAt : input.endedAt, input.id]);
   return getActivityMergeAttempt(input.id)!;
+}
+
+export interface PromotedCheckpointRef {
+  primaryRepositoryKey: string;
+  promotedCommitOid: string;
+  sourceRepositoryKey: string;
+  sourceCommitOid: string;
+  turnId: string;
+  edge: 'before' | 'after';
+  checkpointRef: string;
+  checkpointOid: string;
+  createdAt: number;
+}
+
+/** Persist the local checkpoint refs referenced by the activity commits that a
+ * successful promotion made reachable from primary history. */
+export function recordPromotedCheckpointRefs(input: {
+  primaryRepositoryKey: string;
+  promotedCommitOid: string;
+  sourceRepositoryKey: string;
+  sourceCommitOids: readonly string[];
+  createdAt: number;
+}): PromotedCheckpointRef[] {
+  if (input.sourceCommitOids.length === 0) return [];
+  const uniqueOids = [...new Set(input.sourceCommitOids)];
+  const placeholders = uniqueOids.map(() => '?').join(',');
+  const links = queryAll(
+    `SELECT commit_oid, turn_id FROM commit_turn_links
+      WHERE repository_key = ? AND commit_oid IN (${placeholders})`,
+    [input.sourceRepositoryKey, ...uniqueOids],
+  ) as Array<{ commit_oid: string; turn_id: string }>;
+  const inserted: PromotedCheckpointRef[] = [];
+  getDb().transaction(() => {
+    for (const link of links) {
+      const turn = getTurnRecord(link.turn_id);
+      if (!turn) continue;
+      const edges = [
+        { edge: 'before' as const, ready: turn.beforeReady, ref: turn.beforeRef, oid: turn.beforeOid },
+        { edge: 'after' as const, ready: turn.afterReady, ref: turn.afterRef, oid: turn.afterOid },
+      ];
+      for (const edge of edges) {
+        if (!edge.ready || !edge.ref?.startsWith('refs/lares/') || !edge.oid) continue;
+        run(
+          `INSERT OR IGNORE INTO promoted_checkpoint_refs
+            (primary_repository_key, promoted_commit_oid, source_repository_key,
+             source_commit_oid, turn_id, edge, checkpoint_ref, checkpoint_oid, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [input.primaryRepositoryKey, input.promotedCommitOid, input.sourceRepositoryKey,
+            link.commit_oid, link.turn_id, edge.edge, edge.ref, edge.oid, input.createdAt],
+        );
+        inserted.push({
+          primaryRepositoryKey: input.primaryRepositoryKey,
+          promotedCommitOid: input.promotedCommitOid,
+          sourceRepositoryKey: input.sourceRepositoryKey,
+          sourceCommitOid: link.commit_oid,
+          turnId: link.turn_id,
+          edge: edge.edge,
+          checkpointRef: edge.ref,
+          checkpointOid: edge.oid,
+          createdAt: input.createdAt,
+        });
+      }
+    }
+  })();
+  return inserted;
+}
+
+export function listPromotedCheckpointRefsForWorkspace(workspaceId: string): PromotedCheckpointRef[] {
+  return queryAll(
+    `SELECT p.* FROM promoted_checkpoint_refs p
+       JOIN turn_records t ON t.id = p.turn_id
+      WHERE t.workspace_id = ?
+      ORDER BY p.created_at, p.checkpoint_ref`,
+    [workspaceId],
+  ).map((row: any): PromotedCheckpointRef => ({
+    primaryRepositoryKey: row.primary_repository_key,
+    promotedCommitOid: row.promoted_commit_oid,
+    sourceRepositoryKey: row.source_repository_key,
+    sourceCommitOid: row.source_commit_oid,
+    turnId: row.turn_id,
+    edge: row.edge,
+    checkpointRef: row.checkpoint_ref,
+    checkpointOid: row.checkpoint_oid,
+    createdAt: row.created_at,
+  }));
 }
 export function replaceActivityMergeConflicts(attemptId: string, rows: readonly ActivityMergeConflict[]): void {
   const tx = getDb().transaction(() => {

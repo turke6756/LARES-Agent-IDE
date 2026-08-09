@@ -173,7 +173,7 @@ export interface CommitCoordinatorDeps {
   writeIntentLedger?(write: IntentCommitLedgerWrite): void;
   /** Server-derived `Lares-*` trailers from the immutable snapshot (default below);
    *  NEVER renderer-trusted. */
-  deriveTrailers?(snapshot: CandidateTokenSnapshot): string[];
+  deriveTrailers?(snapshot: CandidateTokenSnapshot): string[] | Promise<string[]>;
   contractVersion?: number;
   /** WP-6 production Save seam: activity repositories advance detached HEAD and
    * their durable activity ref in one CAS, then eagerly promote after ledgering. */
@@ -209,7 +209,10 @@ function defaultValidateMessage(raw: string): string {
 
 /** Deterministic, server-only trailer block from the immutable snapshot. Renderer
  *  input never contributes; this reads ONLY the frozen associations + candidateId. */
-function defaultDeriveTrailers(snapshot: CandidateTokenSnapshot): string[] {
+export function deriveSnapshotTrailers(
+  snapshot: CandidateTokenSnapshot,
+  assistedByEnabled = true,
+): string[] {
   const turnIds = new Set<string>();
   const planIds = new Set<string>();
   for (const association of snapshot.associations) {
@@ -219,7 +222,24 @@ function defaultDeriveTrailers(snapshot: CandidateTokenSnapshot): string[] {
   const trailers = [`Lares-Candidate: ${snapshot.candidate.candidateId}`];
   for (const turnId of [...turnIds].sort()) trailers.push(`Lares-Turn: ${turnId}`);
   for (const planId of [...planIds].sort()) trailers.push(`Lares-Plan: ${planId}`);
+  const provenance = snapshot.witnessedProvenance;
+  if (assistedByEnabled) {
+    for (const identity of provenance?.assistedBy ?? []) {
+      if (!/^[A-Za-z0-9._/-]+$/.test(identity.provider)
+        || !/^[A-Za-z0-9._/+:-]+$/.test(identity.model)) continue;
+      trailers.push(`Assisted-by: ${identity.provider}:${identity.model}`);
+    }
+  }
+  for (const ref of provenance?.localCheckpointRefs ?? []) {
+    if (/^refs\/lares\/[A-Za-z0-9._/-]+$/.test(ref)) {
+      trailers.push(`Lares-Checkpoint-Ref-Local: ${ref}`);
+    }
+  }
   return trailers;
+}
+
+function defaultDeriveTrailers(snapshot: CandidateTokenSnapshot): string[] {
+  return deriveSnapshotTrailers(snapshot);
 }
 
 async function mapBounded<T, R>(
@@ -393,7 +413,9 @@ export class CommitCoordinator {
   private readonly now: () => number;
   private readonly newAttemptId: () => string;
   private readonly validateMessage: (raw: string) => string;
-  private readonly deriveTrailers: (snapshot: CandidateTokenSnapshot) => string[];
+  private readonly deriveTrailers: (
+    snapshot: CandidateTokenSnapshot,
+  ) => string[] | Promise<string[]>;
   private readonly contractVersion: number;
 
   constructor(deps: CommitCoordinatorDeps) {
@@ -707,7 +729,7 @@ export class CommitCoordinator {
     const baseEnv = { ...(this.d.env ?? process.env) };
 
     try {
-      const trailers = this.deriveTrailers(snapshot);
+      const trailers = await this.deriveTrailers(snapshot);
       const body = `${message}\n\n${trailers.join('\n')}\n`;
       await fs.promises.writeFile(messageFile, body, 'utf8');
 

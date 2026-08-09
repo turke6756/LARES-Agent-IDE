@@ -14,6 +14,7 @@ import {
   listActivityMergeAttempts,
   listActivityMergeConflicts,
   replaceActivityMergeConflicts,
+  recordPromotedCheckpointRefs,
   resolveActivityMergeConflict as persistResolution,
   updateActivityMergeAttempt,
   updatePlanningActivityWorktree,
@@ -39,6 +40,7 @@ export interface ActivityMergeStore {
   replaceConflicts(attemptId: string, rows: readonly ActivityMergeConflict[]): void;
   resolveConflict(input: Parameters<typeof persistResolution>[0]): ActivityMergeConflict | null;
   updateActivity(input: Parameters<typeof updatePlanningActivityWorktree>[0]): PlanningActivityWorktree;
+  recordPromotedCheckpointRefs?: typeof recordPromotedCheckpointRefs;
 }
 
 export interface ActivityMergeServiceDeps {
@@ -70,6 +72,7 @@ const defaultStore: ActivityMergeStore = {
   replaceConflicts: replaceActivityMergeConflicts,
   resolveConflict: persistResolution,
   updateActivity: updatePlanningActivityWorktree,
+  recordPromotedCheckpointRefs,
 };
 
 function splitZero(bytes: Buffer): Buffer[] {
@@ -309,6 +312,17 @@ export class ActivityMergeService {
           { ...OPTS, gitExe: this.deps.gitExe, stdin: indexInfo });
         if (updateIndex.code !== 0) throw new Error('primary-index-reconcile-failed');
       }
+      const promotedActivityCommits = await this.runGit(activity.path,
+        ['rev-list', '--reverse', `${base}..${theirs}`],
+        { ...OPTS, gitExe: this.deps.gitExe });
+      if (promotedActivityCommits.code !== 0) throw new Error('promotion-source-commits-unavailable');
+      this.store.recordPromotedCheckpointRefs?.({
+        primaryRepositoryKey: activity.primaryRepositoryKey,
+        promotedCommitOid: proposed,
+        sourceRepositoryKey: activity.activityRepositoryKey,
+        sourceCommitOids: promotedActivityCommits.stdout.split(/\r?\n/).filter((oid) => OID_RE.test(oid)),
+        createdAt: this.now(),
+      });
       this.store.updateAttempt({ id: attempt.id, state: 'committed', proposedCommitOid: proposed, endedAt: this.now() });
       this.store.updateActivity({ executionRunId, promotedHeadOid: proposed, state: 'active', failureCode: null, updatedAt: this.now() });
       return { status: 'promoted', attemptId: attempt.id, primaryHeadOid: proposed };

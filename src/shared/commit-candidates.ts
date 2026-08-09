@@ -75,6 +75,20 @@ export interface BundleAssociation {
   memberEntryIds: string[];
 }
 
+/** Shareable assistant identity for evidence-backed commit attribution. Dashboard
+ * agent/session UUIDs deliberately never enter this shape. */
+export interface AssistedByIdentity {
+  provider: string;
+  model: string;
+}
+
+/** Frozen local provenance carried by an opaque candidate token. Checkpoint refs
+ * are explicitly local-only; no clone/push transport is promised. */
+export interface WitnessedCommitProvenance {
+  assistedBy: AssistedByIdentity[];
+  localCheckpointRefs: string[];
+}
+
 export interface BundleOverlap {
   componentId: string;
   contributingAgentCount: number;

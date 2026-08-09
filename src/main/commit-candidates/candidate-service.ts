@@ -12,6 +12,7 @@ import type {
   BundleCaptureHealth,
   BundleAssociation,
   CandidateMember,
+  WitnessedCommitProvenance,
   CommitCandidate,
   CommitCandidateToken,
   CommitEligibility,
@@ -141,6 +142,8 @@ export interface CandidateTokenSnapshot {
     readonly memberManifestJson: string;
   }[];
   readonly associations: readonly BundleAssociation[];
+  /** Evidence-backed, UUID-free provenance frozen at mint time. */
+  readonly witnessedProvenance?: Readonly<WitnessedCommitProvenance>;
 }
 
 interface CandidateTokenRecord {
@@ -183,6 +186,12 @@ export interface CandidateServiceDeps {
   /** Immutable turn-row attribution. Null/omitted preserves Stage ① behavior. */
   stampSource?: WitnessStampSource | null;
   readCaptureTurns: CaptureTurnReader;
+  /** UUID-free attribution and local checkpoint refs resolved from the immutable
+   * turn row. Missing evidence yields no public attribution. */
+  readWitnessedProvenance?: (
+    workspaceId: string,
+    turnId: string,
+  ) => Readonly<WitnessedCommitProvenance> | null;
   readCommitPathLinks?: CommitPathLinkReader;
   readActiveFinalizations?: (repositoryKey: string) => readonly PackageFinalization[];
   /**
@@ -222,10 +231,32 @@ export interface CandidateInventoryRead {
   /** SC-WP-2L — retention quota-weakening warning; null unless a still-dirty edge is released. */
   quotaWeakening: SaveCardQuotaWeakening | null;
   intentUnits?: CandidateIntentUnit[];
+  witnessedProvenanceByTurnId?: ReadonlyMap<string, Readonly<WitnessedCommitProvenance>>;
 }
 
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function freezeSelectedWitnessedProvenance(
+  context: CandidateBuildContext,
+  turnIds: Iterable<string>,
+): WitnessedCommitProvenance {
+  const assistedBy = new Map<string, WitnessedCommitProvenance['assistedBy'][number]>();
+  const localCheckpointRefs = new Set<string>();
+  for (const turnId of new Set(turnIds)) {
+    const provenance = context.witnessedProvenanceByTurnId?.get(turnId);
+    if (!provenance) continue;
+    for (const identity of provenance.assistedBy) {
+      assistedBy.set(`${identity.provider}\0${identity.model}`, identity);
+    }
+    for (const ref of provenance.localCheckpointRefs) localCheckpointRefs.add(ref);
+  }
+  return {
+    assistedBy: [...assistedBy.values()].sort((a, b) =>
+      compareStrings(`${a.provider}:${a.model}`, `${b.provider}:${b.model}`)),
+    localCheckpointRefs: [...localCheckpointRefs].sort(compareStrings),
+  };
 }
 
 function uniqueScopePrefixes(
@@ -395,6 +426,11 @@ export class CommitCandidateService {
     if (carryVerdict) carryVerdictByCandidate.set(candidate, carryVerdict);
     const selectedComponents = context.components.filter((component) =>
       built.componentIds.includes(component.componentId));
+    const selectedAssociations = selectedComponents.flatMap((component) => component.associations);
+    const witnessedProvenance = freezeSelectedWitnessedProvenance(
+      context,
+      selectedAssociations.flatMap((association) => association.contributingTurnIds),
+    );
     const commitEffects = candidateCommitEffects(built.members, context.inventory.entries, context);
     const snapshot = cloneAndFreeze<CandidateTokenSnapshot>({
       token,
@@ -412,7 +448,8 @@ export class CommitCandidateService {
           finalizationId: finalization.id,
           memberManifestJson: finalization.memberManifestJson,
         })),
-      associations: selectedComponents.flatMap((component) => component.associations),
+      associations: selectedAssociations,
+      witnessedProvenance,
     });
     this.tokens.set(tokenId, {
       snapshot,
@@ -457,6 +494,10 @@ export class CommitCandidateService {
     const candidate = cloneAndFreeze({ ...built, token });
     const selectedComponents = context.components.filter((component) =>
       built.componentIds.includes(component.componentId));
+    const selectedTaskTurnIds = (context.intentUnits ?? [])
+      .filter((unit) => unit.kind === 'task' && normalizedRequest.selectedIntentIds.includes(unit.intentId))
+      .flatMap((unit) => unit.contributingTurnIds ?? []);
+    const witnessedProvenance = freezeSelectedWitnessedProvenance(context, selectedTaskTurnIds);
     const topologyDigest = computeCandidateTopologyDigest(
       context, built.componentIds,
       context.inventory.entries.filter((entry) => built.selectedUnattributedEntryIds.includes(entry.entryId)),
@@ -472,6 +513,7 @@ export class CommitCandidateService {
         .filter((finalization) => normalizedRequest.finalizationIds.includes(finalization.id))
         .map((finalization) => ({ finalizationId: finalization.id, memberManifestJson: finalization.memberManifestJson })),
       associations: selectedComponents.flatMap((component) => component.associations),
+      witnessedProvenance,
     });
     this.tokens.set(tokenId, { snapshot, state: 'issued', lastAccessedAt: now, sequence: this.tokenSequence++ });
     return candidate;
@@ -750,7 +792,16 @@ export class CommitCandidateService {
         planTitle: unit.intent.planId ? getPlan(unit.intent.planId)?.slug ?? null : null,
         planItemTitle: unit.intent.planItemId ? getPlanWorkPackage(unit.intent.planItemId)?.title ?? null : null,
         memberEntryIds: unit.memberEntryIds,
+        contributingTurnIds: unit.contributingTurnIds,
       }));
+    }
+    const witnessedProvenanceByTurnId = new Map<string, Readonly<WitnessedCommitProvenance>>();
+    if (this.deps.readWitnessedProvenance) {
+      for (const witness of witnesses) {
+        if (witnessedProvenanceByTurnId.has(witness.turnId)) continue;
+        const provenance = this.deps.readWitnessedProvenance(witness.workspaceId, witness.turnId);
+        if (provenance) witnessedProvenanceByTurnId.set(witness.turnId, provenance);
+      }
     }
     return {
       inventory: assembly.inventory,
@@ -761,6 +812,7 @@ export class CommitCandidateService {
       planAttributionUnavailableTurnIds,
       quotaWeakening: this.deps.readQuotaWeakening?.(repository.repositoryKey) ?? null,
       ...(intentUnits ? { intentUnits } : {}),
+      ...(witnessedProvenanceByTurnId.size > 0 ? { witnessedProvenanceByTurnId } : {}),
     };
   }
 
@@ -882,6 +934,7 @@ export interface CandidateBuildContext {
   reviewChallengeAtoms?: readonly ReviewChallengeAtom[];
   /** Fresh intent-first selection documents. Required by v2 mint only. */
   intentUnits?: readonly CandidateIntentUnit[];
+  witnessedProvenanceByTurnId?: ReadonlyMap<string, Readonly<WitnessedCommitProvenance>>;
   attributionResolutions?: readonly ReviewedAttributionResolution[];
   protectionByEntryId?: Readonly<Record<string, ProtectionRung>>;
   pinnedHeadOid: string | null;
@@ -899,6 +952,7 @@ export interface CandidateIntentUnit {
   planTitle?: string | null;
   planItemTitle?: string | null;
   memberEntryIds: string[];
+  contributingTurnIds?: string[];
 }
 
 function compareBase64(left: string, right: string): number {

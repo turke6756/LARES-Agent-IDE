@@ -30,11 +30,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { GitCapability, SaveCardMintRequestV2, SaveCardPreviewRequest, SaveSweepIntent,
   SaveCardAttributionResolutionRequest, SaveCardAttributionResolutionResponse } from '../../shared/types';
 import type { PlanCandidatePreviewRequest } from '../../shared/types';
-import type { DirtyEntry } from '../../shared/commit-candidates';
+import type { DirtyEntry, WitnessedCommitProvenance } from '../../shared/commit-candidates';
 import { BUNDLE_CONTRACT_VERSION } from '../../shared/constants';
 import {
   getWorkspaces as dbGetWorkspaces,
   getTurnRecord as dbGetTurnRecord,
+  getAgent as dbGetAgent,
+  getAgentContextStats as dbGetAgentContextStats,
   getTurnWitnessReads as dbGetTurnWitnessReads,
   getPackageFinalization as dbGetPackageFinalization,
   getPlanWorkPackage as dbGetPlanWorkPackage,
@@ -74,6 +76,7 @@ import type {
   ReadMemberRepresentationInput,
   MemberRepresentation,
 } from '../git-checkpoints/commit-coordinator';
+import { deriveSnapshotTrailers } from '../git-checkpoints/commit-coordinator';
 import { CheckpointQueue } from '../git-checkpoints/checkpoint-queue';
 import { computeIndexFingerprint } from './index-fingerprint';
 import {
@@ -129,6 +132,10 @@ export interface PreviewRoutesDeps {
   readTurnWitnesses?: TurnWitnessReader;
   readTurnRecord?: TurnStampRecordReader;
   readCaptureTurns?: CaptureTurnReader;
+  readWitnessedProvenance?: (
+    workspaceId: string,
+    turnId: string,
+  ) => Readonly<WitnessedCommitProvenance> | null;
   readCommitPathLinks?: CommitPathLinkReader;
   /** Whole-repository commit ledger for the prior-exact-commit closure (unfiltered,
    *  unlike the path-scoped `readCommitPathLinks` the service uses internally). */
@@ -179,7 +186,7 @@ export interface PreviewProductionSeams {
   reassemble(snapshot: CandidateTokenSnapshot): Promise<LiveReassembly>;
   readMemberRepresentation(input: ReadMemberRepresentationInput): Promise<MemberRepresentation>;
   locateRepository(snapshot: CandidateTokenSnapshot): { repoRoot: string; gitExe?: string };
-  deriveTrailers(snapshot: CandidateTokenSnapshot): string[];
+  deriveTrailers(snapshot: CandidateTokenSnapshot): Promise<string[]>;
   resolveSweepIntent(intent: Readonly<SaveSweepIntent>): Promise<FreshSaveSweepResolution>;
   refreshSweepInventory(repositoryKey: string): Promise<void>;
 }
@@ -215,6 +222,22 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   const readCaptureTurns: CaptureTurnReader =
     deps.readCaptureTurns ??
     ((workspaceId) => dbListTurnRecords(workspaceId, { limit: Number.MAX_SAFE_INTEGER }));
+  const readWitnessedProvenance = deps.readWitnessedProvenance
+    ?? ((workspaceId: string, turnId: string): WitnessedCommitProvenance | null => {
+      const turn = dbGetTurnRecord(turnId);
+      if (!turn || turn.workspaceId !== workspaceId) return null;
+      const localCheckpointRefs = [
+        turn.beforeReady ? turn.beforeRef : null,
+        turn.afterReady ? turn.afterRef : null,
+      ].filter((ref): ref is string => typeof ref === 'string' && ref.startsWith('refs/lares/'));
+      if (!turn.agentId) return { assistedBy: [], localCheckpointRefs };
+      const agent = dbGetAgent(turn.agentId);
+      const stats = dbGetAgentContextStats(turn.agentId);
+      const assistedBy = agent && stats && turn.sessionId && stats.sessionId === turn.sessionId
+        ? [{ provider: agent.provider, model: stats.model }]
+        : [];
+      return { assistedBy, localCheckpointRefs };
+    });
   const readCommitPathLinks = deps.readCommitPathLinks ?? dbListCommitPathLinks;
   const listRepoCommitPathLinks = deps.listRepoCommitPathLinks
     ?? ((repositoryKey: string) => dbListCommitPathLinks(repositoryKey));
@@ -234,6 +257,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     readTurnWitnesses,
     stampSource: createTurnStampSource(readTurnRecord),
     readCaptureTurns,
+    readWitnessedProvenance,
     readCommitPathLinks,
     readActiveFinalizations: deps.readActiveFinalizations ?? dbListActivePackageFinalizationsForRepository,
     tokenStore: { composeLocks },
@@ -328,6 +352,9 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
         ledger,
         protectionByEntryId: read.protectionByEntryId,
         ...(read.intentUnits ? { intentUnits: read.intentUnits } : {}),
+        ...(read.witnessedProvenanceByTurnId
+          ? { witnessedProvenanceByTurnId: read.witnessedProvenanceByTurnId }
+          : {}),
         pinnedHeadOid,
         indexFingerprint,
         contractVersion,
@@ -717,17 +744,19 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     return location;
   }
 
-  function deriveTrailers(snapshot: CandidateTokenSnapshot): string[] {
-    const turnIds = new Set<string>();
-    const planIds = new Set<string>();
-    for (const association of snapshot.associations) {
-      for (const turnId of association.contributingTurnIds) turnIds.add(turnId);
-      if (association.planId) planIds.add(association.planId);
+  async function deriveTrailers(snapshot: CandidateTokenSnapshot): Promise<string[]> {
+    const location = locateRepository(snapshot);
+    let assistedByEnabled = true;
+    try {
+      const configured = await runGit(location.repoRoot,
+        ['config', '--bool', '--get', 'lares.assistedBy'], {
+          gitExe: location.gitExe, allowNonzero: true, timeoutMs: 5_000, maxBytes: 1 << 20,
+        });
+      if (configured.code === 0) assistedByEnabled = configured.stdout.trim() !== 'false';
+    } catch {
+      // Missing/unreadable policy preserves the settled default-on behavior.
     }
-    const trailers = [`Lares-Candidate: ${snapshot.candidate.candidateId}`];
-    for (const turnId of [...turnIds].sort()) trailers.push(`Lares-Turn: ${turnId}`);
-    for (const planId of [...planIds].sort()) trailers.push(`Lares-Plan: ${planId}`);
-    return trailers;
+    return deriveSnapshotTrailers(snapshot, assistedByEnabled);
   }
 
   async function assembleRepositoryScope(

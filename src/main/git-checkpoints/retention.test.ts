@@ -155,6 +155,7 @@ function baseDeps(repo: string, store: FakeTurnStore, runGit: RunGitLike, queue?
     commonDirQueueKey: repo,
     runGit,
     turnStore: store,
+    readPromotedCheckpointRefs: () => [],
     now: () => NOW,
     retentionMs: 5 * 24 * 60 * 60 * 1000,
     platform: process.platform,
@@ -275,6 +276,29 @@ test('accepted-task thinning: aged accepted turn prunes BEFORE only, keeps the A
   assert.equal(row.beforePrunedAt, NOW);
   assert.equal(row.afterPrunedAt, null, 'after edge not marked pruned');
   assert.ok(row.compactDiff != null, 'still distilled before pruning the before edge');
+});
+
+test('promoted commit checkpoint refs survive a normal retention prune pass', async () => {
+  const T = 'T-promoted';
+  const { repo, beforeOid, afterOid } = mkRepoWithEdges(T);
+  const store = new FakeTurnStore();
+  store.seed(T, {
+    status: 'stopped', endedAt: OLD_TS,
+    beforeOid, afterOid, beforeRef: beforeRef(T), afterRef: afterRef(T),
+    beforeReady: true, afterReady: true,
+    touched: [{ path: 'w.txt', op: 'write' }],
+  });
+  const deps = baseDeps(repo, store, realRunGit);
+  deps.readPromotedCheckpointRefs = () => [{
+    checkpointRef: afterRef(T), checkpointOid: afterOid,
+  }];
+
+  const result = await runRetentionPass(deps);
+
+  assert.equal(refOid(repo, beforeRef(T)), null, 'ordinary unpinned ref was pruned');
+  assert.equal(refOid(repo, afterRef(T)), afterOid, 'promoted-commit ref remains pinned');
+  assert.equal(store.rows.get(T)!.afterPrunedAt, null);
+  assert.equal(result.outcomes[0].action, 'pruned');
 });
 
 test('dense window: a recent turn is kept — no distill, no delete', async () => {

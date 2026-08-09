@@ -23,6 +23,7 @@ import * as path from 'node:path';
 
 import {
   CommitCoordinator,
+  deriveSnapshotTrailers,
   type CommitCoordinatorDeps,
   type CoordinatorTokenStore,
   type LiveReassembly,
@@ -95,6 +96,7 @@ interface SnapshotOptions {
   members: MemberSpec[];
   objectDatabaseKey?: string;
   associations?: CandidateTokenSnapshot['associations'];
+  witnessedProvenance?: CandidateTokenSnapshot['witnessedProvenance'];
 }
 
 function makeSnapshot(opts: SnapshotOptions): CandidateTokenSnapshot {
@@ -148,6 +150,7 @@ function makeSnapshot(opts: SnapshotOptions): CandidateTokenSnapshot {
     associations: opts.associations ?? [
       { planId: 'plan-x', planItemId: null, contributingTurnIds: ['turn-a', 'turn-b'], memberEntryIds: opts.members.map((m) => m.entryId) },
     ],
+    ...(opts.witnessedProvenance ? { witnessedProvenance: opts.witnessedProvenance } : {}),
   };
 }
 
@@ -357,6 +360,36 @@ test('production Save activity path atomically advances activity ref then origin
     `advance:${parent}:${committed}:refs/lares/activities/run-activity/head`,
     'promote:run-activity',
   ]);
+});
+
+test('trailer policy distinguishes witnessed agent work from claimed and adopted saves', () => {
+  const base = makeSnapshot({
+    members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }],
+  });
+  const witnessed = {
+    ...base,
+    witnessedProvenance: {
+      assistedBy: [{ provider: 'codex', model: 'gpt-5.6' }],
+      localCheckpointRefs: ['refs/lares/turns/ws/turn-a/after'],
+    },
+  } satisfies CandidateTokenSnapshot;
+  assert.ok(deriveSnapshotTrailers(witnessed).includes('Assisted-by: codex:gpt-5.6'));
+  assert.ok(deriveSnapshotTrailers(witnessed).includes(
+    'Lares-Checkpoint-Ref-Local: refs/lares/turns/ws/turn-a/after'));
+  assert.ok(!deriveSnapshotTrailers(witnessed, false).some((line) => line.startsWith('Assisted-by:')));
+
+  const claimed = {
+    ...base,
+    candidate: { ...base.candidate, selectedNamedSaveSetIds: ['claimed-save-set'] },
+    witnessedProvenance: { assistedBy: [], localCheckpointRefs: [] },
+  } satisfies CandidateTokenSnapshot;
+  const adopted = {
+    ...base,
+    associations: [],
+    witnessedProvenance: { assistedBy: [], localCheckpointRefs: [] },
+  } satisfies CandidateTokenSnapshot;
+  assert.ok(!deriveSnapshotTrailers(claimed).some((line) => line.startsWith('Assisted-by:')));
+  assert.ok(!deriveSnapshotTrailers(adopted).some((line) => line.startsWith('Assisted-by:')));
 });
 
 // ── Ordering / rejection layer ─────────────────────────────────────────────────
@@ -733,7 +766,13 @@ realTest('real commit lands exactly the selected path; the USER is the committer
   fs.writeFileSync(path.join(root, 'a.txt'), 'changed\n');
 
   const { spec } = await realMember(root, head, 'a.txt');
-  const snapshot = makeSnapshot({ candidateId: 'cand-real', pinnedHeadOid: head, members: [spec], objectDatabaseKey: `odb:${root}` });
+  const snapshot = makeSnapshot({
+    candidateId: 'cand-real', pinnedHeadOid: head, members: [spec], objectDatabaseKey: `odb:${root}`,
+    witnessedProvenance: {
+      assistedBy: [{ provider: 'codex', model: 'gpt-5.6' }],
+      localCheckpointRefs: ['refs/lares/turns/ws/turn-a/after'],
+    },
+  });
   const { coordinator, attempts, tokens } = realHarness(snapshot, root);
 
   const result = await coordinator.commit({ tokenId: 'tok-1', message: 'save a.txt' });
@@ -752,6 +791,9 @@ realTest('real commit lands exactly the selected path; the USER is the committer
   assert.match(body, /Lares-Candidate: cand-real/);
   assert.match(body, /Lares-Turn: turn-a/);
   assert.match(body, /Lares-Plan: plan-x/);
+  assert.match(body, /Assisted-by: codex:gpt-5\.6/);
+  assert.match(body, /Lares-Checkpoint-Ref-Local: refs\/lares\/turns\/ws\/turn-a\/after/);
+  assert.doesNotMatch(body, /agent-[0-9a-f-]+/i, 'internal agent UUIDs never enter the commit message');
   // only a.txt is in the commit's changeset; unrelated.txt untouched.
   const committedFile = git(root, ['show', `${newHead}:a.txt`]);
   assert.equal(committedFile, 'changed\n');

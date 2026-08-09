@@ -444,9 +444,13 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
   const ctx: CandidateBuildContext = {
     ...base, contractVersion: 2,
     intentUnits: [
-      { intentId: 'intent-a', kind: 'task', revision: 1, title: 'First task', planId: 'plan', planItemId: 'item-a', memberEntryIds: [shared.entryId] },
-      { intentId: 'intent-b', kind: 'task', revision: 1, title: 'Second task', planId: 'plan', planItemId: 'item-b', memberEntryIds: [shared.entryId] },
+      { intentId: 'intent-a', kind: 'task', revision: 1, title: 'First task', planId: 'plan', planItemId: 'item-a', memberEntryIds: [shared.entryId], contributingTurnIds: ['turn-a'] },
+      { intentId: 'intent-b', kind: 'task', revision: 1, title: 'Second task', planId: 'plan', planItemId: 'item-b', memberEntryIds: [shared.entryId], contributingTurnIds: ['turn-b'] },
     ],
+    witnessedProvenanceByTurnId: new Map([
+      ['turn-a', { assistedBy: [{ provider: 'codex', model: 'gpt-5.6' }], localCheckpointRefs: ['refs/lares/turn-a/after'] }],
+      ['turn-b', { assistedBy: [{ provider: 'claude', model: 'claude-opus-4-8' }], localCheckpointRefs: ['refs/lares/turn-b/after'] }],
+    ]),
     reviewChallengeAtoms: [atom],
     attributionResolutions: [{
       resolutionId: 'resolution-1', evidenceDigest: 'evidence-v1', resolution: 'commit-together',
@@ -463,6 +467,20 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
   assert.equal(minted.contractVersion, 2);
   assert.deepEqual(minted.saveIntentIds, ['intent-a', 'intent-b']);
   assert.ok(minted.token);
+  const witnessedSnapshot = service().resolveCandidateToken(minted.token!.tokenId);
+  // The minted token belongs to the service instance above; use a retained store
+  // to prove the UUID-free provenance rather than reconstructing it downstream.
+  const provenanceStore = service();
+  const provenanceMint = asCandidate(provenanceStore.mintCandidateTokenV2(
+    { ...request, resolutionIds: ['resolution-1'] }, ctx));
+  assert.deepEqual(provenanceStore.resolveCandidateToken(provenanceMint.token!.tokenId)?.witnessedProvenance, {
+    assistedBy: [
+      { provider: 'claude', model: 'claude-opus-4-8' },
+      { provider: 'codex', model: 'gpt-5.6' },
+    ],
+    localCheckpointRefs: ['refs/lares/turn-a/after', 'refs/lares/turn-b/after'],
+  });
+  assert.equal(witnessedSnapshot, null, 'tokens remain service-local');
   if (priorFlag === undefined) delete process.env.LARES_INTENT_PACKAGING;
   else process.env.LARES_INTENT_PACKAGING = priorFlag;
 }

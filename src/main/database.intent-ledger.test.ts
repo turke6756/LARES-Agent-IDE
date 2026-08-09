@@ -152,6 +152,24 @@ type DatabaseModule = typeof import('./database');
     assert.equal(db.getSaveIntent(first.id)?.state, 'committed');
     assert.equal(db.getAttributionResolution('resolution-1')?.consumedByCandidateId, 'candidate-1');
     assert.equal(db.getSaveIntentFinalization('finalization-1')?.lifecycleStatus, 'committed');
+    const turn = db.allocateAndInsertTurn(workspace.id, { id: 'turn-promoted' });
+    db.updateTurnRecord(turn.id, {
+      beforeRef: 'refs/lares/checkpoints/ws/turn-promoted/before', beforeOid: 'c'.repeat(40), beforeReady: true,
+      afterRef: 'refs/lares/checkpoints/ws/turn-promoted/after', afterOid: 'd'.repeat(40), afterReady: true,
+    });
+    db.upsertCommitTurnLink({
+      repositoryKey: 'activity-repo', commitOid: 'e'.repeat(40), turnId: turn.id,
+      planId: null, planItemId: null, relation: 'candidate_member', captureQuality: null,
+    });
+    const promoted = db.recordPromotedCheckpointRefs({
+      primaryRepositoryKey: repositoryKey, promotedCommitOid: 'f'.repeat(40),
+      sourceRepositoryKey: 'activity-repo', sourceCommitOids: ['e'.repeat(40)], createdAt: 6,
+    });
+    assert.deepEqual(promoted.map((row) => [row.edge, row.checkpointRef]), [
+      ['before', 'refs/lares/checkpoints/ws/turn-promoted/before'],
+      ['after', 'refs/lares/checkpoints/ws/turn-promoted/after'],
+    ]);
+    assert.equal(db.listPromotedCheckpointRefsForWorkspace(workspace.id).length, 2);
     console.log('database intent-ledger migration + transaction rollback: passed');
     db.closeDatabaseForTests();
   } finally {

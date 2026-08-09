@@ -46,6 +46,7 @@ import {
   getTurnRecord as dbGetTurnRecord,
   listCommitPathLinks as dbListCommitPathLinks,
   updateTurnRecord as dbUpdateTurnRecord,
+  listPromotedCheckpointRefsForWorkspace as dbListPromotedCheckpointRefsForWorkspace,
 } from '../database';
 import { runGit as realRunGit, runGitBytes as realRunGitBytes } from './git-command';
 import type { RunGitLike } from './checkpoint-service';
@@ -123,6 +124,11 @@ export interface RetentionDeps {
   /** Stage 3 supplies active finalization refs for the derived repository identity;
    *  absent in Stage 2. */
   activeBoundaryRefs?: (repositoryKey: string) => readonly string[] | Promise<readonly string[]>;
+  /** Promoted commits permanently pin these referenced local checkpoint refs. */
+  readPromotedCheckpointRefs?: (
+    workspaceId: string,
+  ) => readonly { checkpointRef: string; checkpointOid: string }[]
+    | Promise<readonly { checkpointRef: string; checkpointOid: string }[]>;
   /** Test seam for dirty inventory. Production uses the normative WP-1B producer. */
   enumerateDirtyEntries?: () => Promise<{ repositoryKey: string; entries: DirtyEntry[] }>;
   /** Test seam for exact WP-2G ledger protection. */
@@ -290,6 +296,25 @@ export async function runRetentionPass(deps: RetentionDeps): Promise<RetentionPa
   const cfg = resolveConfig(deps);
   const rows = cfg.turnStore.listTurnRecords(deps.workspaceId);
   const pinning = await prepareRetentionPins(cfg, rows);
+  try {
+    const promotedRefs = await cfg.readPromotedCheckpointRefs(deps.workspaceId);
+    const promotedKeys = new Set(promotedRefs.map((row) => liveEdgeKey(row.checkpointRef, row.checkpointOid)));
+    for (const row of rows) {
+      if (row.beforeRef && row.beforeOid && promotedKeys.has(liveEdgeKey(row.beforeRef, row.beforeOid))) {
+        pinning.retainedEdgeKeys.add(pinEdgeKey(row.id, 'before'));
+      }
+      if (row.afterRef && row.afterOid && promotedKeys.has(liveEdgeKey(row.afterRef, row.afterOid))) {
+        pinning.retainedEdgeKeys.add(pinEdgeKey(row.id, 'after'));
+      }
+    }
+  } catch (error) {
+    // Linkage uncertainty must never delete evidence that may already be promoted.
+    cfg.log.warn(`[retention] promoted-ref read failed; retaining all ready edges: ${describeError(error)}`);
+    for (const row of rows) {
+      if (row.beforeReady && row.beforeRef && row.beforeOid) pinning.retainedEdgeKeys.add(pinEdgeKey(row.id, 'before'));
+      if (row.afterReady && row.afterRef && row.afterOid) pinning.retainedEdgeKeys.add(pinEdgeKey(row.id, 'after'));
+    }
+  }
   const result: RetentionPassResult = {
     outcomes: [], distilled: 0, prunedTurns: 0, deleteFailures: 0,
     pinningWarning: pinning.warning,
@@ -374,6 +399,7 @@ interface ResolvedConfig {
   turnStore: RetentionTurnStore;
   workspacePrefix: string;
   activeBoundaryRefs: (repositoryKey: string) => readonly string[] | Promise<readonly string[]>;
+  readPromotedCheckpointRefs: NonNullable<RetentionDeps['readPromotedCheckpointRefs']>;
   enumerateDirtyEntries?: RetentionDeps['enumerateDirtyEntries'];
   readLocallyCommittedEntryIds?: RetentionDeps['readLocallyCommittedEntryIds'];
   now: () => number;
@@ -398,6 +424,8 @@ function resolveConfig(deps: RetentionDeps): ResolvedConfig {
     turnStore: deps.turnStore ?? DEFAULT_TURN_STORE,
     workspacePrefix: deps.workspacePrefix ?? '',
     activeBoundaryRefs: deps.activeBoundaryRefs ?? (() => []),
+    readPromotedCheckpointRefs: deps.readPromotedCheckpointRefs
+      ?? dbListPromotedCheckpointRefsForWorkspace,
     enumerateDirtyEntries: deps.enumerateDirtyEntries,
     readLocallyCommittedEntryIds: deps.readLocallyCommittedEntryIds,
     now: deps.now ?? Date.now,

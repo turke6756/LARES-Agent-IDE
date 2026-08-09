@@ -498,6 +498,12 @@ test('plan done resolver refuses unresolved members before calling checkpoint en
 
 test('production coordinator seams reassemble a minted snapshot from the shared resolver', async () => {
   const routes = createPreviewRoutes(baseDeps({
+    assembleInventory: async () => read({
+      witnessedProvenanceByTurnId: new Map([['t1', {
+        assistedBy: [{ provider: 'codex', model: 'gpt-5.6' }],
+        localCheckpointRefs: ['refs/lares/turns/ws/t1/after'],
+      }]]),
+    }),
     getPackageFinalization: (id) => (id === 'fin-1' ? finalization({
       memberManifestJson: JSON.stringify([{
         ...frozen('e1'),
@@ -529,11 +535,45 @@ test('production coordinator seams reassemble a minted snapshot from the shared 
   assert.equal(live.eligible, true);
   assert.deepEqual(live.members.map((member) => member.entryId), ['e1']);
   assert.deepEqual(routes.productionSeams.locateRepository(snapshot!), { repoRoot: '/repo', gitExe: 'git' });
-  assert.deepEqual(routes.productionSeams.deriveTrailers(snapshot!), [
+  assert.deepEqual(await routes.productionSeams.deriveTrailers(snapshot!), [
     `Lares-Candidate: ${minted.candidateId}`,
     'Lares-Turn: t1',
     'Lares-Plan: plan-A',
+    'Assisted-by: codex:gpt-5.6',
+    'Lares-Checkpoint-Ref-Local: refs/lares/turns/ws/t1/after',
   ]);
+});
+
+test('production trailer seam honors the per-repository Assisted-by opt-out', async () => {
+  const routes = createPreviewRoutes(baseDeps({
+    assembleInventory: async () => read({
+      witnessedProvenanceByTurnId: new Map([['t1', {
+        assistedBy: [{ provider: 'claude', model: 'claude-opus-4-8' }],
+        localCheckpointRefs: ['refs/lares/turns/ws/t1/after'],
+      }]]),
+    }),
+    getPackageFinalization: (id) => id === 'fin-1' ? finalization({
+      memberManifestJson: JSON.stringify([{ ...frozen('e1'), commitBlobOid: OID }]),
+    }) : null,
+    runGit: (async (_cwd, args) => {
+      if (args[0] === 'rev-parse') return { code: 0, stdout: 'a'.repeat(40) + '\n', stderr: '' };
+      if (args[0] === 'config') return { code: 0, stdout: 'false\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    }) as PreviewRoutesDeps['runGit'],
+  }));
+  const context = await routes.saveCardPreviewRoutes.resolvePreviewContext({
+    workspaceId: 'ws-1', selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [],
+    finalizationIds: ['fin-1'],
+  });
+  const minted = routes.productionSeams.candidateService.mintCandidateToken({
+    selectedComponentIds: ['c1'], selectedUnattributedEntryIds: [], finalizationIds: ['fin-1'],
+    acknowledgeUnattributedEntryIds: [],
+  }, context) as CommitCandidate;
+  assert.ok(minted.token, JSON.stringify(minted.eligibility));
+  const snapshot = routes.productionSeams.candidateService.resolveCandidateToken(minted.token!.tokenId)!;
+  const trailers = await routes.productionSeams.deriveTrailers(snapshot);
+  assert.ok(!trailers.some((line) => line.startsWith('Assisted-by:')));
+  assert.ok(trailers.includes('Lares-Checkpoint-Ref-Local: refs/lares/turns/ws/t1/after'));
 });
 
 test('production sweep seam reconstructs a durable intent from fresh route state', async () => {

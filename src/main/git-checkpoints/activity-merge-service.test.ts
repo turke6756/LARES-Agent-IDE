@@ -82,7 +82,9 @@ function activityCommit(f: ReturnType<typeof fixture>, mutate: () => void): stri
 
 test('scenario 5: compatible same-file activity promotion preserves unrelated primary dirt', async (t) => {
   const f = fixture(); t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
-  activityCommit(f, () => fs.writeFileSync(path.join(f.activity, 'shared.txt'), PLAN_SHARED));
+  const activityHead = activityCommit(f, () => fs.writeFileSync(path.join(f.activity, 'shared.txt'), PLAN_SHARED));
+  const recorded: Parameters<NonNullable<ActivityMergeStore['recordPromotedCheckpointRefs']>>[0][] = [];
+  f.store.recordPromotedCheckpointRefs = (input) => { recorded.push(input); return []; };
   fs.writeFileSync(path.join(f.primary, 'shared.txt'), MAIN_SHARED);
   git(f.primary, 'add', 'shared.txt'); git(f.primary, 'commit', '-m', 'other plan');
   fs.writeFileSync(path.join(f.primary, 'unrelated.txt'), 'human dirt\n');
@@ -94,6 +96,15 @@ test('scenario 5: compatible same-file activity promotion preserves unrelated pr
     `${BASE_LINES.map((line, index) => index === 0 ? 'MAIN ONE' : index === 39 ? 'PLAN FORTY' : line).join('\n')}\n`);
   assert.equal(fs.readFileSync(path.join(f.primary, 'unrelated.txt'), 'utf8'), 'human dirt\n');
   assert.equal(git(f.primary, 'rev-list', '--parents', '-n', '1', 'HEAD').split(' ').length, 3);
+  assert.deepEqual(recorded.map((row) => ({
+    primaryRepositoryKey: row.primaryRepositoryKey,
+    sourceRepositoryKey: row.sourceRepositoryKey,
+    sourceCommitOids: row.sourceCommitOids,
+  })), [{
+    primaryRepositoryKey: 'primary-key',
+    sourceRepositoryKey: 'activity-key',
+    sourceCommitOids: [activityHead],
+  }]);
 });
 
 test('scenario 6: incompatible plan commits persist exact conflicts and leave primary untouched', async (t) => {

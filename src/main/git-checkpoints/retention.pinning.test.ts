@@ -105,6 +105,7 @@ function deps(repo: string, store: Store, entries: DirtyEntry[]): RetentionDeps 
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     enumerateDirtyEntries: async () => ({ repositoryKey: 'repo-key', entries }),
     readLocallyCommittedEntryIds: async () => new Set(),
+    readPromotedCheckpointRefs: async () => [],
   };
 }
 

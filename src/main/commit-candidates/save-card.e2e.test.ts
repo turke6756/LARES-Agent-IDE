@@ -188,6 +188,9 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     const previewRoutes = createPreviewRoutes({
       gitExe, captureFinalizationBoundary, getWorkspaces: () => workspaces,
       readTurnWitnesses, readCaptureTurns: empty, readCommitPathLinks: empty,
+      readWitnessedProvenance: (_workspaceId, turnId) => turnId.startsWith('proposal-turn-')
+        ? { assistedBy: [{ provider: 'codex', model: 'gpt-5.6' }], localCheckpointRefs: [] }
+        : null,
       listRepoCommitPathLinks: empty, readTurnRecord: () => null,
       getPackageFinalization: (id) => persistence.getPackageFinalization(id),
       readActiveFinalizations,
@@ -330,6 +333,11 @@ function gitBytes(exe: string, repo: string, args: string[]): Buffer {
     assert.equal(consumed.kind, 'saved');
     const afterCount = Number(git(gitExe, repo, ['rev-list', '--count', 'HEAD']));
     assert.equal(afterCount - beforeCount, 1, 'exactly one commit lands');
+    const committedMessage = git(gitExe, repo, ['log', '-1', '--format=%B']);
+    assert.match(committedMessage, /Assisted-by: codex:gpt-5\.6/,
+      'the production mint → injected trailer seam → commit path emits witnessed attribution');
+    assert.doesNotMatch(committedMessage, /proposal-agent-/,
+      'internal dashboard agent ids never enter the shareable commit message');
 
     for (const [relative, expected] of pinned) {
       assert.deepEqual(fs.readFileSync(path.join(repo, relative)), expected, `${relative} worktree bytes stay pinned`);
