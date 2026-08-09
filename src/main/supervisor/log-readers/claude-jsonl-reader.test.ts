@@ -46,6 +46,54 @@ function writeFixture(lines: object[]): string {
   return tmpPath;
 }
 
+test('Claude 2.1.225 real-schema shell results preserve tool names, command input, and is_error', () => {
+  // Sanitized from real ~/.claude/projects JSONLs produced by Claude Code
+  // 2.1.225. This pins the envelope that feeds ContextStatsMonitor: assistant
+  // tool_use blocks followed by user tool_result blocks paired by tool_use_id.
+  const tmpPath = writeFixture([
+    {
+      type: 'assistant', uuid: 'shell-use', timestamp: '2026-08-08T12:00:00.000Z', version: '2.1.225',
+      message: {
+        model: 'claude-opus-4-1', stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'toolu_bash', name: 'Bash', input: { command: 'head -60 src/main.ts' } }],
+      },
+    },
+    {
+      type: 'user', uuid: 'shell-result', timestamp: '2026-08-08T12:00:01.000Z', version: '2.1.225',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bash', content: 'first sixty lines', is_error: false }] },
+    },
+    {
+      type: 'assistant', uuid: 'ps-use', timestamp: '2026-08-08T12:00:02.000Z', version: '2.1.225',
+      message: {
+        model: 'claude-opus-4-1', stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'toolu_ps', name: 'PowerShell', input: { command: "Set-Content -LiteralPath 'out.txt' -Value 'x'" } }],
+      },
+    },
+    {
+      type: 'user', uuid: 'ps-result', timestamp: '2026-08-08T12:00:03.000Z', version: '2.1.225',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_ps', content: 'Exit code 1', is_error: true }] },
+    },
+  ]);
+  try {
+    const events = makeReader(tmpPath).pollSession(makeSession());
+    const bashUse = events.find(e => e.type === 'tool-use' && e.toolUseId === 'toolu_bash');
+    const bashResult = events.find(e => e.type === 'tool-result' && e.toolUseId === 'toolu_bash');
+    const psUse = events.find(e => e.type === 'tool-use' && e.toolUseId === 'toolu_ps');
+    const psResult = events.find(e => e.type === 'tool-result' && e.toolUseId === 'toolu_ps');
+    assert.ok(bashUse && bashUse.type === 'tool-use');
+    assert.equal(bashUse.toolName, 'Bash');
+    assert.deepEqual(bashUse.input, { command: 'head -60 src/main.ts' });
+    assert.ok(bashResult && bashResult.type === 'tool-result');
+    assert.equal(bashResult.isError, false);
+    assert.ok(psUse && psUse.type === 'tool-use');
+    assert.equal(psUse.toolName, 'PowerShell');
+    assert.ok(psResult && psResult.type === 'tool-result');
+    assert.equal(psResult.isError, true, 'block.is_error is preserved for the monitor success gate');
+  } finally {
+    fs.unlinkSync(tmpPath);
+  }
+});
+
 // ── /clear-rotation fixtures (validateClearSuccessor + EOF stale signal) ──
 //
 // validateClearSuccessor resolves base dirs via getWindowsProjectsDir() /

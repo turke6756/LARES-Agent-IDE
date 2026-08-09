@@ -56,11 +56,18 @@ const TOOL_MAP: Record<string, FileOperation> = {
 };
 
 const SHELL_TOOL_NAMES = new Set([
+  'Bash', // Claude Code
+  'PowerShell', // Claude Code (Windows-native shell tool)
   'shell_command', // Codex (legacy/current function-call spelling)
   'shell', // Codex (newer builds)
   'run_terminal_command', // Grok Build
   'run_command', // Antigravity
 ]);
+
+// Deliberately excluded: Claude's command-bearing `Monitor` tool returns an
+// immediate "Monitor started" tool_result, before the spawned command reaches
+// a terminal success/error state. Treating that result as completion would
+// bypass the success gate and attribute reads/writes from failed monitors.
 
 export class ContextStatsMonitor extends EventEmitter {
   private stats = new Map<string, ContextStats>();

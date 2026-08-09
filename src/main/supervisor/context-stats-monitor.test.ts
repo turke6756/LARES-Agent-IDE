@@ -130,6 +130,78 @@ test('newer Codex shell alias captures file activity', () => {
   ]);
 });
 
+// Claude Code 2.1.225/2.1.220/2.1.217 shapes below are sanitized from real
+// ~/.claude/projects/**/*.jsonl tool_use/tool_result pairs. Claude supplies no
+// per-call cwd field for these tools, so the monitor must use the agent's
+// frozen launch workspace root.
+test('Claude Bash cat/head reads capture only after a successful paired result', () => {
+  const { reader, emitted } = makeHarness('C:\\repo');
+  reader.emit('tool-use', toolUse('Bash', { command: 'cat src/a.ts' }, 'bash-cat'));
+  reader.emit('tool-use', toolUse('Bash', { command: 'head -n 60 src/b.ts' }, 'bash-head'));
+  assert.deepEqual(emitted, [], 'tool uses remain pending until their results');
+  reader.emit('tool-result', toolResult('bash-cat', 'file contents'));
+  reader.emit('tool-result', toolResult('bash-head', 'first sixty lines'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\repo\\src\\a.ts', operation: 'read' },
+    { agentId: 'agent-1', filePath: 'C:\\repo\\src\\b.ts', operation: 'read' },
+  ]);
+});
+
+test('Claude Bash redirection captures a write using the frozen workspace root', () => {
+  const { reader, emitted } = makeHarness('C:\\repo');
+  reader.emit('tool-use', toolUse(
+    'Bash',
+    { command: 'printf "captured\\n" > reports/bash-output.txt' },
+    'bash-write',
+  ));
+  reader.emit('tool-result', toolResult('bash-write', ''));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\repo\\reports\\bash-output.txt', operation: 'create' },
+  ]);
+});
+
+test('Claude PowerShell Set-Content and first-stage Out-File capture writes', () => {
+  const { reader, emitted } = makeHarness('C:\\repo');
+  reader.emit('tool-use', toolUse(
+    'PowerShell',
+    { command: "Set-Content -LiteralPath 'reports/a.txt' -Value 'updated'" },
+    'ps-set',
+  ));
+  reader.emit('tool-result', toolResult('ps-set', ''));
+  reader.emit('tool-use', toolUse(
+    'PowerShell',
+    { command: "Out-File -FilePath 'reports/b.txt' -InputObject 'captured'" },
+    'ps-out',
+  ));
+  reader.emit('tool-result', toolResult('ps-out', ''));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\repo\\reports\\a.txt', operation: 'write' },
+    { agentId: 'agent-1', filePath: 'C:\\repo\\reports\\b.txt', operation: 'create' },
+  ]);
+});
+
+test('Claude is_error result drops pending Bash activity even without a parseable exit-code prefix', () => {
+  const { reader, emitted } = makeHarness('C:\\repo');
+  reader.emit('tool-use', toolUse('Bash', { command: 'cat src/missing.ts' }, 'bash-failed'));
+  reader.emit('tool-result', toolResult('bash-failed', 'Exit code 1\ncat: file not found', true));
+  assert.deepEqual(emitted, []);
+});
+
+test('Claude Monitor and non-command tools stay ignored', () => {
+  const { reader, emitted } = makeHarness('C:\\repo');
+  reader.emit('tool-use', toolUse(
+    'Monitor',
+    { command: 'cat reports/eventual.txt', timeout_ms: 600000, persistent: false },
+    'monitor-start',
+  ));
+  reader.emit('tool-result', toolResult(
+    'monitor-start',
+    'Monitor started (task sanitized, timeout 600000ms).',
+  ));
+  reader.emit('tool-use', toolUse('ToolSearch', { query: 'select:Read' }, 'non-command'));
+  assert.deepEqual(emitted, []);
+});
+
 test('unknown tool is still dropped', () => {
   const { reader, emitted } = makeHarness();
   reader.emit('tool-use', toolUse('unknown_file_tool', { file_path: 'src/ignored.ts' }));
