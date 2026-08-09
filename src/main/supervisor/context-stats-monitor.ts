@@ -4,7 +4,8 @@ import { ContextStats, FileOperation } from '../../shared/types';
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, getContextWindowForModel } from '../../shared/constants';
 import type { UsageEvent, ToolUseEvent, ToolResultEvent } from '../../shared/session-events';
 import { SessionLogReader } from './session-log-reader';
-import { parseShellCommand, parseApplyPatch, shellResultIndicatesSuccess, type ParsedShellActivity } from './codex-shell-parser';
+import { parseShellCommand, parseApplyPatch, type ParsedShellActivity } from './codex-shell-parser';
+import { parseCodexExecCalls, classifyExecOutcome } from './log-readers/codex-exec-call-parser';
 
 export interface JsonlFileActivity {
   agentId: string;
@@ -29,6 +30,12 @@ export interface ContextStatsPersistence {
 const SEEN_UUID_MAX = 6000;
 const SEEN_FILES_MAX = 6000;
 const PENDING_SHELL_MAX = 6000;
+// Codex 0.144+ `exec`/`wait` correlation (see codex-exec-call-parser.ts): an
+// exec whose script keeps running reports a "cell ID"; its real result arrives
+// later through a `wait(cell_id)` call. These bound the two extra maps that hold
+// activity awaiting a deferred cell result and the wait-call → cell-id links.
+const PENDING_CELL_MAX = 6000;
+const WAIT_CALL_MAX = 6000;
 
 const TOOL_MAP: Record<string, FileOperation> = {
   // Claude
@@ -67,7 +74,17 @@ export class ContextStatsMonitor extends EventEmitter {
   private seenFiles = new Map<string, Set<string>>(); // per agentId
   // Codex shell-command activity is parsed at tool-use time but only emitted
   // once the matching tool-result confirms success. Keyed `${agentId}:${toolUseId}`.
+  // Codex 0.144+ `exec` activity is also parked here keyed by the exec's own
+  // call_id; on its immediate result it either captures (success), drops
+  // (failure), or — when the exec deferred to a cell — moves to
+  // `pendingCellActivity` to await the matching `wait` result.
   private pendingShellActivity = new Map<string, ParsedShellActivity[]>();
+  // Deferred Codex exec activity, keyed `${agentId}:${cellId}`. Resolved when a
+  // `wait(cell_id)` tool-result arrives (see handleToolResult).
+  private pendingCellActivity = new Map<string, ParsedShellActivity[]>();
+  // `wait` tool-use call_id → cell_id, keyed `${agentId}:${waitToolUseId}`, so
+  // the wait's tool-result can be routed back to the deferred cell it polled.
+  private waitCallToCell = new Map<string, string>();
   private reader: SessionLogReader;
   private started = false;
   // Fix rec-4: resolves an agent's FROZEN launch workspace root so relative
@@ -134,7 +151,10 @@ export class ContextStatsMonitor extends EventEmitter {
       statsAgents: this.stats.size,
       seenUuidEntries,
       seenFileEntries,
-      pendingShellActivity: this.pendingShellActivity.size,
+      // Includes the Codex exec/wait deferral maps so all pending-family growth
+      // stays visible on the one memory gauge.
+      pendingShellActivity:
+        this.pendingShellActivity.size + this.pendingCellActivity.size + this.waitCallToCell.size,
     };
   }
 
@@ -169,6 +189,12 @@ export class ContextStatsMonitor extends EventEmitter {
     const prefix = `${agentId}:`;
     for (const key of this.pendingShellActivity.keys()) {
       if (key.startsWith(prefix)) this.pendingShellActivity.delete(key);
+    }
+    for (const key of this.pendingCellActivity.keys()) {
+      if (key.startsWith(prefix)) this.pendingCellActivity.delete(key);
+    }
+    for (const key of this.waitCallToCell.keys()) {
+      if (key.startsWith(prefix)) this.waitCallToCell.delete(key);
     }
   }
 
@@ -257,6 +283,30 @@ export class ContextStatsMonitor extends EventEmitter {
   };
 
   private handleToolUse = (e: ToolUseEvent): void => {
+    // Codex 0.144+ `exec` — the tool input is JavaScript source that calls
+    // nested `tools.shell_command({…})` / `tools.apply_patch(…)`. Parse the
+    // literal nested calls (never eval) and stash their file activity under the
+    // exec's own call_id; it is captured/dropped/deferred on the exec result.
+    if (e.toolName === 'exec') {
+      this.handleCodexExec(e);
+      return;
+    }
+    // Codex 0.144+ `wait(cell_id)` — remember which deferred cell this wait call
+    // polls so its tool-result can resolve the parked activity.
+    if (e.toolName === 'wait') {
+      const input = e.input as { cell_id?: unknown } | null | undefined;
+      const cellId = input && input.cell_id != null ? String(input.cell_id) : null;
+      if (cellId) {
+        this.waitCallToCell.set(`${e.agentId}:${e.toolUseId}`, cellId);
+        while (this.waitCallToCell.size > WAIT_CALL_MAX) {
+          const oldest = this.waitCallToCell.keys().next().value;
+          if (oldest === undefined) break;
+          this.waitCallToCell.delete(oldest);
+        }
+      }
+      return;
+    }
+
     // Provider shell tools / Codex apply_patch — parse the command string for
     // file-touch shapes; stash by toolUseId and emit on successful tool-result.
     if (SHELL_TOOL_NAMES.has(e.toolName) || e.toolName === 'apply_patch') {
@@ -343,16 +393,83 @@ export class ContextStatsMonitor extends EventEmitter {
     this.emit('fileActivity', { agentId, filePath, operation } as JsonlFileActivity);
   }
 
+  /**
+   * Codex 0.144+ `exec`: parse the JS payload for literal nested
+   * `tools.shell_command({…})` / `tools.apply_patch(…)` calls (never eval),
+   * reuse the existing shell/patch parsers on each, and park the resulting
+   * activity under the exec's own call_id awaiting its tool-result.
+   */
+  private handleCodexExec(e: ToolUseEvent): void {
+    const source = typeof e.input === 'string' ? e.input : null;
+    if (!source) return;
+    const { calls } = parseCodexExecCalls(source);
+    if (calls.length === 0) return;
+
+    const fallbackWorkdir = this.resolveWorkspaceRoot?.(e.agentId) ?? '';
+    // apply_patch calls carry no workdir; borrow a sibling shell_command's
+    // literal workdir when present (nested calls share the exec's cwd), else
+    // fall back to the agent's frozen workspace root.
+    const siblingWorkdir =
+      calls.find((c): c is Extract<typeof c, { kind: 'shell_command' }> =>
+        c.kind === 'shell_command' && !!c.workdir)?.workdir ?? null;
+
+    const activities: ParsedShellActivity[] = [];
+    for (const call of calls) {
+      if (call.kind === 'shell_command') {
+        activities.push(...parseShellCommand(call.command, call.workdir || fallbackWorkdir));
+      } else {
+        activities.push(...parseApplyPatch(call.patch, call.workdir || siblingWorkdir || fallbackWorkdir));
+      }
+    }
+    if (activities.length === 0) return;
+
+    this.pendingShellActivity.set(`${e.agentId}:${e.toolUseId}`, activities);
+    while (this.pendingShellActivity.size > PENDING_SHELL_MAX) {
+      const oldest = this.pendingShellActivity.keys().next().value;
+      if (oldest === undefined) break;
+      this.pendingShellActivity.delete(oldest);
+    }
+  }
+
   private handleToolResult = (e: ToolResultEvent): void => {
     const key = `${e.agentId}:${e.toolUseId}`;
+
+    // Case 1: a shell/apply_patch/exec result paired directly by call_id.
     const pending = this.pendingShellActivity.get(key);
-    if (!pending) return;
-    this.pendingShellActivity.delete(key);
+    if (pending) {
+      this.pendingShellActivity.delete(key);
+      const outcome = classifyExecOutcome(e.content);
+      if (outcome.kind === 'deferred') {
+        // A Codex exec that kept running: its real result arrives later via
+        // wait(cell_id). Park the activity under the cell until then.
+        const cellKey = `${e.agentId}:${outcome.cellId}`;
+        this.pendingCellActivity.set(cellKey, pending);
+        while (this.pendingCellActivity.size > PENDING_CELL_MAX) {
+          const oldest = this.pendingCellActivity.keys().next().value;
+          if (oldest === undefined) break;
+          this.pendingCellActivity.delete(oldest);
+        }
+        return;
+      }
+      if (e.isError || outcome.kind === 'failure') return;
+      for (const a of pending) {
+        this.captureFileActivity(e.agentId, a.filePath, a.operation, e.toolUseId);
+      }
+      return;
+    }
 
-    if (e.isError) return;
-    if (!shellResultIndicatesSuccess(e.content)) return;
-
-    for (const a of pending) {
+    // Case 2: a `wait(cell_id)` result resolving a deferred Codex exec cell.
+    const cellId = this.waitCallToCell.get(key);
+    if (cellId === undefined) return;
+    this.waitCallToCell.delete(key);
+    const cellKey = `${e.agentId}:${cellId}`;
+    const cellPending = this.pendingCellActivity.get(cellKey);
+    if (!cellPending) return;
+    const outcome = classifyExecOutcome(e.content);
+    if (outcome.kind === 'deferred') return; // still running — a later wait resolves it
+    this.pendingCellActivity.delete(cellKey);
+    if (e.isError || outcome.kind === 'failure') return;
+    for (const a of cellPending) {
       this.captureFileActivity(e.agentId, a.filePath, a.operation, e.toolUseId);
     }
   };

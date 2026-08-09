@@ -13,9 +13,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { CodexRolloutReader, extractSessionIdFromFilename } from './codex-rollout-reader';
+import { ContextStatsMonitor, type JsonlFileActivity } from '../context-stats-monitor';
 import type { ChatLogReaderSession } from './types';
-import type { SessionEvent } from '../../../shared/session-events';
+import type { SessionEvent, ToolUseEvent, ToolResultEvent } from '../../../shared/session-events';
 
 function findRepoRoot(start: string): string {
   let dir = start;
@@ -31,6 +33,8 @@ function findRepoRoot(start: string): string {
 const REPO_ROOT = findRepoRoot(__dirname);
 const FIXTURE_PATH = path.join(REPO_ROOT, 'src', 'main', 'supervisor', 'log-readers', '__fixtures__', 'codex-rollout-sample.jsonl');
 const FIXTURE_SESSION_ID = '019de40d-ec5a-7253-87d3-7062ab223fff';
+const EXEC_WAIT_FIXTURE = path.join(REPO_ROOT, 'src', 'main', 'supervisor', 'log-readers', '__fixtures__', 'codex-exec-wait-sample.jsonl');
+const EXEC_WAIT_SESSION_ID = '019fbeef-0000-7000-8000-0000000000ab';
 
 if (!fs.existsSync(FIXTURE_PATH)) {
   console.error(`FIXTURE_PATH does not exist: ${FIXTURE_PATH}`);
@@ -1045,6 +1049,80 @@ test('P2: readSessionEventsOnce does not advance tail offsets (no subscription/o
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ── Codex 0.144+ exec/wait emission + end-to-end capture (WP-CAP-CODEX-EXEC) ──
+
+function makeExecWaitReader(): CodexRolloutReader {
+  return new (class extends CodexRolloutReader {
+    constructor() {
+      super();
+      (this as any).resolvedPaths.set('exec-agent', EXEC_WAIT_FIXTURE);
+    }
+  })();
+}
+
+function pollExecWait(reader: CodexRolloutReader): SessionEvent[] {
+  return reader.pollSession({
+    agentId: 'exec-agent',
+    sessionId: EXEC_WAIT_SESSION_ID,
+    workingDirectory: 'C:\\ws\\codex',
+    provider: 'codex',
+    subscribed: true,
+  });
+}
+
+test('exec/wait fixture: reader emits exec tool-use with the raw JS source as input', () => {
+  const events = pollExecWait(makeExecWaitReader());
+  const toolUses = events.filter((e): e is ToolUseEvent => e.type === 'tool-use');
+  const execA = toolUses.find((e) => e.toolUseId === 'call_A');
+  assert.ok(execA, 'exec call_A tool-use emitted');
+  assert.equal(execA!.toolName, 'exec');
+  // Codex exec input is JS source — NOT JSON — so the reader must leave it a
+  // string (JSON.parse fails and falls through). The monitor depends on this.
+  assert.equal(typeof execA!.input, 'string', 'exec input passed through as raw JS string');
+  assert.ok((execA!.input as string).includes('tools.shell_command'));
+});
+
+test('exec/wait fixture: reader emits wait tool-use with parsed {cell_id} input', () => {
+  const events = pollExecWait(makeExecWaitReader());
+  const toolUses = events.filter((e): e is ToolUseEvent => e.type === 'tool-use');
+  const wait = toolUses.find((e) => e.toolName === 'wait');
+  assert.ok(wait, 'wait tool-use emitted');
+  assert.equal((wait!.input as any).cell_id, '7');
+  // The deferred exec result and the wait result land on different call_ids.
+  const results = events.filter((e): e is ToolResultEvent => e.type === 'tool-result');
+  assert.ok(results.some((r) => r.toolUseId === 'call_D'), 'deferred exec output on call_D');
+  assert.ok(results.some((r) => r.toolUseId === 'call_W'), 'wait output on call_W');
+});
+
+test('exec/wait fixture: end-to-end reader → ContextStatsMonitor captures nested file activity', () => {
+  const reader = makeExecWaitReader();
+  const events = pollExecWait(reader);
+
+  // Wire a real monitor to a fake reader emitter, then pump the reader's events
+  // through exactly as the dispatcher would (tool-use / tool-result channels).
+  const bus = new (class extends EventEmitter { pollNow(): void {} })();
+  const monitor = new ContextStatsMonitor(bus as any, () => 'C:\\ws');
+  const emitted: JsonlFileActivity[] = [];
+  monitor.on('fileActivity', (a) => emitted.push(a));
+  monitor.start();
+
+  for (const e of events) {
+    if (e.type === 'tool-use') bus.emit('tool-use', e);
+    else if (e.type === 'tool-result') bus.emit('tool-result', e);
+  }
+
+  const keys = emitted.map((a) => `${a.operation}:${a.filePath}`).sort();
+  assert.deepEqual(keys, [
+    'read:C:\\ws\\src\\a.ts',   // single shell_command read
+    'read:C:\\ws\\src\\c1.ts',  // Promise.all read #1
+    'read:C:\\ws\\src\\c2.ts',  // Promise.all read #2
+    'write:C:\\ws\\src\\b.ts',  // apply_patch(const patch) write
+    'write:C:\\ws\\src\\d.ts',  // deferred write resolved via wait(7)
+  ].sort());
+  // f.ts (failed exec) and the dynamic getCmd() exec produce nothing.
+  assert.ok(!keys.some((k) => k.includes('f.ts')), 'failed exec dropped');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────

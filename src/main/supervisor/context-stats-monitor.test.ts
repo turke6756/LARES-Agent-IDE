@@ -201,6 +201,110 @@ test('failed apply_patch result drops pending activity', () => {
   assert.deepEqual(emitted, []);
 });
 
+// ── Codex 0.144+ exec / wait capture (WP-CAP-CODEX-EXEC) ────────────────
+// Codex 0.146 emits `custom_tool_call/exec` (JS source calling nested
+// tools.shell_command/apply_patch) + `function_call/wait`. Shapes below mirror
+// the sanitized fixture __fixtures__/codex-exec-wait-sample.jsonl.
+
+function execUse(id: string, jsSource: string): ToolUseEvent {
+  return toolUse('exec', jsSource, id);
+}
+
+test('exec with a single nested shell_command captures on success', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const r = await tools.shell_command({command:"Get-Content -Raw 'C:\\\\ws\\\\src\\\\a.ts'","workdir":"C:\\\\ws\\\\codex"});\ntext(r);\n`;
+  reader.emit('tool-use', execUse('call_A', src));
+  assert.equal(emitted.length, 0, 'exec tool-use only stashes pending activity');
+  reader.emit('tool-result', toolResult('call_A', 'Script completed\nOutput:\nExit code: 0\nOutput:\ncontents'));
+  assert.deepEqual(emitted, [{ agentId: 'agent-1', filePath: 'C:\\ws\\src\\a.ts', operation: 'read' }]);
+});
+
+test('exec with apply_patch(const patch) captures a write on success', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const patch = "*** Begin Patch\\n*** Update File: src/b.ts\\n@@\\n-old\\n+new\\n*** End Patch";\ntext(await tools.apply_patch(patch));\n`;
+  reader.emit('tool-use', execUse('call_B', src));
+  reader.emit('tool-result', toolResult('call_B', 'Script completed\nOutput:\nSuccess. Updated the following files:\nM src/b.ts'));
+  assert.deepEqual(emitted, [{ agentId: 'agent-1', filePath: 'C:\\ws\\src\\b.ts', operation: 'write' }]);
+});
+
+test('exec with Promise.all of two shell reads captures both', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const results = await Promise.all([\n  tools.shell_command({command:"Get-Content -Raw 'C:\\\\ws\\\\src\\\\c1.ts'",workdir:"C:\\\\ws\\\\codex"}),\n  tools.shell_command({command:"Get-Content -Raw 'C:\\\\ws\\\\src\\\\c2.ts'",workdir:"C:\\\\ws\\\\codex"})\n]);\nfor (const x of results) text(x);\n`;
+  reader.emit('tool-use', execUse('call_C', src));
+  reader.emit('tool-result', toolResult('call_C', 'Script completed\nOutput:\nExit code: 0\nOutput:\nc1\nExit code: 0\nOutput:\nc2'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\ws\\src\\c1.ts', operation: 'read' },
+    { agentId: 'agent-1', filePath: 'C:\\ws\\src\\c2.ts', operation: 'read' },
+  ]);
+});
+
+test('deferred exec (cell) is resolved by the matching wait result, not the exec output', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const r = await tools.shell_command({command:"Set-Content -LiteralPath 'C:\\\\ws\\\\src\\\\d.ts' -Value 'x'","workdir":"C:\\\\ws\\\\codex"});\ntext(r);\n`;
+  reader.emit('tool-use', execUse('call_D', src));
+  // The exec output says it kept running — MUST NOT capture yet (audit false-positive trap).
+  reader.emit('tool-result', toolResult('call_D', 'Script running with cell ID 7\nWall time 10.0 seconds\nOutput:\n'));
+  assert.equal(emitted.length, 0, 'deferred exec output must not capture');
+  // The wait call polls cell 7; its result resolves the pending activity.
+  reader.emit('tool-use', toolUse('wait', { cell_id: '7', yield_time_ms: 10000 }, 'call_W'));
+  reader.emit('tool-result', toolResult('call_W', 'Script completed\nOutput:\nExit code: 0\nOutput:\n'));
+  assert.deepEqual(emitted, [{ agentId: 'agent-1', filePath: 'C:\\ws\\src\\d.ts', operation: 'write' }]);
+});
+
+test('deferred exec still running after first wait, resolved by a later wait', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const r = await tools.shell_command({command:"Set-Content -LiteralPath 'C:\\\\ws\\\\src\\\\e.ts' -Value 'x'","workdir":"C:\\\\ws\\\\codex"});\ntext(r);\n`;
+  reader.emit('tool-use', execUse('call_E', src));
+  reader.emit('tool-result', toolResult('call_E', 'Script running with cell ID 9\nOutput:\n'));
+  // First wait: still running → keep pending, no capture.
+  reader.emit('tool-use', toolUse('wait', { cell_id: '9' }, 'call_W1'));
+  reader.emit('tool-result', toolResult('call_W1', 'Script running with cell ID 9\nOutput:\n'));
+  assert.equal(emitted.length, 0, 'still-running wait must not capture or drop');
+  // Second wait: completes.
+  reader.emit('tool-use', toolUse('wait', { cell_id: '9' }, 'call_W2'));
+  reader.emit('tool-result', toolResult('call_W2', 'Script completed\nOutput:\nExit code: 0\nOutput:\n'));
+  assert.deepEqual(emitted, [{ agentId: 'agent-1', filePath: 'C:\\ws\\src\\e.ts', operation: 'write' }]);
+});
+
+test('failed exec (nonzero nested exit) drops all pending activity', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const r = await tools.shell_command({command:"Get-Content -Raw 'C:\\\\ws\\\\src\\\\f.ts'","workdir":"C:\\\\ws\\\\codex"});\ntext(r);\n`;
+  reader.emit('tool-use', execUse('call_F', src));
+  reader.emit('tool-result', toolResult('call_F', 'Script failed\nOutput:\nExit code: 1\nnot found'));
+  assert.deepEqual(emitted, []);
+});
+
+test('exec with only dynamic/computed calls captures nothing and does not crash', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const c = getCmd();\nconst r = await tools.shell_command({command:c});\ntext(r);\n`;
+  reader.emit('tool-use', execUse('call_G', src));
+  reader.emit('tool-result', toolResult('call_G', 'Script completed\nOutput:\nExit code: 0\nOutput:\n'));
+  assert.deepEqual(emitted, []);
+});
+
+test('replaying the SAME exec tool-use id does not double-capture', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const r = await tools.shell_command({command:"cat a.ts",workdir:"C:\\\\ws"});\n`;
+  reader.emit('tool-use', execUse('dup', src));
+  reader.emit('tool-result', toolResult('dup', 'Script completed\nExit code: 0\n'));
+  reader.emit('tool-use', execUse('dup', src)); // replay
+  reader.emit('tool-result', toolResult('dup', 'Script completed\nExit code: 0\n'));
+  assert.deepEqual(emitted, [{ agentId: 'agent-1', filePath: 'C:\\ws\\a.ts', operation: 'read' }]);
+});
+
+test('invalidateAgent clears deferred cell + wait maps for the agent', () => {
+  const { reader, monitor } = makeHarness('C:\\ws');
+  const src = `const r = await tools.shell_command({command:"Set-Content -LiteralPath 'C:\\\\ws\\\\x.ts' -Value 'y'",workdir:"C:\\\\ws"});\n`;
+  reader.emit('tool-use', execUse('call_X', src));
+  reader.emit('tool-result', toolResult('call_X', 'Script running with cell ID 3\nOutput:\n'));
+  reader.emit('tool-use', toolUse('wait', { cell_id: '3' }, 'call_WX'));
+  assert.equal((monitor as any).pendingCellActivity.has('agent-1:3'), true, 'pre: cell pending');
+  assert.equal((monitor as any).waitCallToCell.has('agent-1:call_WX'), true, 'pre: wait link');
+  monitor.invalidateAgent('agent-1');
+  assert.equal((monitor as any).pendingCellActivity.has('agent-1:3'), false, 'cell pending cleared');
+  assert.equal((monitor as any).waitCallToCell.has('agent-1:call_WX'), false, 'wait link cleared');
+});
+
 // ── BUG-26 Layer 3: invalidateAgent ────────────────────────────────────
 
 function makeUsage(agentId: string, sessionId: string, overrides: Partial<UsageEvent> = {}): UsageEvent {
