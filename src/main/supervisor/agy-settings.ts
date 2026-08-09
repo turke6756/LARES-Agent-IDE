@@ -29,6 +29,16 @@ export const AGY_GIT_DISCARD_DENY_RULES = [
 
 const AGY_GIT_DISCARD_DENY_RULE_SET = new Set<string>(AGY_GIT_DISCARD_DENY_RULES);
 
+/** Agy's native file permission spelling. Directory grants are recursive; do
+ * not append a glob (Windows agy rejects path globs). On Windows 1.1.x these
+ * grants guide the native write_file tool but the terminal sandbox is not an OS
+ * boundary. Shell commands, especially chained commands, can bypass both this
+ * grant and the deny regexes below. */
+export function agyWriteGrant(dir: string, pathType: string, home?: string): string | null {
+  const key = agyTrustPathKey(dir, pathType, home);
+  return key ? `write_file(${key})` : null;
+}
+
 export type AgySettingsMerge =
   | { action: 'write'; content: string }
   | { action: 'unchanged' }
@@ -94,14 +104,20 @@ export function mergeAgyTrust(existing: string | null, keys: string[]): AgySetti
   return { action: 'write', content: `${JSON.stringify(parsed.root, null, 2)}\n` };
 }
 
-/** Add only the fixed, reviewed git-discard deny set and remove the known-broken
- * stash lookahead rule. The optional argument is
+/** Add only the fixed, reviewed git-discard deny set, native write_file grants,
+ * and remove the known-broken stash lookahead rule. Agy deny regexes are a
+ * single heuristic layer and do not protect against arbitrary shell chaining.
+ * The optional argument is
  * a testable safety seam: any unreviewed/broad pattern is refused wholesale.
- * permissions.allow and permissions.ask are never assigned or normalized. */
+ * Foreign permissions.allow and permissions.ask entries are never normalized. */
 export function mergeAgyPermissions(
   existing: string | null,
   rules: readonly string[] = AGY_GIT_DISCARD_DENY_RULES,
+  writeGrants: readonly string[] = [],
 ): AgySettingsMerge {
+  if (writeGrants.some(grant => !/^write_file\([A-Za-z]:\\[^*?]+\)$/.test(grant))) {
+    return { action: 'invalid', reason: 'write grant is not a concrete absolute Windows directory' };
+  }
   if (rules.some(rule => !AGY_GIT_DISCARD_DENY_RULE_SET.has(rule))) {
     return { action: 'invalid', reason: 'deny seed contains an unreviewed or unsafe broad pattern' };
   }
@@ -115,6 +131,19 @@ export function mergeAgyPermissions(
     return { action: 'invalid', reason: 'permissions must be a JSON object' };
   }
   const permissions = (currentPermissions ?? {}) as Record<string, unknown>;
+  const currentAllow = permissions.allow;
+  if (currentAllow !== undefined && !Array.isArray(currentAllow)) {
+    return { action: 'invalid', reason: 'permissions.allow must be an array' };
+  }
+  const allow = [...((currentAllow ?? []) as unknown[])];
+  const allowPresent = new Set(allow);
+  let changed = false;
+  for (const grant of writeGrants) {
+    if (allowPresent.has(grant)) continue;
+    allow.push(grant);
+    allowPresent.add(grant);
+    changed = true;
+  }
   const currentDeny = permissions.deny;
   if (currentDeny !== undefined && (!Array.isArray(currentDeny) || currentDeny.some(v => typeof v !== 'string'))) {
     return { action: 'invalid', reason: 'permissions.deny must be an array of strings' };
@@ -122,7 +151,7 @@ export function mergeAgyPermissions(
   const originalDeny = (currentDeny ?? []) as string[];
   const deny = originalDeny.filter(rule => rule !== AGY_BROKEN_STASH_LOOKAHEAD_RULE);
   const present = new Set(deny);
-  let changed = deny.length !== originalDeny.length;
+  changed ||= deny.length !== originalDeny.length;
   for (const rule of rules) {
     if (present.has(rule)) continue;
     deny.push(rule);
@@ -130,6 +159,7 @@ export function mergeAgyPermissions(
     changed = true;
   }
   if (!changed) return { action: 'unchanged' };
+  if (writeGrants.length > 0) permissions.allow = allow;
   permissions.deny = deny;
   parsed.root.permissions = permissions;
   return { action: 'write', content: `${JSON.stringify(parsed.root, null, 2)}\n` };
@@ -170,6 +200,13 @@ export function ensureAgyTrust(
   return ensureAgySettings(home, existing => mergeAgyTrust(existing, keys));
 }
 
-export function ensureAgyPermissions(home: string | undefined): EnsureAgySettingsResult {
-  return ensureAgySettings(home, existing => mergeAgyPermissions(existing));
+export function ensureAgyPermissions(
+  home: string | undefined,
+  dirs: string[] = [],
+  pathType = 'windows',
+): EnsureAgySettingsResult {
+  const grants = dirs
+    .map(dir => agyWriteGrant(dir, pathType, home))
+    .filter((grant): grant is string => grant !== null);
+  return ensureAgySettings(home, existing => mergeAgyPermissions(existing, AGY_GIT_DISCARD_DENY_RULES, grants));
 }

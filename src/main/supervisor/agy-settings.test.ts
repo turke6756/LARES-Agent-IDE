@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   AGY_GIT_DISCARD_DENY_RULES,
+  agyWriteGrant,
   agyTrustPathKey,
   ensureAgyPermissions,
   ensureAgyTrust,
@@ -33,6 +34,14 @@ test('trust key refuses non-Windows, relative, filesystem-root, and home-wide tr
   assert.equal(agyTrustPathKey('relative\\ws', 'windows', 'C:\\Users\\turke'), null);
   assert.equal(agyTrustPathKey('C:\\', 'windows', 'C:\\Users\\turke'), null);
   assert.equal(agyTrustPathKey('c:\\users\\TURKE\\', 'windows', 'C:\\Users\\turke'), null);
+});
+
+test('write grant uses a concrete recursive directory without Windows-broken globs', () => {
+  assert.equal(
+    agyWriteGrant('C:/Users/Turke/Projects/Workspace', 'windows', 'C:\\Users\\Turke'),
+    'write_file(C:\\Users\\Turke\\Projects\\Workspace)',
+  );
+  assert.equal(agyWriteGrant('relative\\workspace', 'windows'), null);
 });
 
 test('trust merge appends exact keys and preserves every foreign setting and trust entry', () => {
@@ -155,6 +164,16 @@ test('permissions merge adds the reviewed set and never mutates allow, ask, or f
   assert.equal(mergeAgyPermissions(result.content).action, 'unchanged');
 });
 
+test('permissions merge appends concrete write_file grants without replacing foreign allow entries', () => {
+  const grant = 'write_file(C:\\Workspace)';
+  const existing = JSON.stringify({ permissions: { allow: ['command(echo)'], deny: ['human-deny'] } });
+  const result = mergeAgyPermissions(existing, AGY_GIT_DISCARD_DENY_RULES, [grant]);
+  assert.equal(result.action, 'write');
+  const parsed = JSON.parse(result.content);
+  assert.deepEqual(parsed.permissions.allow, ['command(echo)', grant]);
+  assert.equal(mergeAgyPermissions(result.content, AGY_GIT_DISCARD_DENY_RULES, [grant]).action, 'unchanged');
+});
+
 test('permissions merge removes the broken lookahead, preserves the retired stash rule, and is idempotent', () => {
   const brokenLookahead = String.raw`command(regex:^((env\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*git(\.exe)?(\s+(-C|-c|--git-dir|--work-tree|--namespace|--exec-path)\s+\S+|\s+--(git-dir|work-tree|namespace|exec-path)=\S+)*\s+stash\s+(?!(?:-\S+\s+)*(?:list|show)(?:\s|$)).+$)`;
   const retiredRule = String.raw`command(regex:^((env\s+)?[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*git(\.exe)?(\s+(-C|-c|--git-dir|--work-tree|--namespace|--exec-path)\s+\S+|\s+--(git-dir|work-tree|namespace|exec-path)=\S+)*\s+stash\s+(drop|clear|pop)(\s+.*)?$)`;
@@ -184,16 +203,17 @@ test('filesystem wrappers share the exact settings path, merge sequentially, and
   try {
     const trust = ensureAgyTrust(home, ['C:\\RawCase\\worker'], 'windows');
     assert.equal(trust.action, 'written');
-    const permissions = ensureAgyPermissions(home);
+    const permissions = ensureAgyPermissions(home, ['C:\\Workspace'], 'windows');
     assert.equal(permissions.action, 'written');
     assert.equal(permissions.settingsPath, trust.settingsPath);
     const first = fs.readFileSync(trust.settingsPath, 'utf-8');
     const parsed = JSON.parse(first);
     assert.deepEqual(parsed.trustedWorkspaces, ['C:\\RawCase\\worker']);
     assert.deepEqual(parsed.permissions.deny, AGY_GIT_DISCARD_DENY_RULES);
+    assert.deepEqual(parsed.permissions.allow, ['write_file(C:\\Workspace)']);
 
     assert.equal(ensureAgyTrust(home, ['C:\\RawCase\\worker'], 'windows').action, 'unchanged');
-    assert.equal(ensureAgyPermissions(home).action, 'unchanged');
+    assert.equal(ensureAgyPermissions(home, ['C:\\Workspace'], 'windows').action, 'unchanged');
     assert.equal(fs.readFileSync(trust.settingsPath, 'utf-8'), first);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });

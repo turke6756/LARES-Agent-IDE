@@ -23,6 +23,7 @@ import {
   WORKER_AGY_HOOKS_JSON_V1_HASH,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
   WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4, WORKER_CODEX_CONFIG_TOML_V5,
+  WORKER_CODEX_CONFIG_TOML_V6,
   WORKER_CODEX_AGENTS_MD, WORKER_CODEX_AGENTS_MD_V1, WORKER_CODEX_AGENTS_MD_V4, WORKER_CODEX_BEHAVIORAL_MD,
   WORKER_GROK_AGENTS_MD, WORKER_AGY_AGENTS_MD,
   GUARD_GIT_DISCARD_MJS,
@@ -34,7 +35,7 @@ import {
   HANDSHAKE_CONFIRM_WINDOW_MS, HANDSHAKE_CONFIRM_POLL_MS,
   TMUX_OPTION_MAX_AGE_MS, TMUX_OPTION_LAUNCH_SKEW_MS, STATUS_POLL_INTERVAL_MS,
   RESEARCH_STORE_README_MD, RESEARCH_WRITE_GUARD_MJS, RESEARCHER_CLAUDE_SETTINGS_JSON,
-  RESEARCHER_CLAUDE_SETTINGS_JSON_V1, RESEARCHER_AGENT_MD,
+  RESEARCHER_CLAUDE_SETTINGS_JSON_V1, RESEARCHER_CLAUDE_SETTINGS_JSON_V2, RESEARCHER_AGENT_MD,
   PERSONA_CREATE_PERSONA_SKILL, PERSONA_READ_COMMENTS_SKILL, SCRIPT_READ_COMMENTS_PY,
   PERSONA_CREATE_PERSONA_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V1, PERSONA_READ_COMMENTS_SKILL_V2, PERSONA_READ_COMMENTS_SKILL_V3, PERSONA_READ_COMMENTS_SKILL_V4,
   PERSONA_CREATE_PERSONA_SKILL_V3_HASH,
@@ -1485,6 +1486,12 @@ export const RESEARCH_WRITE_GUARD_MJS_V3_HASH = '828fe6833a8cffd37731f3aa1c7af68
  *  bytes), NOT from the live constant. */
 export const RESEARCH_WRITE_GUARD_MJS_V4_HASH = 'ee18176d996fa25e8e06c445b8f7d338be14804d45d649e953f569f36810c972';
 
+/** SHA-256 hex of the v5 research-write-guard.mjs, including the pre-existing
+ *  five-line Claude/Codex deny-exit comment preserved verbatim. v6 adds the
+ *  bypassable Bash write-target recognizer; this frozen hash lets pristine v5
+ *  workspace copies upgrade silently. */
+export const RESEARCH_WRITE_GUARD_MJS_V5_HASH = '37a7ccdbda2779ccb4d155dced9191643e0556c2037cdb5843914d09fc97c8ec';
+
 /** SHA-256 hex of the v1 `.lares/scripts/guard-git-discard.mjs` — the pre-
  *  per-provider body that emitted a single deny shape for every caller. v2
  *  discriminates the calling harness from the stdin payload (isCodexPayload) and
@@ -1595,7 +1602,7 @@ export function isCodexHookPersona(a: { provider?: AgentProvider; wantsCodexHook
  *
  *  Native Windows carries them in-cwd for BOTH the worker lane AND codex personas:
  *  the worker cwd (.lares/workers/codex/) and each persona cwd (.lares/agents/
- *  <name>/) both ship a v6 WORKER_CODEX_CONFIG_TOML and are trust-seeded by
+ *  <name>/) both ship a v7 WORKER_CODEX_CONFIG_TOML and are trust-seeded by
  *  ensureProviderDirTrust, so Codex loads the config directly. WSL is NOT yet
  *  migrated (needs its own probe): WSL workers AND WSL personas still ride the
  *  CODEX_HOME profile, so this is windows-only. Only consulted under
@@ -1627,7 +1634,7 @@ export function shouldUseWorkerCwdCodexHooks(opts: {
  *   • injectProfile=false (Path A — native-Windows WORKER lane AND native-Windows
  *     personas): hooks ride the launch cwd's trusted-project `.codex/config.toml`
  *     (ensureProviderDirTrust marks the cwd trusted; the worker/persona scaffold
- *     writes the v6 config there). Do NOT inject `--profile` — probe 2026-07-28 Run D
+ *     writes the v7 config there). Do NOT inject `--profile` — probe 2026-07-28 Run D
  *     proved a profile layer + the project layer MERGE, so every hook
  *     double-fires. If a stored/legacy command already carries OUR
  *     `--profile dashboard-worker`, STRIP it for the same reason. KEEP the
@@ -1787,7 +1794,7 @@ function normalizeCodexArgs(args: string[]): string[] {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--full-auto') {
-      out.push('--dangerously-bypass-approvals-and-sandbox');
+      out.push('--sandbox', 'workspace-write', '--ask-for-approval', 'never');
     } else if (arg === '--ask-for-approval' || arg === '-a') {
       i++;
     } else if (arg.startsWith('--ask-for-approval=')) {
@@ -2990,7 +2997,7 @@ export class AgentSupervisor extends EventEmitter {
     // launch — WORKER lane OR persona — gets its turn-boundary hooks from its
     // own cwd's trusted-project .codex/config.toml (ensureCodexProjectTrust marks
     // the cwd trusted, so Codex loads it). The worker cwd (.lares/workers/codex/)
-    // and each persona cwd (.lares/agents/<name>/) both now ship the v6
+    // and each persona cwd (.lares/agents/<name>/) both now ship the v7
     // WORKER_CODEX_CONFIG_TOML, so neither must ALSO carry `--profile
     // dashboard-worker` (Run D: profile + project layers merge → every hook
     // double-fires). The only codex-hook path still on the CODEX_HOME profile is
@@ -3632,8 +3639,8 @@ export class AgentSupervisor extends EventEmitter {
     ...writeProposalEntry('.lares/researcher/.claude/skills/write-proposal'),
     ...readPlanningSurfaceEntry('.lares/researcher/.claude/skills/read-planning-surface'),
     [`.lares/researcher/CLAUDE.md`]:                         { content: RESEARCHER_AGENT_MD, version: 6, previousHashes: { 1: RESEARCHER_AGENT_MD_V1_HASH, 2: RESEARCHER_AGENT_MD_V2_HASH, 3: RESEARCHER_AGENT_MD_V3_HASH, 4: RESEARCHER_AGENT_MD_V4_HASH, 5: RESEARCHER_AGENT_MD_V5_HASH } }, // v6: `.lares` rename
-    [`.lares/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 2, previousHashes: { 1: sha256Hex(RESEARCHER_CLAUDE_SETTINGS_JSON_V1) } },
-    [`.lares/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 5, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH, 2: RESEARCH_WRITE_GUARD_MJS_V2_HASH, 3: RESEARCH_WRITE_GUARD_MJS_V3_HASH, 4: RESEARCH_WRITE_GUARD_MJS_V4_HASH }, executable: true }, // v5: deny exits 2 again (Claude-only lane; Claude 2.1.220 does not honor an exit-0 hookSpecificOutput deny, so v4's exit 0 left it UNENFORCING). v4 exited 0; v3 accepts both `.lares`/`.dashboard` research markers
+    [`.lares/researcher/.claude/settings.json`]:             { content: RESEARCHER_CLAUDE_SETTINGS_JSON, version: 3, previousHashes: { 1: sha256Hex(RESEARCHER_CLAUDE_SETTINGS_JSON_V1), 2: sha256Hex(RESEARCHER_CLAUDE_SETTINGS_JSON_V2) } }, // v3: deliver the defense-in-depth guard for Bash as well as Write
+    [`.lares/researcher/scripts/research-write-guard.mjs`]:  { content: RESEARCH_WRITE_GUARD_MJS, version: 6, previousHashes: { 1: RESEARCH_WRITE_GUARD_MJS_V1_HASH, 2: RESEARCH_WRITE_GUARD_MJS_V2_HASH, 3: RESEARCH_WRITE_GUARD_MJS_V3_HASH, 4: RESEARCH_WRITE_GUARD_MJS_V4_HASH, 5: RESEARCH_WRITE_GUARD_MJS_V5_HASH }, executable: true }, // v6: bypassable Bash/shell write-target detection; Write behavior and Claude exit-2 deny stay unchanged
     // Persona kit (§1.4) — default skills for the researcher lane.
     [`.lares/researcher/.claude/skills/create-persona/SKILL.md`]: { content: PERSONA_CREATE_PERSONA_SKILL, version: 4, previousHashes: { 1: sha256Hex(PERSONA_CREATE_PERSONA_SKILL_V1), 2: PERSONA_CREATE_PERSONA_SKILL_V2_HASH, 3: PERSONA_CREATE_PERSONA_SKILL_V3_HASH } }, // v4: `.lares` rename
     [`.lares/researcher/.claude/skills/read-comments/SKILL.md`]:  { content: PERSONA_READ_COMMENTS_SKILL, version: 5, previousHashes: { 1: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V1), 2: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V2), 3: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V3), 4: sha256Hex(PERSONA_READ_COMMENTS_SKILL_V4) } }, // v5: Python fallback removed (honest on a Python-free clean VM)
@@ -3731,14 +3738,16 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
-      // v1/v2/v3/v4/v5 content with the same materialized workspace root, so an
+      // v1/v2/v3/v4/v5/v6 content with the same materialized workspace root, so an
       // old workspace's on-disk file hashes match and upgrade silently. v1 = Stop
       // only; v2 = Stop + UserPromptSubmit; v3 adds SessionStart; v4 renames the
       // hook script path `.dashboard/` → `.lares/`; v5 adds the PreToolUse →
       // guard-git-discard.mjs block; v6 (current, Path A) adds `[features]
       // hooks = true` (so this file works as the sole hook carrier on native
       // Windows, with no profile layer to supply the gate) and rewrites the
-      // now-stale INERT header — see WORKER_CODEX_CONFIG_TOML.
+      // now-stale INERT header; v7 enables workspace-write and grants the declared
+      // workspace through writable_roots. There is no Codex researcher lane, so
+      // this is workspace containment rather than a subdirectory-only outbox.
       const codexConfigV1 = WORKER_CODEX_CONFIG_TOML_V1.replace(
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
@@ -3759,6 +3768,10 @@ export class AgentSupervisor extends EventEmitter {
         /\$\{WORKSPACE_ROOT\}/g,
         posixWorkspaceRoot,
       );
+      const codexConfigV6 = WORKER_CODEX_CONFIG_TOML_V6.replace(
+        /\$\{WORKSPACE_ROOT\}/g,
+        posixWorkspaceRoot,
+      );
       const codexFiles: Record<string, ScaffoldFile> = {
         ...proposalToPlanEntries('.lares/workers/codex/.agents/skills/proposal-to-plan'),
         ...writeProposalEntry('.lares/workers/codex/.agents/skills/write-proposal'),
@@ -3766,13 +3779,14 @@ export class AgentSupervisor extends EventEmitter {
         ...proveProductionEntryPointEntry('.lares/workers/codex/.agents/skills/prove-the-production-entry-point'),
         [`.lares/workers/codex/.codex/config.toml`]: {
           content: codexConfig,
-          version: 6,
+          version: 7,
           previousHashes: {
             1: sha256Hex(codexConfigV1),
             2: sha256Hex(codexConfigV2),
             3: sha256Hex(codexConfigV3),
             4: sha256Hex(codexConfigV4),
             5: sha256Hex(codexConfigV5),
+            6: sha256Hex(codexConfigV6),
           },
         },
         // Standing instructions for the Codex worker. AGENTS.md is the file the
@@ -4238,7 +4252,10 @@ export class AgentSupervisor extends EventEmitter {
         // prevent the native deny seed (and vice versa), and neither blocks launch.
         for (const [label, ensure] of [
           ['trust', () => ensureAgyTrust(home, dirs, pathType)],
-          ['permissions', () => ensureAgyPermissions(home)],
+          // Agy has no researcher lane. Grant the concrete workspace root for
+          // existing lanes; on Windows 1.1.x write_file grants and deny regexes
+          // are guidance layers only and shell chaining can bypass them.
+          ['permissions', () => ensureAgyPermissions(home, [workDir], pathType)],
         ] as const) {
           try {
             const result = ensure();

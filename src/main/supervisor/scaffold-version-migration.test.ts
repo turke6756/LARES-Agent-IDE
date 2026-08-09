@@ -20,6 +20,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   AgentSupervisor,
   DASHBOARD_STATUS_SCRIPT_V1_HASH,
@@ -45,6 +46,7 @@ import {
   GUARD_GIT_DISCARD_MJS_V2_HASH,
   RESEARCH_WRITE_GUARD_MJS_V3_HASH,
   RESEARCH_WRITE_GUARD_MJS_V4_HASH,
+  RESEARCH_WRITE_GUARD_MJS_V5_HASH,
   SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V1_HASH,
   SUPERVISOR_ORCHESTRATION_SPIKE_SKILL_V2_HASH,
   WORKER_CLAUDE_MD_V6_HASH,
@@ -104,6 +106,7 @@ import {
   RESEARCH_STORE_README_MD,
   RESEARCHER_AGENT_MD,
   RESEARCHER_CLAUDE_SETTINGS_JSON,
+  RESEARCHER_CLAUDE_SETTINGS_JSON_V2,
   REMEMBER_SKILL,
   SUPERVISOR_AGENT_MD,
   SUPERVISOR_RUN_ORCHESTRATION_SKILL,
@@ -148,6 +151,7 @@ import {
   WORKER_CODEX_CONFIG_TOML_V3,
   WORKER_CODEX_CONFIG_TOML_V4,
   WORKER_CODEX_CONFIG_TOML_V5,
+  WORKER_CODEX_CONFIG_TOML_V6,
   WORKER_CLAUDE_SETTINGS_JSON,
   WORKER_CLAUDE_SETTINGS_JSON_V6,
   WORKER_CLAUDE_SETTINGS_JSON_V7,
@@ -1039,6 +1043,7 @@ test('WP-B. researcher scaffold: fresh workspace writes persona CLAUDE.md + sett
     assert.ok(settings.includes('"SessionStart"'), 'researcher settings must wire SessionStart');
     assert.ok(settings.includes('"UserPromptSubmit"'), 'researcher settings must wire UserPromptSubmit');
     assert.ok(settings.includes('"PreToolUse"'), 'researcher settings must keep the PreToolUse write-guard');
+    assert.ok(settings.includes('"matcher": "Write|Bash"'), 'researcher settings must deliver the guard for Write and Bash');
     // Relative depth: status script is one level up (../scripts), write-guard is in-cwd (scripts/).
     assert.ok(settings.includes('/../scripts/dashboard-status.mjs'), 'status hook path must walk one level up');
     assert.ok(settings.includes('/scripts/research-write-guard.mjs'), 'write-guard path must be cwd-relative');
@@ -1048,7 +1053,7 @@ test('WP-B. researcher scaffold: fresh workspace writes persona CLAUDE.md + sett
 
     const sidecar = readSidecar(workDir);
     assert.equal(sidecar['researcher/CLAUDE.md'], 6, `sidecar must record researcher CLAUDE.md v6; got ${JSON.stringify(sidecar)}`);
-    assert.equal(sidecar['researcher/.claude/settings.json'], 2, 'sidecar must record settings v2 (statusLine added)');
+    assert.equal(sidecar['researcher/.claude/settings.json'], 3, 'sidecar must record settings v3 (Write|Bash guard delivery)');
 
     // Idempotent second pass — no rewrites, no backups.
     const beforeMtime = fs.statSync(mdPath).mtimeMs;
@@ -1287,12 +1292,12 @@ test('research-write-guard.mjs v3 + sidecar v3 → silent upgrade to v5, no .bak
 
     assert.equal(
       fs.readFileSync(researchGuardPath(workDir), 'utf-8'), RESEARCH_WRITE_GUARD_MJS,
-      'a pristine v3 research-write-guard must silently upgrade to the exact current (v5) bundled body',
+      'a pristine v3 research-write-guard must silently upgrade to the exact current (v6) bundled body',
     );
     assert.equal(listResearchGuardBackups(workDir).length, 0, 'known v3-hash upgrade must NOT create a backup');
     assert.equal(
-      readSidecar(workDir)['researcher/scripts/research-write-guard.mjs'], 5,
-      `sidecar must record research-write-guard v5; got: ${JSON.stringify(readSidecar(workDir))}`,
+      readSidecar(workDir)['researcher/scripts/research-write-guard.mjs'], 6,
+      `sidecar must record research-write-guard v6; got: ${JSON.stringify(readSidecar(workDir))}`,
     );
   } finally {
     cleanup();
@@ -1317,13 +1322,42 @@ test('research-write-guard.mjs v4 (exit-0 unenforcing) + sidecar v4 → silent u
 
     assert.equal(
       fs.readFileSync(researchGuardPath(workDir), 'utf-8'), RESEARCH_WRITE_GUARD_MJS,
-      'a pristine v4 research-write-guard (the exit-0 unenforcing body) must silently upgrade to the exact v5 bundled body',
+      'a pristine v4 research-write-guard (the exit-0 unenforcing body) must silently upgrade to the exact v6 bundled body',
     );
     assert.equal(listResearchGuardBackups(workDir).length, 0, 'known v4-hash upgrade must NOT create a backup');
     assert.equal(
-      readSidecar(workDir)['researcher/scripts/research-write-guard.mjs'], 5,
-      `sidecar must record research-write-guard v5; got: ${JSON.stringify(readSidecar(workDir))}`,
+      readSidecar(workDir)['researcher/scripts/research-write-guard.mjs'], 6,
+      `sidecar must record research-write-guard v6; got: ${JSON.stringify(readSidecar(workDir))}`,
     );
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
+
+test('C2A scaffold migrations preserve pristine researcher settings v2 and guard v5 without backups', () => {
+  const workDir = mktmp('c2a-researcher-scaffolds');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const settingsPath = researcherPath(workDir, '.claude', 'settings.json');
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, RESEARCHER_CLAUDE_SETTINGS_JSON_V2, 'utf-8');
+    fs.mkdirSync(path.dirname(researchGuardPath(workDir)), { recursive: true });
+    fs.writeFileSync(researchGuardPath(workDir), reconstructResearchWriteGuardV5(), 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(sidecarPath(workDir), JSON.stringify({
+      'researcher/.claude/settings.json': 2,
+      'researcher/scripts/research-write-guard.mjs': 5,
+    }, null, 2) + '\n', 'utf-8');
+
+    supervisor.ensureResearcherScaffold(workDir, 'windows');
+
+    assert.equal(fs.readFileSync(settingsPath, 'utf-8'), RESEARCHER_CLAUDE_SETTINGS_JSON);
+    assert.equal(fs.readFileSync(researchGuardPath(workDir), 'utf-8'), RESEARCH_WRITE_GUARD_MJS);
+    assert.equal(fs.readdirSync(path.dirname(settingsPath)).filter(n => n.startsWith('settings.json.bak')).length, 0);
+    assert.equal(listResearchGuardBackups(workDir).length, 0);
+    assert.equal(readSidecar(workDir)['researcher/.claude/settings.json'], 3);
+    assert.equal(readSidecar(workDir)['researcher/scripts/research-write-guard.mjs'], 6);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3466,7 +3500,7 @@ test('CX-CFG-V3-upgrade. a pristine on-disk v3 codex config.toml upgrades to cur
     const expectedCurrent = WORKER_CODEX_CONFIG_TOML.replace(/\$\{WORKSPACE_ROOT\}/g, posixRoot);
     assert.equal(
       fs.readFileSync(configPath, 'utf-8'), expectedCurrent,
-      'pristine v3 config.toml must silently upgrade to the exact current (v6) bundled content',
+      'pristine v3 config.toml must silently upgrade to the exact current (v7) bundled content',
     );
 
     const codexDir = codexPath(workDir, '.codex');
@@ -3478,8 +3512,8 @@ test('CX-CFG-V3-upgrade. a pristine on-disk v3 codex config.toml upgrades to cur
 
     const sidecar = readSidecar(workDir);
     assert.equal(
-      sidecar['workers/codex/.codex/config.toml'], 6,
-      `sidecar must record the config.toml at v6 after upgrade; got: ${JSON.stringify(sidecar)}`,
+      sidecar['workers/codex/.codex/config.toml'], 7,
+      `sidecar must record the config.toml at v7 after upgrade; got: ${JSON.stringify(sidecar)}`,
     );
   } finally {
     cleanup();
@@ -3539,7 +3573,7 @@ test('CX-CFG-V5-upgrade. a pristine on-disk v5 codex config.toml upgrades to v6 
     const expectedCurrent = WORKER_CODEX_CONFIG_TOML.replace(/\$\{WORKSPACE_ROOT\}/g, posixRoot);
     assert.equal(
       fs.readFileSync(configPath, 'utf-8'), expectedCurrent,
-      'pristine v5 config.toml must silently upgrade to the exact current (v6) bundled content',
+      'pristine v5 config.toml must silently upgrade to the exact current (v7) bundled content',
     );
 
     const codexDir = codexPath(workDir, '.codex');
@@ -3551,8 +3585,8 @@ test('CX-CFG-V5-upgrade. a pristine on-disk v5 codex config.toml upgrades to v6 
 
     const sidecar = readSidecar(workDir);
     assert.equal(
-      sidecar['workers/codex/.codex/config.toml'], 6,
-      `sidecar must record the config.toml at v6 after upgrade; got: ${JSON.stringify(sidecar)}`,
+      sidecar['workers/codex/.codex/config.toml'], 7,
+      `sidecar must record the config.toml at v7 after upgrade; got: ${JSON.stringify(sidecar)}`,
     );
   } finally {
     cleanup();
@@ -3561,6 +3595,31 @@ test('CX-CFG-V5-upgrade. a pristine on-disk v5 codex config.toml upgrades to v6 
 });
 
 // ── normalizeManagedKey: small builder unit ──────────────────────────
+
+test('CX-CFG-V6-upgrade. pristine v6 config upgrades to v7 native workspace scope silently', () => {
+  const workDir = mktmp('codex-cfg-v6');
+  const { supervisor, cleanup } = makeSupervisor();
+  try {
+    const posixRoot = workDir.replace(/\\/g, '/');
+    const configPath = codexPath(workDir, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, WORKER_CODEX_CONFIG_TOML_V6.replace(/\$\{WORKSPACE_ROOT\}/g, posixRoot), 'utf-8');
+    fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+    fs.writeFileSync(sidecarPath(workDir), JSON.stringify({ 'workers/codex/.codex/config.toml': 6 }, null, 2) + '\n', 'utf-8');
+
+    supervisor.ensureWorkerScaffold(workDir, 'codex', 'windows');
+
+    const current = fs.readFileSync(configPath, 'utf-8');
+    assert.equal(current, WORKER_CODEX_CONFIG_TOML.replace(/\$\{WORKSPACE_ROOT\}/g, posixRoot));
+    assert.match(current, /^sandbox_mode = "workspace-write"$/m);
+    assert.match(current, /^writable_roots = \['.+?'\]$/m);
+    assert.equal(fs.readdirSync(path.dirname(configPath)).filter(n => n.startsWith('config.toml.bak')).length, 0);
+    assert.equal(readSidecar(workDir)['workers/codex/.codex/config.toml'], 7);
+  } finally {
+    cleanup();
+    rmrf(workDir);
+  }
+});
 
 test('normalizeManagedKey strips .lares/ AND legacy .dashboard/, and normalizes separators', () => {
   assert.equal(normalizeManagedKey('.lares/scripts/dashboard-status.mjs'), 'scripts/dashboard-status.mjs');
@@ -3975,6 +4034,49 @@ test('WP-1-PRECONDITION. frozen write-proposal v1 hashes to its literal and diff
     sha256Hex(WRITE_PROPOSAL_SKILL_MD), WRITE_PROPOSAL_SKILL_MD_V1_HASH,
     'the live v2 body must differ from the frozen v1 hash',
   );
+});
+
+function reconstructResearchWriteGuardV5(): string {
+  const helpersStart = RESEARCH_WRITE_GUARD_MJS.indexOf('function unquoteShellToken(token) {');
+  const helpersEnd = RESEARCH_WRITE_GUARD_MJS.indexOf('function parseFrontmatter(fileContent) {');
+  assert.ok(helpersStart !== -1 && helpersEnd > helpersStart, 'live guard must contain the C2A helper block');
+  return (RESEARCH_WRITE_GUARD_MJS.slice(0, helpersStart) + RESEARCH_WRITE_GUARD_MJS.slice(helpersEnd))
+    .replace('// Research-store PreToolUse(Write|Bash) guard — WP-G / WP-C2A.\n', '// Research-store PreToolUse(Write) guard — WP-G.\n')
+    .replace('// src/main/research/frontmatter.ts. The Bash inspection is deliberately a\n// bypassable defense-in-depth heuristic, NOT a security boundary: dynamic paths,\n// interpreters, aliases, and novel shell syntax can escape recognition.\n', '// src/main/research/frontmatter.ts. Dependency-free.\n')
+    .replace("import path from 'node:path';\n", '')
+    .replace(
+      '// Shell writes are a second line of defense behind the researcher\'s native tool\n// restriction. This recognizer is intentionally incomplete and bypassable; it\n// raises the bar for common accidental writes but is not an enforcement boundary.\nif (payload.tool_name === \'Bash\') {\n  const outside = inspectShellWrite(payload);\n  if (outside) {\n    block(\'researcher shell write is confined to .lares/research/inbox/ (detected target: \' + outside + \')\');\n  }\n  allow();\n}\n\n// Preserve the existing Write allow/block behavior unchanged.\n',
+      '// Only guard Write.\n',
+    );
+}
+
+test('precondition: reconstructed v5 research-write-guard hashes to previousHashes[5] and differs from live v6', () => {
+  const v5 = reconstructResearchWriteGuardV5();
+  assert.equal(sha256Hex(v5), RESEARCH_WRITE_GUARD_MJS_V5_HASH, 'frozen v5 hash must match the exact pre-C2A body');
+  assert.notEqual(v5, RESEARCH_WRITE_GUARD_MJS, 'live v6 guard must differ from reconstructed v5');
+});
+
+test('research write guard emits a deny for an out-of-inbox Bash redirection', () => {
+  const dir = mktmp('research-guard-shell');
+  const script = path.join(dir, 'research-write-guard.mjs');
+  try {
+    fs.writeFileSync(script, RESEARCH_WRITE_GUARD_MJS, 'utf-8');
+    const result = spawnSync(process.execPath, [script], {
+      input: JSON.stringify({
+        tool_name: 'Bash',
+        cwd: 'C:\\workspace\\.lares\\researcher',
+        tool_input: { command: 'echo escaped > C:\\workspace\\outside.md' },
+      }),
+      encoding: 'utf-8',
+    });
+    assert.equal(result.status, 2, `guard must exit 2 for Claude deny; stderr=${result.stderr}`);
+    const emitted = JSON.parse(result.stdout);
+    assert.equal(emitted.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(emitted.hookSpecificOutput.permissionDecisionReason, /shell write is confined/);
+    assert.match(result.stderr, /detected target: C:\\workspace\\outside\.md/);
+  } finally {
+    rmrf(dir);
+  }
 });
 
 test('WP-1-CONTENT. write-proposal owns the conceptual model, bounded decisions, reconfirmation, and hand-off', () => {

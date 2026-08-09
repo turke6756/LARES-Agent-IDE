@@ -1,10 +1,13 @@
 #!/usr/bin/env node
-// Research-store PreToolUse(Write) guard — WP-G.
+// Research-store PreToolUse(Write|Bash) guard — WP-G / WP-C2A.
 // Blocks researcher writes that escape .lares/research/inbox/ or violate the
 // artifact naming / frontmatter schema. Validation mirrors
-// src/main/research/frontmatter.ts. Dependency-free.
+// src/main/research/frontmatter.ts. The Bash inspection is deliberately a
+// bypassable defense-in-depth heuristic, NOT a security boundary: dynamic paths,
+// interpreters, aliases, and novel shell syntax can escape recognition.
 
 import fs from 'node:fs';
+import path from 'node:path';
 
 const MAX_STDIN_BYTES = 5 * 1024 * 1024;
 // '.lares/' is the live state-dir name; '.dashboard/' is accepted for a
@@ -17,6 +20,11 @@ const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2
 function allow() { process.exit(0); }
 
 function block(reason) {
+  // Claude-only lane. Emit the hookSpecificOutput deny on stdout AND exit 2:
+  // Claude 2.1.220 does NOT honor an exit-0 hookSpecificOutput deny (verified:
+  // the write still lands), so exit 2 is what actually blocks. stderr keeps the
+  // reason in Claude's transcript. (A Codex caller would need exit 0 — it fails
+  // OPEN on any nonzero exit — but no Codex researcher is wired here.)
   const out = {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
@@ -30,6 +38,84 @@ function block(reason) {
 }
 
 function fail(reason) { return { ok: false, reason: 'Research artifact rejected: ' + reason }; }
+
+function unquoteShellToken(token) {
+  if (typeof token !== 'string') return null;
+  let value = token.trim().replace(/[;,]+$/, '');
+  if ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1);
+  }
+  if (!value || /[$\x60%]/.test(value) || /^&\d+$/.test(value)) return null;
+  if (/^(?:nul|con|prn|aux|com\d|lpt\d|\/dev\/null)$/i.test(value)) return null;
+  return value;
+}
+
+function tokenizeShell(segment) {
+  return segment.match(/"(?:\\.|[^"\\])*"|'[^']*'|[^\s]+/g) || [];
+}
+
+function collectShellWriteTargets(command) {
+  const targets = [];
+  const push = (token) => {
+    const value = unquoteShellToken(token);
+    if (value) targets.push(value);
+  };
+  for (const segment of command.split(/[;&|\n]+/g)) {
+    // Redirection, excluding descriptor duplication such as 2>&1.
+    for (const match of segment.matchAll(/(?:^|\s)(?:\d*)>>?\s*(?!&)("(?:\\.|[^"\\])*"|'[^']*'|[^\s]+)/g)) {
+      push(match[1]);
+    }
+
+    const tokens = tokenizeShell(segment);
+    for (let i = 0; i < tokens.length; i++) {
+      const commandName = (unquoteShellToken(tokens[i]) || '').split(/[\\/]/).pop().toLowerCase();
+      if (commandName === 'tee' || commandName === 'tee.exe') {
+        for (const token of tokens.slice(i + 1)) if (!token.startsWith('-')) push(token);
+      } else if (['cp', 'cp.exe', 'mv', 'mv.exe', 'copy', 'move'].includes(commandName)) {
+        const positional = tokens.slice(i + 1).filter(token => !token.startsWith('-'));
+        if (positional.length >= 2) push(positional[positional.length - 1]);
+      } else if (['out-file', 'set-content', 'add-content'].includes(commandName)) {
+        const rest = tokens.slice(i + 1);
+        const named = rest.findIndex(token => /^-(?:file)?path$|^-literalpath$/i.test(token));
+        if (named !== -1 && rest[named + 1]) push(rest[named + 1]);
+        else {
+          const positional = rest.find(token => !token.startsWith('-'));
+          if (positional) push(positional);
+        }
+      } else if (['touch', 'mkdir', 'md', 'new-item'].includes(commandName)) {
+        const rest = tokens.slice(i + 1);
+        const named = rest.findIndex(token => /^-(?:path|literalpath)$/i.test(token));
+        if (named !== -1 && rest[named + 1]) push(rest[named + 1]);
+        else for (const token of rest) if (!token.startsWith('-')) push(token);
+      }
+    }
+  }
+  return targets;
+}
+
+function isResearchInboxTarget(target, cwd) {
+  let normalized = target.replace(/\\/g, '/');
+  if (!/^(?:[A-Za-z]:\/|\/)/.test(normalized) && typeof cwd === 'string' && cwd) {
+    normalized = path.posix.resolve(cwd.replace(/\\/g, '/'), normalized);
+  } else {
+    normalized = path.posix.normalize(normalized);
+  }
+  for (const marker of RESEARCH_MARKERS) {
+    const at = normalized.indexOf(marker);
+    if (at !== -1 && normalized.slice(at + marker.length).startsWith('inbox/')) return true;
+  }
+  return false;
+}
+
+function inspectShellWrite(payload) {
+  const input = payload.tool_input || {};
+  const command = typeof input.command === 'string' ? input.command : null;
+  if (!command) return null;
+  const targets = collectShellWriteTargets(command);
+  const outside = targets.find(target => !isResearchInboxTarget(target, payload.cwd));
+  return outside || null;
+}
 
 function parseFrontmatter(fileContent) {
   if (typeof fileContent !== 'string') return null;
@@ -112,7 +198,18 @@ let payload;
 try { payload = JSON.parse(raw); } catch { allow(); }
 if (!payload || typeof payload !== 'object') allow();
 
-// Only guard Write.
+// Shell writes are a second line of defense behind the researcher's native tool
+// restriction. This recognizer is intentionally incomplete and bypassable; it
+// raises the bar for common accidental writes but is not an enforcement boundary.
+if (payload.tool_name === 'Bash') {
+  const outside = inspectShellWrite(payload);
+  if (outside) {
+    block('researcher shell write is confined to .lares/research/inbox/ (detected target: ' + outside + ')');
+  }
+  allow();
+}
+
+// Preserve the existing Write allow/block behavior unchanged.
 if (payload.tool_name !== 'Write') allow();
 
 const input = payload.tool_input || {};

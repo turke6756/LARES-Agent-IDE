@@ -373,8 +373,13 @@ export const LAUNCH_SETTLE_OVERRUN_GRACE_MS = 5_000;
 /** Default CLI commands per provider and environment */
 export const PROVIDER_COMMANDS: Record<LaunchableAgentProvider, { windows: string; wsl: string }> = {
   claude: { windows: 'claude --dangerously-skip-permissions', wsl: 'ccode --dangerously-skip-permissions' },
+  // Keep the native Windows workspace-write sandbox active so the per-lane
+  // trusted-project config can grant the declared workspace root. WSL still
+  // rides the shared CODEX_HOME profile (the project config is unverified there),
+  // so retain its prior bypass until that transport has a per-workspace grant.
+  // Any custom bypass command intentionally disables native write scoping.
   codex:  {
-    windows: 'codex --dangerously-bypass-approvals-and-sandbox',
+    windows: 'codex --sandbox workspace-write --ask-for-approval never',
     wsl: 'ccodex --dangerously-bypass-approvals-and-sandbox',
   },
   // Plain `grok` — the CLI has no `--dangerously-*`/bypass flag; the trust
@@ -2111,7 +2116,7 @@ export const WORKER_CLAUDE_SETTINGS_JSON_V2 = `{
  *  ignores stdin and reads AGENT_ID + DASHBOARD_PORT from process env (injected
  *  by the supervisor on isSupervised launches in src/main/supervisor/index.ts),
  *  so the single workspace-shared script serves Claude and Codex unchanged. */
-export const WORKER_CODEX_CONFIG_TOML = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
+export const WORKER_CODEX_CONFIG_TOML_V6 = `# Class IV worker hook config — see plans/class-iv-worker-hook-scaffold.md §12.
 #
 # ✅ LIVE ON NATIVE WINDOWS (Path A, probe 2026-07-28). This worker-cwd
 # .codex/config.toml IS the real hook carrier for native-Windows Codex workers:
@@ -2172,6 +2177,28 @@ type = "command"
 command = 'node "\${WORKSPACE_ROOT}/.lares/scripts/guard-git-discard.mjs"'
 timeout = 30
 `;
+
+/** Current v7 Codex worker config. Codex 0.146.0 calls this setting
+ *  sandbox_workspace_write.writable_roots; it ADDS roots beyond the launch cwd,
+ *  so it cannot turn an already-writable cwd into a subdirectory-only outbox.
+ *  Lares has no Codex researcher lane today: existing Codex worker/supervisor
+ *  lanes need the declared workspace root, while the Claude-only researcher is
+ *  guarded separately. The native sandbox is defense in depth and is disabled
+ *  by any custom launch command carrying --dangerously-bypass-approvals-and-sandbox. */
+export const WORKER_CODEX_CONFIG_TOML = WORKER_CODEX_CONFIG_TOML_V6.replace(
+  '# Codex hooks are on by default in current Codex,',
+  `# Provider-native write scope (Codex 0.146.0): workspace-write always includes
+# this lane's cwd; writable_roots adds the declared Lares workspace. This is
+# workspace containment for existing Codex lanes, NOT a researcher outbox — no
+# Codex researcher lane exists today. Custom --dangerously-bypass-approvals-and-
+# sandbox commands disable this layer entirely.
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+writable_roots = ['\${WORKSPACE_ROOT}']
+
+# Codex hooks are on by default in current Codex,`,
+);
 
 /** FROZEN v5 Codex worker config body — the pre-Path-A body that shipped in every
  *  v5 workspace: the four hook blocks (Stop / UserPromptSubmit / SessionStart /
@@ -4229,12 +4256,15 @@ the writing agent can fix the artifact and retry.
  *  exactly why the shared git-discard guard, which serves both providers, keys
  *  its exit code off isCodexPayload; see GUARD_GIT_DISCARD_MJS.) */
 export const RESEARCH_WRITE_GUARD_MJS = String.raw`#!/usr/bin/env node
-// Research-store PreToolUse(Write) guard — WP-G.
+// Research-store PreToolUse(Write|Bash) guard — WP-G / WP-C2A.
 // Blocks researcher writes that escape .lares/research/inbox/ or violate the
 // artifact naming / frontmatter schema. Validation mirrors
-// src/main/research/frontmatter.ts. Dependency-free.
+// src/main/research/frontmatter.ts. The Bash inspection is deliberately a
+// bypassable defense-in-depth heuristic, NOT a security boundary: dynamic paths,
+// interpreters, aliases, and novel shell syntax can escape recognition.
 
 import fs from 'node:fs';
+import path from 'node:path';
 
 const MAX_STDIN_BYTES = 5 * 1024 * 1024;
 // '.lares/' is the live state-dir name; '.dashboard/' is accepted for a
@@ -4265,6 +4295,84 @@ function block(reason) {
 }
 
 function fail(reason) { return { ok: false, reason: 'Research artifact rejected: ' + reason }; }
+
+function unquoteShellToken(token) {
+  if (typeof token !== 'string') return null;
+  let value = token.trim().replace(/[;,]+$/, '');
+  if ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1);
+  }
+  if (!value || /[$\x60%]/.test(value) || /^&\d+$/.test(value)) return null;
+  if (/^(?:nul|con|prn|aux|com\d|lpt\d|\/dev\/null)$/i.test(value)) return null;
+  return value;
+}
+
+function tokenizeShell(segment) {
+  return segment.match(/"(?:\\.|[^"\\])*"|'[^']*'|[^\s]+/g) || [];
+}
+
+function collectShellWriteTargets(command) {
+  const targets = [];
+  const push = (token) => {
+    const value = unquoteShellToken(token);
+    if (value) targets.push(value);
+  };
+  for (const segment of command.split(/[;&|\n]+/g)) {
+    // Redirection, excluding descriptor duplication such as 2>&1.
+    for (const match of segment.matchAll(/(?:^|\s)(?:\d*)>>?\s*(?!&)("(?:\\.|[^"\\])*"|'[^']*'|[^\s]+)/g)) {
+      push(match[1]);
+    }
+
+    const tokens = tokenizeShell(segment);
+    for (let i = 0; i < tokens.length; i++) {
+      const commandName = (unquoteShellToken(tokens[i]) || '').split(/[\\/]/).pop().toLowerCase();
+      if (commandName === 'tee' || commandName === 'tee.exe') {
+        for (const token of tokens.slice(i + 1)) if (!token.startsWith('-')) push(token);
+      } else if (['cp', 'cp.exe', 'mv', 'mv.exe', 'copy', 'move'].includes(commandName)) {
+        const positional = tokens.slice(i + 1).filter(token => !token.startsWith('-'));
+        if (positional.length >= 2) push(positional[positional.length - 1]);
+      } else if (['out-file', 'set-content', 'add-content'].includes(commandName)) {
+        const rest = tokens.slice(i + 1);
+        const named = rest.findIndex(token => /^-(?:file)?path$|^-literalpath$/i.test(token));
+        if (named !== -1 && rest[named + 1]) push(rest[named + 1]);
+        else {
+          const positional = rest.find(token => !token.startsWith('-'));
+          if (positional) push(positional);
+        }
+      } else if (['touch', 'mkdir', 'md', 'new-item'].includes(commandName)) {
+        const rest = tokens.slice(i + 1);
+        const named = rest.findIndex(token => /^-(?:path|literalpath)$/i.test(token));
+        if (named !== -1 && rest[named + 1]) push(rest[named + 1]);
+        else for (const token of rest) if (!token.startsWith('-')) push(token);
+      }
+    }
+  }
+  return targets;
+}
+
+function isResearchInboxTarget(target, cwd) {
+  let normalized = target.replace(/\\/g, '/');
+  if (!/^(?:[A-Za-z]:\/|\/)/.test(normalized) && typeof cwd === 'string' && cwd) {
+    normalized = path.posix.resolve(cwd.replace(/\\/g, '/'), normalized);
+  } else {
+    normalized = path.posix.normalize(normalized);
+  }
+  for (const marker of RESEARCH_MARKERS) {
+    const at = normalized.indexOf(marker);
+    if (at !== -1 && normalized.slice(at + marker.length).startsWith('inbox/')) return true;
+  }
+  return false;
+}
+
+function inspectShellWrite(payload) {
+  const input = payload.tool_input || {};
+  const command = typeof input.command === 'string' ? input.command : null;
+  if (!command) return null;
+  const targets = collectShellWriteTargets(command);
+  const outside = targets.find(target => !isResearchInboxTarget(target, payload.cwd));
+  return outside || null;
+}
 
 function parseFrontmatter(fileContent) {
   if (typeof fileContent !== 'string') return null;
@@ -4347,7 +4455,18 @@ let payload;
 try { payload = JSON.parse(raw); } catch { allow(); }
 if (!payload || typeof payload !== 'object') allow();
 
-// Only guard Write.
+// Shell writes are a second line of defense behind the researcher's native tool
+// restriction. This recognizer is intentionally incomplete and bypassable; it
+// raises the bar for common accidental writes but is not an enforcement boundary.
+if (payload.tool_name === 'Bash') {
+  const outside = inspectShellWrite(payload);
+  if (outside) {
+    block('researcher shell write is confined to .lares/research/inbox/ (detected target: ' + outside + ')');
+  }
+  allow();
+}
+
+// Preserve the existing Write allow/block behavior unchanged.
 if (payload.tool_name !== 'Write') allow();
 
 const input = payload.tool_input || {};
@@ -4571,8 +4690,9 @@ Workspace research lives in \`.lares/research/\`. \`inbox/\` is untrusted data
  *  Mirrors WORKER_CLAUDE_SETTINGS_JSON's memory/compaction posture AND its
  *  turn-boundary status hooks (Stop / SessionStart / UserPromptSubmit →
  *  dashboard-status.mjs) so the dashboard can detect researcher idle/working
- *  status and fire supervisor events — PLUS a PreToolUse(Write) hook invoking
- *  the research-write guard.
+ *  status and fire supervisor events — PLUS a PreToolUse(Write|Bash) hook
+ *  invoking the research-write guard. Bash recognition is a bypassable second
+ *  line of defense, not a sandbox boundary.
  *
  *  Relative-depth note: the researcher cwd is .lares/researcher/, ONE level
  *  below .lares/ (vs the worker's two-level .lares/workers/claude/). So
@@ -4580,7 +4700,7 @@ Workspace research lives in \`.lares/research/\`. \`inbox/\` is untrusted data
  *  \${CLAUDE_PROJECT_DIR}/../scripts/... (one ..), while the researcher's OWN
  *  write-guard at .lares/researcher/scripts/research-write-guard.mjs is
  *  \${CLAUDE_PROJECT_DIR}/scripts/... (no ..). */
-export const RESEARCHER_CLAUDE_SETTINGS_JSON = `{
+export const RESEARCHER_CLAUDE_SETTINGS_JSON_V2 = `{
   "autoMemoryEnabled": false,
   "autoCompactEnabled": false,
   "hooks": {
@@ -4633,6 +4753,12 @@ export const RESEARCHER_CLAUDE_SETTINGS_JSON = `{
   }
 }
 `;
+
+/** v3 adds Bash delivery to the existing Write guard. The script's Bash parser
+ *  is deliberately heuristic; shell syntax can bypass it and WP-C2B owns the
+ *  provider-neutral OS boundary. */
+export const RESEARCHER_CLAUDE_SETTINGS_JSON = RESEARCHER_CLAUDE_SETTINGS_JSON_V2
+  .replace('"matcher": "Write"', '"matcher": "Write|Bash"');
 
 /** Pre-statusLine researcher settings (v1) — the hook block (SessionStart / Stop
  *  / UserPromptSubmit + PreToolUse(Write) guard, NO statusLine) kept verbatim so
