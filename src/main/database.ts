@@ -5844,7 +5844,7 @@ export function upsertPlanWorkPackage(pkg: PlanWorkPackage): void {
         content_hash = COALESCE(excluded.content_hash, plan_work_packages.content_hash),
         projection_status = COALESCE(excluded.projection_status, plan_work_packages.projection_status),
        title = excluded.title, acceptance_condition = excluded.acceptance_condition,
-       state = excluded.state, assignee_agent_id = excluded.assignee_agent_id,
+       assignee_agent_id = excluded.assignee_agent_id,
        revision = excluded.revision, updated_at = excluded.updated_at`,
     [pkg.id, pkg.workspaceId, pkg.planId, pkg.title, pkg.acceptanceCondition,
       pkg.state, pkg.assigneeAgentId, pkg.revision, pkg.createdAt, pkg.updatedAt,
@@ -6098,6 +6098,13 @@ interface PlanWpTransitionInput {
   ts: number;
 }
 
+type PackageLedgerModule = typeof import('./plans/package-ledger');
+
+/** Lazy to avoid a database -> package-ledger -> database initialization cycle. */
+function packageLedger(): PackageLedgerModule {
+  return require('./plans/package-ledger') as PackageLedgerModule;
+}
+
 function rowToPlanWpLifecycleEvent(row: any): PlanWpLifecycleEvent {
   return {
     id: row.id,
@@ -6121,32 +6128,37 @@ function rowToPlanWpLifecycleEvent(row: any): PlanWpLifecycleEvent {
 function transitionPlanWorkPackageStateInTransaction(
   input: PlanWpTransitionInput,
 ): PlanWpLifecycleEvent {
-  if ((input.toState as string) === 'done') {
-    throw new Error('transitionPlanWorkPackageState: `done` is SC-WP-3C-owned, never ledgered here');
-  }
   const pkg = getPlanWorkPackage(input.packageId);
   if (!pkg) throw new Error(`transitionPlanWorkPackageState: no package ${input.packageId}`);
-  if (input.toState === 'executing' && pkg.projectionStatus === 'legacy-unmigrated') {
-    throw new Error(`transitionPlanWorkPackageState: package ${input.packageId} is legacy-unmigrated (quarantined)`);
+  const plan = queryOne('SELECT artifact_id FROM plans WHERE id = ?', [pkg.planId]) as
+    { artifact_id: string | null } | null;
+  if (!plan?.artifact_id || !pkg.intentId) {
+    throw new Error('transitionPlanWorkPackageState: package lacks portable plan/intent identity');
   }
-  if (pkg.state === 'done') {
-    throw new Error(`transitionPlanWorkPackageState: package ${input.packageId} is done (terminal)`);
+  const identity = {
+    idempotencyKey: input.eventId, workspaceId: pkg.workspaceId, planId: pkg.planId,
+    planArtifactId: plan.artifact_id, intentId: pkg.intentId, packageId: pkg.id,
+    packageRevision: pkg.revision,
+  };
+  const command = input.toState === 'archived'
+    ? { ...identity, type: 'archive' as const, reason: input.reason ?? 'legacy archive route' }
+    : input.toState === 'blocked' && pkg.state === 'executing'
+      ? { ...identity, type: 'block' as const, reason: input.reason ?? 'legacy block route' }
+      : input.toState === 'executing' && pkg.state === 'blocked'
+        ? { ...identity, type: 'unblock' as const, reason: input.reason ?? 'legacy unblock route' }
+        : input.toState === 'ready' && (pkg.state === 'done' || pkg.state === 'archived')
+          ? { ...identity, type: 'reopen' as const, reason: input.reason ?? 'legacy reopen route' }
+          : null;
+  if (!command) {
+    throw new Error(`transitionPlanWorkPackageState: ${pkg.state} -> ${input.toState} requires a witnessed package-ledger command`);
   }
-  const fromState = pkg.state;
-  run(
-    `UPDATE plan_work_packages SET state = ?, updated_at = ? WHERE id = ?`,
-    [input.toState, input.ts, input.packageId],
-  );
-  run(
-    `INSERT INTO plan_wp_lifecycle_events
-       (id, package_id, plan_id, from_state, to_state, actor, reason, ts)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [input.eventId, input.packageId, pkg.planId, fromState, input.toState,
-      input.actor, input.reason ?? null, input.ts],
-  );
+  const result = packageLedger().transitionPlanPackage(command, {
+    kind: 'operator', actor: input.actor, observedAt: input.ts,
+  });
   return {
-    id: input.eventId, packageId: input.packageId, planId: pkg.planId,
-    fromState, toState: input.toState, actor: input.actor,
+    id: `package-ledger:${input.eventId}`, packageId: input.packageId, planId: pkg.planId,
+    fromState: result.stateBefore, toState: result.stateAfter as PlanWpTransitionState,
+    actor: input.actor,
     reason: input.reason ?? null, ts: input.ts,
   };
 }
@@ -8174,23 +8186,25 @@ export function confirmPlanDispatchAttempt(input: {
     if (!pkg || pkg.state !== 'ready') {
       throw new Error(`confirmPlanDispatchAttempt: package ${attempt.packageId} is not ready`);
     }
+    const plan = queryOne('SELECT artifact_id FROM plans WHERE id = ?', [attempt.planId]) as
+      { artifact_id: string | null } | null;
+    if (!plan?.artifact_id || !attempt.intentId || attempt.packageRevision === null) {
+      throw new Error('confirmPlanDispatchAttempt: dispatch lacks portable package identity');
+    }
     const reconciled = input.reconciledAt !== undefined && input.reconciledAt !== null;
-    run(
-      `UPDATE plan_dispatch_attempts
-          SET state = ?, confirmed_turn_id = ?, confirmed_at = ?, reconciled_at = ?,
-              target_session_id = COALESCE(target_session_id, ?)
-        WHERE id = ?`,
-      [reconciled ? 'reconciled' : 'delivered', input.confirmedTurnId,
-        input.confirmedAt, input.reconciledAt ?? null, turn.sessionId, input.attemptId],
-    );
-    transitionPlanWorkPackageStateInTransaction({
-      eventId: input.eventId,
-      packageId: attempt.packageId,
-      toState: 'executing',
-      actor: input.actor,
-      reason: reconciled ? 'dispatch-turn-start-reconciled' : 'dispatch-turn-start-confirmed',
-      ts: input.confirmedAt,
+    packageLedger().transitionPlanPackage({
+      type: 'dispatch-confirmed', idempotencyKey: input.eventId,
+      workspaceId: pkg.workspaceId, planId: pkg.planId, planArtifactId: plan.artifact_id,
+      intentId: attempt.intentId, packageId: pkg.id, packageRevision: attempt.packageRevision,
+      dispatchAttemptId: attempt.id,
+    }, {
+      kind: 'dispatch', actor: input.actor, observedAt: input.confirmedAt,
+      confirmedTurnId: input.confirmedTurnId,
     });
+    if (reconciled) run(
+      `UPDATE plan_dispatch_attempts SET state = 'reconciled', reconciled_at = ? WHERE id = ?`,
+      [input.reconciledAt, input.attemptId],
+    );
     return getPlanDispatchAttempt(input.attemptId)!;
   })();
 }

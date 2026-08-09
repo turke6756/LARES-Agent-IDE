@@ -13,13 +13,12 @@
 //      path-sorted and JCS-canonicalized so the frozen manifest is byte-stable.
 //   2. Force-create the durable boundary ref at the computed boundary oid
 //      (idempotent; finalization-refs.ts).
-//   3. In ONE SQLite txn: insert the row `boundary_status='ready'` AND — for a
-//      plan-package — flip `plan_work_packages.state='done'`. A differing
-//      re-finalization also supersedes the prior active row in the SAME txn.
+//   3. In ONE SQLite txn: insert the row `boundary_status='ready'`, invoke the
+//      caller's evidence-gated completion hook, and supersede any prior active row.
 //
 // Compensation:
 //   • ref creation FAILS  ⇒ never insert a `ready` row. Record a non-active
-//     `boundary_status='unavailable'` attempt (no supersede, no `done` flip) and
+//     `boundary_status='unavailable'` attempt (no supersede, no completion hook) and
 //     return it as incomplete. The still-valid prior finalization stays active.
 //   • crash AFTER ref creation but BEFORE the txn ⇒ an orphan ref with no active
 //     row; the startup reconciler GCs it. The retry recomputes the SAME revision
@@ -54,12 +53,9 @@ import {
   insertPackageFinalization as dbInsert,
   supersedePackageFinalization as dbSupersede,
   setPackageFinalizationBoundaryStatus as dbSetBoundaryStatus,
-  getPlanWorkPackage as dbGetPlanWorkPackage,
-  upsertPlanWorkPackage as dbUpsertPlanWorkPackage,
   type FinalizationBoundaryStatus,
   type FinalizationKind,
   type PackageFinalization,
-  type PlanWorkPackage,
 } from '../database';
 
 /** One frozen manifest member — the per-path evidence pinned at finalize time.
@@ -83,8 +79,6 @@ export interface FinalizationStore {
   insertPackageFinalization(f: PackageFinalization): void;
   supersedePackageFinalization(id: string, supersededBy: string): void;
   setPackageFinalizationBoundaryStatus(id: string, status: FinalizationBoundaryStatus): void;
-  getPlanWorkPackage(id: string): PlanWorkPackage | null;
-  upsertPlanWorkPackage(pkg: PlanWorkPackage): void;
   transact<T>(fn: () => T): T;
 }
 
@@ -94,8 +88,6 @@ export const DATABASE_FINALIZATION_STORE: FinalizationStore = {
   insertPackageFinalization: dbInsert,
   supersedePackageFinalization: dbSupersede,
   setPackageFinalizationBoundaryStatus: dbSetBoundaryStatus,
-  getPlanWorkPackage: dbGetPlanWorkPackage,
-  upsertPlanWorkPackage: dbUpsertPlanWorkPackage,
   transact: <T>(fn: () => T): T => getDb().transaction(fn)() as T,
 };
 
@@ -109,6 +101,8 @@ export type MemberFreezer = (entry: CommitRepresentationEntry) => Promise<Commit
 
 export interface FinalizePackageRequest {
   packageId: string;
+  /** Work-package content revision for plan-package boundaries. */
+  packageRevision?: number;
   repositoryKey: string;
   finalizationKind: FinalizationKind;
   /** plan-package only; both null for fleet-adhoc (the DB CHECK enforces this). */
@@ -158,6 +152,8 @@ export interface FinalizePackageDeps {
   freeze?: MemberFreezer;
   now?: () => number;
   newId?: () => string;
+  /** Invoked only after a ready boundary is durable, inside the finalization txn. */
+  onReady?: (finalization: PackageFinalization) => void;
 }
 
 let idSeq = 0;
@@ -205,6 +201,10 @@ function assertRequest(request: FinalizePackageRequest): void {
   if (request.finalizationKind === 'plan-package') {
     if (!request.planId || !request.planItemId) {
       throw new Error('a plan-package finalization requires planId and planItemId');
+    }
+    if (request.packageRevision !== undefined
+        && (!Number.isInteger(request.packageRevision) || request.packageRevision < 1)) {
+      throw new Error('a plan-package finalization requires a positive packageRevision');
     }
   } else if (request.planId !== null || request.planItemId !== null) {
     throw new Error('a fleet-adhoc finalization must carry NULL plan attribution');
@@ -254,12 +254,6 @@ export async function finalizePackage(
   const memberManifestJson = await freezeManifest(request, freeze);
   const requestIdentity = boundaryIdentity(request.boundaryOid, memberManifestJson);
 
-  const flipPlanPackageDone = (): void => {
-    if (request.finalizationKind !== 'plan-package' || !request.planItemId) return;
-    const pkg = store.getPlanWorkPackage(request.planItemId);
-    if (pkg) store.upsertPlanWorkPackage({ ...pkg, state: 'done', updatedAt: now() });
-  };
-
   const buildRow = (
     id: string,
     revision: number,
@@ -296,6 +290,7 @@ export async function finalizePackage(
 
   // 2a. Byte-identical re-finalize over a still-ready boundary → no-op.
   if (identical && latest.boundaryStatus === 'ready') {
+    if (deps.onReady) store.transact(() => deps.onReady!(latest));
     return { finalization: latest, outcome: 'existing-unchanged', memberManifestJson };
   }
 
@@ -308,7 +303,7 @@ export async function finalizePackage(
     if (write.ok) {
       store.transact(() => {
         store.setPackageFinalizationBoundaryStatus(latest.id, 'ready');
-        flipPlanPackageDone();
+        deps.onReady?.({ ...latest, boundaryStatus: 'ready' });
       });
       return {
         finalization: { ...latest, boundaryStatus: 'ready' },
@@ -322,12 +317,14 @@ export async function finalizePackage(
   // 3. Fresh or differing finalization: allocate the next revision. On a retry after
   //    a crash-before-txn the prior attempt committed no row, so `max` is unchanged
   //    and this recomputes the SAME revision → same ref → idempotent force-create.
-  const revision = store.maxPackageRevision(request.packageId) + 1;
+  const revision = request.finalizationKind === 'plan-package' && request.packageRevision !== undefined
+    ? request.packageRevision
+    : store.maxPackageRevision(request.packageId) + 1;
   const ref = finalizationRef(request.packageId, revision);
   const write = await writeRef(ref, request.boundaryOid);
 
   if (!write.ok) {
-    // Ref creation failed ⇒ NEVER a ready row, NEVER supersede, NEVER flip `done`.
+    // Ref creation failed ⇒ NEVER a ready row, NEVER supersede, NEVER invoke completion.
     // A non-active `unavailable` attempt records the failure; the prior finalization
     // (if any) stays active. Plan-package `done` therefore never appears finalized on
     // an unavailable boundary.
@@ -342,7 +339,7 @@ export async function finalizePackage(
   store.transact(() => {
     if (latest) store.supersedePackageFinalization(latest.id, row.id);
     store.insertPackageFinalization(row);
-    flipPlanPackageDone();
+    deps.onReady?.(row);
   });
   return { finalization: row, outcome: latest ? 'superseded' : 'created', memberManifestJson };
 }

@@ -50,6 +50,7 @@ import {
   listPlanWorkPackagesOrdered,
   listRecoveryOperations,
   listTurnRecords,
+  getPlanPackageEvidenceProjection,
 } from '../database';
 import type { PlanWorkPackage } from '../database';
 import { listPlanningEntries, readPlanningDocument } from './planning-reader';
@@ -58,6 +59,7 @@ import { buildPlanGallery, readProposalDocument } from './plan-gallery';
 import type { PlanGalleryOptions } from '../../shared/types';
 import {
   finalizePackage,
+  type FinalizePackageRequest,
   type FinalizePackageResult,
 } from '../commit-candidates/finalization-service';
 import type { CommitRepresentationEntry } from '../commit-candidates/commit-representation';
@@ -103,6 +105,13 @@ import { parseStrictJson } from './strict-json';
 import { reconcilePlanFolderProjections } from './plan-folder-reconciler';
 import { derivePromotedLifecycle } from './promoted-lifecycle';
 import { deleteProposal } from './proposal-delete';
+import {
+  transitionPlanPackage,
+  type CompletionDeclaration,
+  type PlanPackageCommand,
+  type PlanPackageWitness,
+  type TransitionResult,
+} from './package-ledger';
 
 const MAX_PROMOTED_PLAN_JSON_BYTES = 256_000;
 const ARCHIVED_PLAN_STATUSES = new Set(['archived', 'superseded', 'cancelled', 'canceled']);
@@ -217,8 +226,8 @@ export function listPromotedPlanFolders(
 // An explicit plan-item `done` transition mints a `finalization_kind='plan-package'`
 // finalization via the WP-3C service. The service does the crash-safe work: it
 // freezes the member manifest, force-creates the durable boundary ref, records the
-// `package_finalizations` row, AND flips `plan_work_packages.state='done'` inside the
-// SAME SQLite txn — so `done` never appears without a `ready` finalization. This is
+// `package_finalizations` row, then invokes package-ledger completion in the same
+// SQLite txn — so `done` never appears without a ready, evidence-gated boundary. This is
 // the ONLY producer of a plan-package boundary; it is never auto-derived from
 // `accepted`. WP-3D is wiring only: the caller (WP-3G candidate assembly) supplies the
 // already-computed boundary OID and the members to freeze — this layer forwards them,
@@ -229,7 +238,7 @@ export function listPromotedPlanFolders(
  *  function of the item id — never the workspace, the boundary oid, or a timestamp —
  *  so re-finalizing the same item resolves to the same package and bumps a revision. */
 export function planPackageId(planItemId: string): string {
-  return `plan-package:${planItemId}`;
+  return planItemId;
 }
 
 export interface FinalizePlanItemDoneRequest {
@@ -280,6 +289,24 @@ export interface FinalizePlanItemDoneDeps {
   finalize?: (
     ...args: Parameters<typeof finalizePackage>
   ) => ReturnType<typeof finalizePackage>;
+  complete?: (command: PlanPackageCommand, witness: PlanPackageWitness) => TransitionResult;
+}
+
+function codeCompletionDeclaration(packageId: string, packageRevision: number): CompletionDeclaration {
+  const projection = getPlanPackageEvidenceProjection(packageId, packageRevision);
+  if (!projection) throw new Error('cannot complete plan package: evidence projection unavailable');
+  const latestGateIds = new Set(projection.latestGateAttempts.map((gate) => gate.id));
+  const commits = projection.gateCommitLinks
+    .filter((link) => latestGateIds.has(link.gateAttemptId))
+    .map((link) => ({ repositoryKey: link.repositoryKey, commitOid: link.commitOid }));
+  return {
+    kind: 'code',
+    requiredGateKeys: projection.latestGateAttempts.map((gate) => gate.gateKey),
+    implementationCommits: [...new Map(commits.map((ref) => [`${ref.repositoryKey}:${ref.commitOid}`, ref])).values()],
+    boundary: 'ready',
+    deploymentEnvironments: projection.latestDeploymentEvents.map((event) => event.environment),
+    behavior: true,
+  };
 }
 
 /**
@@ -287,7 +314,7 @@ export interface FinalizePlanItemDoneDeps {
  * Looks up the work package to derive its `planId` (and default workspace), then calls
  * the finalization service with `finalizationKind='plan-package'`. Throws if the item
  * does not exist — a `done` transition on an unknown package is a caller bug, and the
- * work-package flip to `done` happens INSIDE the service's txn, not here.
+ * package-ledger completion happens INSIDE the service's txn, not inline here.
  */
 export async function finalizePlanItemDone(
   request: FinalizePlanItemDoneRequest,
@@ -295,6 +322,8 @@ export async function finalizePlanItemDone(
 ): Promise<FinalizePackageResult> {
   const getPkg = deps.getPlanWorkPackage ?? dbGetPlanWorkPackage;
   const finalize = deps.finalize ?? finalizePackage;
+  const complete = deps.complete ?? transitionPlanPackage;
+  const routeCompletion = deps.complete !== undefined || deps.finalize === undefined;
 
   const pkg = getPkg(request.planItemId);
   if (!pkg) {
@@ -303,8 +332,9 @@ export async function finalizePlanItemDone(
     );
   }
 
-  return finalize({
-    packageId: planPackageId(pkg.id),
+  const finalizeRequest: FinalizePackageRequest = {
+    packageId: pkg.id,
+    packageRevision: pkg.revision,
     repositoryKey: request.repositoryKey,
     finalizationKind: 'plan-package',
     planId: pkg.planId,
@@ -319,6 +349,26 @@ export async function finalizePlanItemDone(
     pinnedHeadOid: request.pinnedHeadOid,
     gitExe: request.gitExe,
     deadlineAt: request.deadlineAt,
+  };
+  if (!routeCompletion) return finalize(finalizeRequest);
+
+  const planIdentity = getDb().prepare('SELECT artifact_id FROM plans WHERE id = ?').get(pkg.planId) as
+    { artifact_id: string | null } | undefined;
+  if (!planIdentity?.artifact_id || !pkg.intentId) {
+    throw new Error('cannot finalize plan-package done: package lacks portable plan/intent identity');
+  }
+  return finalize(finalizeRequest, {
+    onReady: (finalization) => {
+      complete({
+        type: 'complete', idempotencyKey: `finalization-complete:${finalization.id}`,
+        workspaceId: pkg.workspaceId, planId: pkg.planId,
+        planArtifactId: planIdentity.artifact_id!, intentId: pkg.intentId!,
+        packageId: pkg.id, packageRevision: pkg.revision,
+        declaration: codeCompletionDeclaration(pkg.id, pkg.revision),
+      }, {
+        kind: 'completion', actor: request.finalizedBy, observedAt: finalization.finalizedAt,
+      });
+    },
   });
 }
 
@@ -1421,7 +1471,7 @@ export function registerPlanIpc(delivery: PlanDispatchDelivery): void {
 
   // ── SC-WP-3D: plan-package `done` transition → finalization ─────────────────
   // The renderer's explicit `done` gesture mints a plan-package finalization through
-  // the WP-3C service (which also flips the work package to `done` in the same txn).
+  // the WP-3C service, whose ready hook enters package-ledger `complete` in the same txn.
   // Identity-only renderer requests are enriched through the engine-backed lazy route.
   // Full main-side WP-3D requests still pass through byte-for-byte unchanged.
   ipcMain.handle('plan:finalizeItemDone', async (_e, request: unknown) =>
