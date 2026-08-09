@@ -16,7 +16,7 @@
 //   node dist/main/main/supervisor/codex-resume-command-builder.test.js
 
 import assert from 'node:assert/strict';
-import { buildCodexResumeCommand } from './index';
+import { buildCodexResumeCommand, normalizeCodexArgs } from './index';
 
 interface TestCase { name: string; run(): void; }
 const tests: TestCase[] = [];
@@ -25,6 +25,36 @@ function test(name: string, fn: () => void): void {
 }
 
 const SID = '019e6787-dcdb-7193-8a27-71083315fc8e';
+
+test('normalizeCodexArgs maps --full-auto to bypass mode on native Windows', () => {
+  assert.deepEqual(
+    normalizeCodexArgs(['--full-auto'], 'win32'),
+    ['--dangerously-bypass-approvals-and-sandbox'],
+  );
+});
+
+test('normalizeCodexArgs preserves workspace-write mode off Windows', () => {
+  assert.deepEqual(
+    normalizeCodexArgs(['--full-auto'], 'linux'),
+    ['--sandbox', 'workspace-write', '--ask-for-approval', 'never'],
+  );
+});
+
+test('resume path maps --full-auto to bypass mode on native Windows', () => {
+  const out = buildCodexResumeCommand('ccodex --full-auto', SID, 'win32');
+  assert.equal(
+    out,
+    `'ccodex' 'resume' '--dangerously-bypass-approvals-and-sandbox' '${SID}'`,
+  );
+});
+
+test('resume path preserves workspace-write mode off Windows', () => {
+  const out = buildCodexResumeCommand('ccodex --full-auto', SID, 'linux');
+  assert.equal(
+    out,
+    `'ccodex' 'resume' '--sandbox' 'workspace-write' '--ask-for-approval' 'never' '${SID}'`,
+  );
+});
 
 // ── Bare command (no env prefix) ─────────────────────────────────────
 

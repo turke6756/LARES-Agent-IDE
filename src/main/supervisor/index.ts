@@ -1799,12 +1799,21 @@ const CODEX_LAUNCH_GATE_HARD_CAP_MS = DEFAULT_SQL_POLL_TIMEOUT_MS + 10_000;
 const CODEX_SID_RECOVERY_POLL_INTERVAL_MS = 2_000;
 const CODEX_SID_RECOVERY_POLL_WINDOW_MS = 60_000;
 
-function normalizeCodexArgs(args: string[]): string[] {
+export function normalizeCodexArgs(
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--full-auto') {
-      out.push('--sandbox', 'workspace-write', '--ask-for-approval', 'never');
+      // Codex 0.146.0 workspace-write hangs PowerShell when the global Windows
+      // sandbox gate is present and is read-only outside cwd when it is absent.
+      if (platform === 'win32') {
+        out.push('--dangerously-bypass-approvals-and-sandbox');
+      } else {
+        out.push('--sandbox', 'workspace-write', '--ask-for-approval', 'never');
+      }
     } else if (arg === '--ask-for-approval' || arg === '-a') {
       i++;
     } else if (arg.startsWith('--ask-for-approval=')) {
@@ -1816,8 +1825,12 @@ function normalizeCodexArgs(args: string[]): string[] {
   return out;
 }
 
-function buildCodexResumeArgs(baseArgs: string[], sessionId: string): string[] {
-  const args = normalizeCodexArgs(baseArgs).filter((arg) => arg !== 'resume');
+function buildCodexResumeArgs(
+  baseArgs: string[],
+  sessionId: string,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  const args = normalizeCodexArgs(baseArgs, platform).filter((arg) => arg !== 'resume');
   return ['resume', ...args, sessionId];
 }
 
@@ -1862,13 +1875,17 @@ function tokenizeShell(s: string): string[] {
  *  single-quote the codex executable and its args. The `resume` subcommand
  *  and the session-id positional are inserted in the right place relative to
  *  the codex executable (NOT in front of the env vars). */
-export function buildCodexResumeCommand(command: string, sessionId: string): string {
+export function buildCodexResumeCommand(
+  command: string,
+  sessionId: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const parts = tokenizeShell(command);
   let envEnd = 0;
   while (envEnd < parts.length && SHELL_ENV_ASSIGNMENT_RE.test(parts[envEnd])) envEnd++;
   const envPrefix = parts.slice(0, envEnd);
   const cmd = parts[envEnd] || 'codex';
-  const args = buildCodexResumeArgs(parts.slice(envEnd + 1), sessionId);
+  const args = buildCodexResumeArgs(parts.slice(envEnd + 1), sessionId, platform);
   const cmdAndArgs = [cmd, ...args].map(shellSingleQuote).join(' ');
   return envPrefix.length > 0 ? `${envPrefix.join(' ')} ${cmdAndArgs}` : cmdAndArgs;
 }
