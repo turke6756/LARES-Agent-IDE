@@ -76,6 +76,37 @@ describe('AtMentionDropdown rail + pane', () => {
     expect(options[1].textContent).toContain('Bob');
   });
 
+  it('renders all candidates when there are more than eight', () => {
+    const candidates = Array.from({ length: 11 }, (_, index) =>
+      mkAgent(`agent-${index}`, `Agent ${index}`, 'ws-1'),
+    );
+
+    render({ candidates });
+
+    expect(container.querySelectorAll('[role="option"]')).toHaveLength(11);
+    expect(container.textContent).toContain('Agent 10');
+  });
+
+  it('scrolls the highlighted option into view when keyboard navigation changes it', () => {
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const candidates = Array.from({ length: 11 }, (_, index) =>
+      mkAgent(`agent-${index}`, `Agent ${index}`, 'ws-1'),
+    );
+
+    render({ candidates, highlighted: 0 });
+    scrollIntoView.mockClear();
+    act(() => {
+      root.render(<AtMentionDropdown {...BASE} candidates={candidates} highlighted={10} />);
+    });
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+    expect(container.querySelectorAll('[role="option"]')[10].getAttribute('aria-selected')).toBe('true');
+  });
+
   it('marks the active rail workspace with aria-selected', () => {
     render({ activeWorkspaceId: 'ws-2' });
     const tabs = Array.from(container.querySelectorAll('[role="tab"]'));

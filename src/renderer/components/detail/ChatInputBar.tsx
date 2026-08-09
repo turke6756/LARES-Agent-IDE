@@ -8,6 +8,7 @@ import {
   formatAgentToken,
   detectMention,
   filterAgents,
+  sortAgentsForMention,
   type MentionContext,
 } from '../../lib/agent-mention';
 import { getCaretCoordinates } from '../../lib/textarea-caret';
@@ -109,14 +110,17 @@ export default function ChatInputBar({
     return list;
   }, [mention, mentionCatalog, catalogAgents, selectedWorkspaceId]);
 
-  // Candidates = agents in the ACTIVE rail workspace matching the query (cap 8).
+  // Candidates = all agents in the ACTIVE rail workspace matching the query,
+  // ordered idle-first while preserving catalog order within each status band.
   const candidates = useMemo(
     () =>
       mention
-        ? filterAgents(
-            catalogAgents.filter((a) => a.workspaceId === mentionWorkspaceId),
-            mention.query,
-          ).slice(0, 8)
+        ? sortAgentsForMention(
+            filterAgents(
+              catalogAgents.filter((a) => a.workspaceId === mentionWorkspaceId),
+              mention.query,
+            ),
+          )
         : [],
     [mention, catalogAgents, mentionWorkspaceId],
   );

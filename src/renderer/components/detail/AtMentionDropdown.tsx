@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import StatusBadge from '../agent/StatusBadge';
 import type { Agent } from '../../../shared/types';
 
@@ -25,7 +25,7 @@ export interface Props {
   // (the rail selection). Used to label FOREIGN agent rows for disambiguation.
   selectedWorkspaceId: string | null;
   onSelectWorkspace: (id: string) => void;
-  candidates: Agent[]; // agents in the active workspace matching the query (cap 8)
+  candidates: Agent[]; // all agents in the active workspace matching the query
   highlighted: number;
   loading: boolean; // catalog is (re)loading
   activeWorkspaceHasAgents: boolean; // distinguishes empty-workspace from no-match
@@ -47,6 +47,12 @@ export default function AtMentionDropdown({
   onHover,
   position,
 }: Props) {
+  const highlightedOptionRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    highlightedOptionRef.current?.scrollIntoView?.({ block: 'nearest' });
+  }, [highlighted]);
+
   // Nothing to render only when the catalog is empty AND not loading — the
   // parent already gates on an active mention, so loading/empty/no-match all
   // render below.
@@ -129,6 +135,7 @@ export default function AtMentionDropdown({
           candidates.map((agent, i) => (
             <button
               key={agent.id}
+              ref={highlighted === i ? highlightedOptionRef : undefined}
               type="button"
               role="option"
               aria-selected={highlighted === i}

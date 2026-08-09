@@ -1,4 +1,4 @@
-import type { Agent } from '../../shared/types';
+import type { Agent, AgentStatus } from '../../shared/types';
 
 // Single source of truth for the inline "@"-mention wire token.
 //
@@ -58,4 +58,29 @@ export function filterAgents(agents: Agent[], query: string): Agent[] {
   const q = query.toLowerCase();
   if (!q) return agents.slice();
   return agents.filter((a) => a.title.toLowerCase().includes(q));
+}
+
+const MENTION_STATUS_PRIORITY: Record<AgentStatus, number> = {
+  idle: 0,
+  launching: 1,
+  working: 1,
+  waiting: 1,
+  restarting: 1,
+  receiving: 1,
+  done: 2,
+  crashed: 2,
+};
+
+// Put idle agents first, other live/actionable agents next, and terminal agents
+// last. The catalog index is the explicit tie-breaker so order within each band
+// remains stable regardless of the JavaScript engine's sort implementation.
+export function sortAgentsForMention(agents: Agent[]): Agent[] {
+  return agents
+    .map((agent, catalogIndex) => ({ agent, catalogIndex }))
+    .sort(
+      (a, b) =>
+        MENTION_STATUS_PRIORITY[a.agent.status] - MENTION_STATUS_PRIORITY[b.agent.status]
+        || a.catalogIndex - b.catalogIndex,
+    )
+    .map(({ agent }) => agent);
 }

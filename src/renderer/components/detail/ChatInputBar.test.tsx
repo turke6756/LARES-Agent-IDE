@@ -122,6 +122,37 @@ describe('ChatInputBar "@"-mention', () => {
     expect(document.body.textContent).toContain('Supervisor');
   });
 
+  it('renders all matching agents when there are more than eight', () => {
+    const manyAgents = Array.from({ length: 11 }, (_, index) =>
+      mkAgent(`many-${index}`, `Matching Agent ${index}`),
+    );
+    useDashboardStore.setState({
+      mentionCatalog: { agents: manyAgents, workspaces: WORKSPACES, loading: false },
+    });
+
+    render();
+    type('@matching');
+
+    expect(container.querySelectorAll('[role="option"]')).toHaveLength(11);
+    expect(container.textContent).toContain('Matching Agent 10');
+  });
+
+  it('renders an idle agent above earlier-in-catalog done agents', () => {
+    const doneFirst = mkAgent('done-first', 'Done First');
+    doneFirst.status = 'done';
+    const idleLater = mkAgent('idle-later', 'Idle Later');
+    useDashboardStore.setState({
+      mentionCatalog: { agents: [doneFirst, idleLater], workspaces: WORKSPACES, loading: false },
+    });
+
+    render();
+    type('@');
+
+    const options = container.querySelectorAll('[role="option"]');
+    expect(options[0].textContent).toContain('Idle Later');
+    expect(options[1].textContent).toContain('Done First');
+  });
+
   it('ArrowDown + Enter inserts the highlighted agent\'s FULL token + trailing space', () => {
     render();
     type('@'); // both candidates; highlight clamps to 0 (Researcher)

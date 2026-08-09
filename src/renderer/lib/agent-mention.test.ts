@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { formatAgentToken, detectMention, filterAgents } from './agent-mention';
-import type { Agent } from '../../shared/types';
+import { formatAgentToken, detectMention, filterAgents, sortAgentsForMention } from './agent-mention';
+import type { Agent, AgentStatus } from '../../shared/types';
 
 // Minimal Agent factory — only the fields these pure helpers read.
 function agent(partial: Partial<Agent> & { id: string; title: string }): Agent {
@@ -101,5 +101,63 @@ describe('filterAgents', () => {
 
   it('returns an empty array when nothing matches', () => {
     expect(filterAgents(agents, 'zzz')).toEqual([]);
+  });
+});
+
+describe('sortAgentsForMention', () => {
+  it('puts an idle agent before an earlier-in-catalog done agent', () => {
+    const agents = [
+      agent({ id: 'done', title: 'Done', status: 'done' }),
+      agent({ id: 'idle', title: 'Idle', status: 'idle' }),
+    ];
+
+    expect(sortAgentsForMention(agents).map((a) => a.id)).toEqual(['idle', 'done']);
+  });
+
+  it('preserves catalog order within each priority band', () => {
+    const agents = [
+      agent({ id: 'done-1', title: 'Done 1', status: 'done' }),
+      agent({ id: 'working-1', title: 'Working 1', status: 'working' }),
+      agent({ id: 'idle-1', title: 'Idle 1', status: 'idle' }),
+      agent({ id: 'crashed-1', title: 'Crashed 1', status: 'crashed' }),
+      agent({ id: 'waiting-1', title: 'Waiting 1', status: 'waiting' }),
+      agent({ id: 'idle-2', title: 'Idle 2', status: 'idle' }),
+      agent({ id: 'done-2', title: 'Done 2', status: 'done' }),
+    ];
+
+    expect(sortAgentsForMention(agents).map((a) => a.id)).toEqual([
+      'idle-1',
+      'idle-2',
+      'working-1',
+      'waiting-1',
+      'done-1',
+      'crashed-1',
+      'done-2',
+    ]);
+  });
+
+  it('classifies every AgentStatus member', () => {
+    const statuses: AgentStatus[] = [
+      'launching',
+      'working',
+      'idle',
+      'waiting',
+      'done',
+      'crashed',
+      'restarting',
+      'receiving',
+    ];
+    const agents = statuses.map((status) => agent({ id: status, title: status, status }));
+
+    expect(sortAgentsForMention(agents).map((a) => a.status)).toEqual([
+      'idle',
+      'launching',
+      'working',
+      'waiting',
+      'restarting',
+      'receiving',
+      'done',
+      'crashed',
+    ]);
   });
 });
