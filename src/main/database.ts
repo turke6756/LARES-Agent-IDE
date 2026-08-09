@@ -260,6 +260,23 @@ export function initDatabase(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_continuation_bricks_agent_written
            ON continuation_bricks (dashboard_agent_id, written_at DESC)`);
 
+  // Continuation deferral — one durable decision row per deferred attempt.
+  // The attempt status is the lifecycle disposition; this row carries the
+  // authored reason and bounded retry delay that the watcher observes.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS continuation_deferrals (
+      id                  TEXT PRIMARY KEY,
+      dashboard_agent_id  TEXT NOT NULL,
+      handoff_attempt_id  TEXT NOT NULL UNIQUE,
+      generation          INTEGER NOT NULL,
+      reason              TEXT NOT NULL,
+      retry_after_minutes INTEGER NOT NULL,
+      deferred_at         TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_continuation_deferrals_agent_generation
+           ON continuation_deferrals (dashboard_agent_id, generation, deferred_at DESC)`);
+
   // Context-brick Phase 1 (D1) — durable session lineage. One dashboard agent
   // id spans many sessions across continuations and `/clear` rotations. This is
   // the durable map agent id → ordered generations→session ids that survives
@@ -3799,7 +3816,7 @@ export function updateAgentSupervised(id: string, supervised: boolean): void {
 
 // ── Context-brick Inc 4 (4.3) — continuation attempts + bricks ─────────────
 
-export type ContinuationAttemptStatus = 'open' | 'committed' | 'aborted' | 'relaunched';
+export type ContinuationAttemptStatus = 'open' | 'committed' | 'aborted' | 'deferred' | 'relaunched';
 
 export interface ContinuationHandoffAttempt {
   id: string;
@@ -3829,6 +3846,16 @@ export interface ContinuationBrickRow {
   byteLen: number;
   writtenAt: string;
   supersededAt: string | null;
+}
+
+export interface ContinuationDeferralRow {
+  id: string;
+  dashboardAgentId: string;
+  handoffAttemptId: string;
+  generation: number;
+  reason: string;
+  retryAfterMinutes: number;
+  deferredAt: string;
 }
 
 function rowToContinuationAttempt(row: any): ContinuationHandoffAttempt {
@@ -4000,9 +4027,10 @@ export function hasRunningOrchestrationForSupervisor(supervisorId: string): bool
  *  attempt count, so a prior generation's failures can never pre-exhaust a fresh
  *  cycle.
  *   - `abortedCount` = those attempts closed 'aborted'.
- *   - `firstAttemptStartedAt` = min(started_at) across ALL such attempts,
- *     INCLUDING the current still-open one — so the alive-time clock starts at
- *     the first attempt and can trip before any abort is recorded.
+ *   - `firstAttemptStartedAt` = min(started_at) after the latest deferral (or
+ *     relaunch when no deferral exists), INCLUDING the current still-open one.
+ *     A good-faith deferral therefore resets the alive-time clock without
+ *     erasing real aborts already spent in this generation.
  *  Timestamps are the millisecond-resolution UTC strings written via NOW_MS_SQL
  *  ('YYYY-MM-DD HH:MM:SS.fff'); the caller converts to epoch ms as UTC. */
 export function getContinuationEscapeBudget(
@@ -4017,17 +4045,101 @@ export function getContinuationEscapeBudget(
     [agentId],
   );
   const since: string = (lastRelaunch?.started_at as string) ?? '';
-  const row = queryOne(
-    `SELECT SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) AS aborted_count,
-            MIN(started_at) AS first_started_at
+  const abortRow = queryOne(
+    `SELECT SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) AS aborted_count
        FROM continuation_handoff_attempts
       WHERE dashboard_agent_id = ? AND generation = ? AND started_at > ?`,
     [agentId, successorGeneration, since],
   );
+  // A committed deferral resets only the alive-time clock. Prior real aborts
+  // remain effort already spent, while the deferred attempt itself is neither
+  // an abort nor part of the new clock basis.
+  const lastDeferral = queryOne(
+    `SELECT deferred_at FROM continuation_deferrals
+      WHERE dashboard_agent_id = ? AND generation = ? AND deferred_at > ?
+      ORDER BY deferred_at DESC LIMIT 1`,
+    [agentId, successorGeneration, since],
+  );
+  const aliveSince: string = (lastDeferral?.deferred_at as string) ?? since;
+  const clockRow = queryOne(
+    `SELECT MIN(started_at) AS first_started_at
+       FROM continuation_handoff_attempts
+      WHERE dashboard_agent_id = ? AND generation = ? AND started_at > ?`,
+    [agentId, successorGeneration, aliveSince],
+  );
   return {
-    abortedCount: (row?.aborted_count as number) ?? 0,
-    firstAttemptStartedAt: (row?.first_started_at as string | null) ?? null,
+    abortedCount: (abortRow?.aborted_count as number) ?? 0,
+    firstAttemptStartedAt: (clockRow?.first_started_at as string | null) ?? null,
   };
+}
+
+function rowToContinuationDeferral(row: any): ContinuationDeferralRow {
+  return {
+    id: row.id,
+    dashboardAgentId: row.dashboard_agent_id,
+    handoffAttemptId: row.handoff_attempt_id,
+    generation: row.generation,
+    reason: row.reason,
+    retryAfterMinutes: row.retry_after_minutes,
+    deferredAt: row.deferred_at,
+  };
+}
+
+export function countContinuationDeferrals(agentId: string, generation: number): number {
+  const row = queryOne(
+    'SELECT COUNT(*) AS count FROM continuation_deferrals WHERE dashboard_agent_id = ? AND generation = ?',
+    [agentId, generation],
+  );
+  return (row?.count as number) ?? 0;
+}
+
+/** Atomically record a deferral and close its currently-open attempt. The
+ * route performs validation/budget messaging; this helper preserves the DB
+ * invariant if a stale caller races another disposition. */
+export function insertContinuationDeferral(input: {
+  agentId: string;
+  handoffAttemptId: string;
+  generation: number;
+  reason: string;
+  retryAfterMinutes: number;
+}): ContinuationDeferralRow {
+  const id = uuidv4();
+  const tx = db.transaction(() => {
+    const attempt = queryOne(
+      "SELECT status, dashboard_agent_id, generation FROM continuation_handoff_attempts WHERE id = ?",
+      [input.handoffAttemptId],
+    );
+    if (!attempt || attempt.status !== 'open'
+        || attempt.dashboard_agent_id !== input.agentId
+        || attempt.generation !== input.generation) {
+      throw new Error(`continuation attempt ${input.handoffAttemptId} is no longer open for ${input.agentId}`);
+    }
+    run(
+      `INSERT INTO continuation_deferrals
+         (id, dashboard_agent_id, handoff_attempt_id, generation, reason, retry_after_minutes, deferred_at)
+       VALUES (?, ?, ?, ?, ?, ?, ${NOW_MS_SQL})`,
+      [id, input.agentId, input.handoffAttemptId, input.generation, input.reason, input.retryAfterMinutes],
+    );
+    run(
+      `UPDATE continuation_handoff_attempts SET status = 'deferred', closed_at = ${NOW_MS_SQL}
+        WHERE id = ? AND status = 'open'`,
+      [input.handoffAttemptId],
+    );
+  });
+  tx();
+  return getContinuationDeferralForAttempt(input.agentId, input.handoffAttemptId)!;
+}
+
+export function getContinuationDeferralForAttempt(
+  agentId: string,
+  attemptId: string,
+): ContinuationDeferralRow | null {
+  const row = queryOne(
+    `SELECT * FROM continuation_deferrals
+      WHERE dashboard_agent_id = ? AND handoff_attempt_id = ? LIMIT 1`,
+    [agentId, attemptId],
+  );
+  return row ? rowToContinuationDeferral(row) : null;
 }
 
 export function getOpenContinuationAttempt(agentId: string): ContinuationHandoffAttempt | null {

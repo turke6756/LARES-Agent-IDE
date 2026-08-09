@@ -91,6 +91,7 @@ test('notebooks,comms,observability exposes exactly those toolsets, not orchestr
     'execute_cell',
     'execute_notebook',
     'execute_range',
+    'defer_continuation',
     'get_kernel_state',
     'get_my_context',
     'get_usage_limits',
@@ -129,7 +130,7 @@ const OBSERVABILITY_CORE_TOOLS = [
   'get_my_context', 'get_usage_limits',
   'list_agents', 'list_my_agents', 'list_templates', 'list_workspaces',
   'open_file_in_view', 'read_agent_chat', 'read_agent_files_touched',
-  'read_agent_log', 'read_comments', 'save_continuation_brick',
+  'read_agent_log', 'read_comments', 'save_continuation_brick', 'defer_continuation',
 ].sort();
 
 /** The 13 tools that made up the `observability-analytics` toolset, retired in
@@ -525,6 +526,24 @@ test('31. list_my_agents schema exposes NO agent/owner id arg (owner is identity
   assert.ok(def, 'list_my_agents definition registered');
   assert.deepStrictEqual(Object.keys(def.inputSchema.properties).sort(), ['include_terminal', 'limit']);
   assert.ok(!('required' in def.inputSchema) || def.inputSchema.required.length === 0, 'no required args');
+});
+
+test('32. production observability registration exposes and dispatches defer_continuation on the self-authored route', async () => {
+  const proxy = loadProxy('observability-core');
+  const def = proxy.getToolDefinitions().find((d) => d.name === 'defer_continuation');
+  assert.ok(def, 'the production toolset registry must expose defer_continuation');
+  assert.deepStrictEqual(Object.keys(def.inputSchema.properties).sort(), ['reason', 'retry_after_minutes']);
+  assert.deepStrictEqual(def.inputSchema.required, ['reason']);
+
+  const api = capturingApi({ id: 'defer-1' });
+  await proxy.handleToolCall('defer_continuation', {
+    reason: 'finish review', retry_after_minutes: 12,
+  }, api);
+  assert.deepStrictEqual(api.calls, [{
+    method: 'POST',
+    route: '/api/supervisor/continuation-deferral',
+    body: { reason: 'finish review', retry_after_minutes: 12 },
+  }]);
 });
 
 (async () => {

@@ -13,6 +13,7 @@ import {
   type TriggerSnapshot,
   type OwnedAgentRow,
   type CommittedBrickView,
+  type CommittedDeferralView,
   type HandshakeResult,
   type EscapeBudget,
   type OpenAttemptResult,
@@ -41,6 +42,7 @@ import {
   CONTINUATION_BACKOFF_CAP_MS,
   CONTINUATION_ESCAPE_MAX_ATTEMPTS,
   CONTINUATION_ESCAPE_MAX_ALIVE_MS,
+  CONTINUATION_MAX_DEFERRALS,
   CONTINUATION_POST_NOTE_GRACE_MS,
   CONTINUATION_POST_NOTE_IDLE_POLLS,
   HANDSHAKE_TIMEOUT_MS,
@@ -300,6 +302,8 @@ interface FakeWorld {
   inFlight: Set<string>;
   orchestration: boolean;
   toolBrick: CommittedBrickView | null;
+  deferral: CommittedDeferralView | null;
+  remainingDeferrals: number;
   handshakeResult: HandshakeResult;
   openAttemptResult: OpenAttemptResult;
   /** The force-gate watch set the tick would actually visit (Slice 1 §3.1/§3.2). */
@@ -313,6 +317,7 @@ interface FakeWorld {
     openAttempt: Array<{ agentId: string; reason: string; thresholdContextPct: number }>;
     requestNote: Array<{ agentId: string; message: string }>;
     brickPolls: number;
+    deferralPolls: number;
     relaunch: Array<{ agentId: string; attemptId: string }>;
     relaunchNone: Array<{ agentId: string; attemptId: string }>;
     abortAttempt: Array<{ agentId: string; attemptId: string; detail: string }>;
@@ -334,6 +339,8 @@ function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     inFlight: new Set(),
     orchestration: false,
     toolBrick: null,
+    deferral: null,
+    remainingDeferrals: CONTINUATION_MAX_DEFERRALS,
     handshakeResult: 'ok',
     openAttemptResult: { status: 'ok', attemptId: 'att-1', startedAt: '2026-07-03T10:00:00.000Z' },
     watchEligible: true,
@@ -344,7 +351,7 @@ function makeWorld(overrides: Partial<FakeWorld> = {}): FakeWorld {
     // the escape branch never fires unless a test arms the budget.
     escapeBudget: { abortedCount: 0, firstAttemptStartedAtMs: 1_000_000 },
     calls: {
-      openAttempt: [], requestNote: [], brickPolls: 0, relaunch: [],
+      openAttempt: [], requestNote: [], brickPolls: 0, deferralPolls: 0, relaunch: [],
       relaunchNone: [], abortAttempt: [], handoffFailedRecovery: [], pageHuman: [],
       getEscapeBudget: 0, log: [],
     },
@@ -378,6 +385,11 @@ function makeEffects(w: FakeWorld): ContinuationWatcherEffects {
       w.calls.brickPolls++;
       return w.toolBrick;
     },
+    getCommittedDeferral: async () => {
+      w.calls.deferralPolls++;
+      return w.deferral;
+    },
+    getRemainingDeferrals: () => w.remainingDeferrals,
     relaunch: async (agentId, attemptId) => {
       w.calls.relaunch.push({ agentId, attemptId });
       return w.relaunchResult;
@@ -456,6 +468,35 @@ test('handshake FAILED is pre-attempt: recovery runs, attempt stays open, no rel
   assert.equal(st.openAttempt?.attemptId, 'att-1', 'attempt carried for the retry');
   assert.ok(st.backoffUntil > w.now.value - 1, 'backoff armed');
   assert.equal(st.lastBackoffMs, CONTINUATION_BACKOFF_MS);
+});
+
+test('committed deferral keeps the supervisor alive, uses the requested backoff, and burns no abort', async () => {
+  const w = makeWorld({
+    deferral: {
+      id: 'defer-1',
+      reason: 'finishing the release checklist',
+      retryAfterMinutes: 12,
+      deferredAt: '2026-07-03T10:00:05.000Z',
+    },
+  });
+  const watcher = new ContinuationWatcher(makeEffects(w));
+  const observedAt = w.now.value;
+  await fireAndDrain(watcher, w);
+
+  assert.equal(w.calls.abortAttempt.length, 0, 'a deferral never consumes an abort');
+  assert.equal(w.calls.getEscapeBudget, 0, 'deferral returns before the escape predicate');
+  assert.equal(w.calls.relaunch.length, 0);
+  assert.equal(w.calls.relaunchNone.length, 0);
+  const st = watcher.getAgentState(SELF);
+  assert.equal(st.openAttempt, null, 'the deferred attempt is closed by the route and cleared locally');
+  assert.equal(st.lastBackoffMs, null, 'failure backoff is not advanced');
+  assert.equal(st.backoffUntil, observedAt + 12 * 60_000);
+  const phase = w.phases.at(-1) as { phase: string; message?: string; retryAt?: number; attemptId?: string };
+  assert.equal(phase.phase, 'backoff');
+  assert.equal(phase.attemptId, 'att-1');
+  assert.equal(phase.retryAt, st.backoffUntil);
+  assert.ok(phase.message?.includes('Supervisor deferred'));
+  assert.ok(phase.message?.includes('Retry in 12 minutes'));
 });
 
 test('handshake-failed retry reuses the still-open attempt (no second openAttempt, generation unadvanced)', async () => {
@@ -704,11 +745,20 @@ test('openAttempt rejection (409 open-attempt-exists) → backoff, no note reque
   assert.ok(line!.includes('att-old'), `log should carry the server reason: ${line}`);
 });
 
-test('note-request message content: attempt id + tool instruction + byte cap', () => {
-  const msg = buildNoteRequestMessage('att-9', 'context ≥ 80%');
+test('note-request message offers bounded deferral and reports the remaining count', () => {
+  const msg = buildNoteRequestMessage('att-9', 'context ≥ 80%', 2);
   assert.ok(msg.includes('att-9'));
   assert.ok(msg.includes('save_continuation_brick'));
   assert.ok(msg.includes('6 KB'));
+  assert.ok(msg.includes('defer_continuation'));
+  assert.ok(msg.includes('retry_after_minutes, 5–30'));
+  assert.ok(msg.includes('2 deferrals remain'));
+});
+
+test('note-request message omits the deferral offer when none remain', () => {
+  const msg = buildNoteRequestMessage('att-10', 'context ≥ 80%', 0);
+  assert.ok(msg.includes('save_continuation_brick'));
+  assert.ok(!msg.includes('defer_continuation'));
 });
 
 // ── BUG-39 WP1: post-note grace decision + loop ───────────────────────

@@ -18,7 +18,8 @@ import {
   listAgentTemplates, createAgentTemplate, updateAgentTemplate, deleteAgentTemplate, getAgentTemplate,
   createContinuationHandoffAttempt, getOpenContinuationAttempt, getLatestContinuationAttempt,
   getContinuationAttempt, getContinuationEscapeBudget, closeContinuationHandoffAttempt, insertContinuationBrick,
-  getLatestBrickForAttempt, hasRunningOrchestrationForSupervisor,
+  getLatestBrickForAttempt, countContinuationDeferrals, insertContinuationDeferral,
+  getContinuationDeferralForAttempt, hasRunningOrchestrationForSupervisor,
   getPlans, getPlan, getPlanByWorkspacePath, createOrRevivePlan, updatePlan, softDeletePlan, derivePlanSlug,
   planItemInPlan,
   getSupervisorFocus, upsertSupervisorFocus, deleteSupervisorFocus,
@@ -43,7 +44,7 @@ import {
 import { OrchestrationProviderSettingsValidationError } from './orchestration/orchestration-provider-settings';
 import { getOrchestrationProviderSettingsCached } from './orchestration/orchestration-provider-settings';
 import { getAvailableProviders } from './provider-availability';
-import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } from '../shared/constants';
+import { TEAM_MAX_MESSAGES_PER_5MIN, TEAM_MAX_ALTERNATIONS, TEAM_ALTERNATION_WINDOW_MS, TEAM_PAIR_COOLDOWN_MS, CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS, CONTINUATION_MAX_DEFERRALS, CONTINUATION_DEFER_RETRY_MINUTES_MIN, CONTINUATION_DEFER_RETRY_MINUTES_MAX } from '../shared/constants';
 import { TeamMessageStatus, hasSupervisorPrivilege } from '../shared/types';
 import type { Agent, Workspace } from '../shared/types';
 import fs from 'fs';
@@ -224,6 +225,7 @@ const API_ERROR_CODES = new Set<string>([
   // Context-brick Inc 4 (4.4) — continuation attempt/brick/relaunch gates.
   'continuation-open-attempt-exists', 'continuation-no-open-attempt',
   'continuation-note-too-large', 'continuation-attempt-not-committed',
+  'continuation-deferral-spent',
   'continuation-no-tool-brick',
   'continuation-input-in-flight', 'continuation-awaiting-human',
   'continuation-orchestration-running',
@@ -2585,6 +2587,78 @@ export class ApiServer {
       });
       closeContinuationHandoffAttempt(attempt.id, 'committed');
       return { id };
+    }
+
+    // POST /api/supervisor/continuation-deferral { reason, retry_after_minutes }
+    // — the same identity rail as continuation-brick: the authenticated
+    // supervisor can defer only its own currently-open attempt.
+    if (method === 'POST' && path === '/api/supervisor/continuation-deferral') {
+      const body = await readBody(req);
+      const input = body ? JSON.parse(body) : {};
+      const bodyAgentKeys = ['agent_id', 'agentId', 'dashboard_agent_id', 'dashboardAgentId']
+        .filter(k => k in input);
+      if (bodyAgentKeys.length > 0) {
+        throw Object.assign(
+          new Error(`author is derived from X-Supervisor-Id; remove body field(s): ${bodyAgentKeys.join(', ')}`),
+          { statusCode: 400 },
+        );
+      }
+      if (!identity.supervisorId || !identity.supervisor) {
+        throw Object.assign(
+          new Error('supervisor identity required (send X-Supervisor-Id header)'),
+          { statusCode: 400 },
+        );
+      }
+      const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+      if (reason.length === 0 || reason.length > 500) {
+        throw Object.assign(new Error('reason (non-empty string, at most 500 characters) required'), { statusCode: 400 });
+      }
+      if (input.retry_after_minutes !== undefined && !Number.isInteger(input.retry_after_minutes)) {
+        throw Object.assign(new Error('retry_after_minutes must be an integer'), { statusCode: 400 });
+      }
+      const retryAfterMinutes = Math.max(
+        CONTINUATION_DEFER_RETRY_MINUTES_MIN,
+        Math.min(CONTINUATION_DEFER_RETRY_MINUTES_MAX, input.retry_after_minutes ?? 10),
+      );
+      const attempt = getOpenContinuationAttempt(identity.supervisor.id);
+      if (!attempt) {
+        throw Object.assign(
+          new Error('no open continuation attempt for this supervisor — there is no handoff to defer'),
+          { statusCode: 409, code: 'continuation-no-open-attempt' },
+        );
+      }
+      const used = countContinuationDeferrals(identity.supervisor.id, attempt.generation);
+      if (used >= CONTINUATION_MAX_DEFERRALS) {
+        throw Object.assign(
+          new Error(`continuation deferral is spent for this successor generation (${used}/${CONTINUATION_MAX_DEFERRALS}); the continuation note must be written now`),
+          { statusCode: 409, code: 'continuation-deferral-spent' },
+        );
+      }
+      const deferral = insertContinuationDeferral({
+        agentId: identity.supervisor.id,
+        handoffAttemptId: attempt.id,
+        generation: attempt.generation,
+        reason,
+        retryAfterMinutes,
+      });
+      return {
+        id: deferral.id,
+        attemptId: deferral.handoffAttemptId,
+        retryAfterMinutes: deferral.retryAfterMinutes,
+        remainingDeferrals: CONTINUATION_MAX_DEFERRALS - used - 1,
+      };
+    }
+
+    // GET /api/supervisor/continuation-deferral?agentId=&attemptId= — watcher
+    // observation rail, paired with the brick observation route below.
+    if (method === 'GET' && path === '/api/supervisor/continuation-deferral') {
+      const agentId = url.searchParams.get('agentId');
+      const attemptId = url.searchParams.get('attemptId');
+      if (!agentId || !attemptId) {
+        throw Object.assign(new Error('agentId and attemptId query params required'), { statusCode: 400 });
+      }
+      const deferral = getContinuationDeferralForAttempt(agentId, attemptId);
+      return { agentId, attemptId, deferral };
     }
 
     // GET /api/supervisor/continuation-brick?agentId=&attemptId=&source=tool

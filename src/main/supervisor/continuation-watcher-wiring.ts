@@ -13,6 +13,7 @@ import {
   getAgentsByOwner,
   getContinuationAttempt,
   getContinuationEscapeBudget,
+  countContinuationDeferrals,
   getOpenContinuationAttempt,
   getLatestBrickForAttempt,
   closeContinuationHandoffAttempt,
@@ -20,6 +21,7 @@ import {
   addEvent,
 } from '../database';
 import { getApiToken } from '../security/api-auth';
+import { CONTINUATION_MAX_DEFERRALS } from '../../shared/constants';
 
 /** Context-brick Inc 5B — production wiring for the continuation watcher.
  *
@@ -151,6 +153,27 @@ export function createContinuationWatcherEffects(
       );
       const brick = res.ok ? res.json?.brick : null;
       return brick ? { id: brick.id, writtenAt: brick.writtenAt } : null;
+    },
+
+    getCommittedDeferral: async (agentId, attemptId) => {
+      const res = await apiCall(
+        apiPort, 'GET',
+        `/api/supervisor/continuation-deferral?agentId=${encodeURIComponent(agentId)}&attemptId=${encodeURIComponent(attemptId)}`,
+      );
+      const deferral = res.ok ? res.json?.deferral : null;
+      return deferral ? {
+        id: deferral.id,
+        reason: deferral.reason,
+        retryAfterMinutes: deferral.retryAfterMinutes,
+        deferredAt: deferral.deferredAt,
+      } : null;
+    },
+
+    getRemainingDeferrals: (agentId, attemptId) => {
+      const attempt = getContinuationAttempt(attemptId);
+      if (!attempt || attempt.dashboardAgentId !== agentId) return 0;
+      return Math.max(0, CONTINUATION_MAX_DEFERRALS
+        - countContinuationDeferrals(agentId, attempt.generation));
     },
 
     // Slice 2 §2.6 — the rejection reason used to die in a console.warn here.

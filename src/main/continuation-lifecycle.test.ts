@@ -120,6 +120,10 @@ type Brick = {
   id: string; dashboardAgentId: string; handoffAttemptId: string; generation: number;
   note: string; noteSource: string; byteLen: number; writtenAt: string; supersededAt: string | null;
 };
+type Deferral = {
+  id: string; dashboardAgentId: string; handoffAttemptId: string; generation: number;
+  reason: string; retryAfterMinutes: number; deferredAt: string;
+};
 type DbAgentRow = {
   id: string; workspaceId: string; status: string; provider: string;
   continuationGeneration?: number; resumeSessionId?: string | null;
@@ -141,6 +145,10 @@ type DbModule = {
   getLatestContinuationAttempt(agentId: string, status?: string): Attempt | null;
   getOpenContinuationAttempt(agentId: string): Attempt | null;
   closeContinuationHandoffAttempt(id: string, status: string): void;
+  countContinuationDeferrals(agentId: string, generation: number): number;
+  insertContinuationDeferral(input: { agentId: string; handoffAttemptId: string; generation: number; reason: string; retryAfterMinutes: number }): Deferral;
+  getContinuationDeferralForAttempt(agentId: string, attemptId: string): Deferral | null;
+  getContinuationEscapeBudget(agentId: string, successorGeneration: number): { abortedCount: number; firstAttemptStartedAt: string | null };
   insertContinuationBrick(input: { agentId: string; handoffAttemptId: string; generation: number; note: string; noteSource: 'tool' | 'scrape' }): string;
   getLatestBrickForAttempt(agentId: string, attemptId: string, opts?: { source?: 'tool' | 'scrape' }): Brick | null;
   getCurrentBrick(agentId: string): Brick | null;
@@ -240,6 +248,33 @@ test('one-open-max at the DB level: second open attempt throws; close frees the 
 
 test('unknown agent cannot mint an attempt', () => {
   assert.throws(() => dbm.createContinuationHandoffAttempt('no-such-agent'), /no agent/);
+});
+
+test('deferral is durable, closes with deferred disposition, does not add an abort, and resets the alive clock', async () => {
+  const agent = makeDbAgent();
+  const aborted = dbm.createContinuationHandoffAttempt(agent.id);
+  dbm.closeContinuationHandoffAttempt(aborted.id, 'aborted');
+  await sleep(5);
+
+  const attempt = dbm.createContinuationHandoffAttempt(agent.id);
+  const deferral = dbm.insertContinuationDeferral({
+    agentId: agent.id,
+    handoffAttemptId: attempt.id,
+    generation: attempt.generation,
+    reason: 'finish a context-sensitive review',
+    retryAfterMinutes: 12,
+  });
+  assert.equal(dbm.getContinuationAttempt(attempt.id)!.status, 'deferred');
+  assert.equal(dbm.getOpenContinuationAttempt(agent.id), null);
+  assert.equal(dbm.countContinuationDeferrals(agent.id, attempt.generation), 1);
+  assert.deepEqual(dbm.getContinuationDeferralForAttempt(agent.id, attempt.id), deferral);
+
+  await sleep(5);
+  const retry = dbm.createContinuationHandoffAttempt(agent.id);
+  const budget = dbm.getContinuationEscapeBudget(agent.id, retry.generation);
+  assert.equal(budget.abortedCount, 1, 'the deferral is not counted as an abort');
+  assert.equal(budget.firstAttemptStartedAt, retry.startedAt,
+    'the alive-time basis starts after the latest deferral');
 });
 
 // ── DB-level: bricks ─────────────────────────────────────────────────────────

@@ -246,7 +246,17 @@ export function buildContinuationKickoffMessage(): string {
 }
 
 /** The note-request prompt injected via the send handshake. */
-export function buildNoteRequestMessage(attemptId: string, reason: string): string {
+export function buildNoteRequestMessage(
+  attemptId: string,
+  reason: string,
+  remainingDeferrals: number,
+): string {
+  const deferOffer = remainingDeferrals > 0
+    ? ` If you are close to finishing something that would materially benefit from your current context, ` +
+      `you may defer this handoff by calling defer_continuation with a short reason (and optional ` +
+      `retry_after_minutes, 5–30); the dashboard will re-ask later. ` +
+      `${remainingDeferrals} deferral${remainingDeferrals === 1 ? '' : 's'} remain.`
+    : '';
   return (
     `[DASHBOARD EVENT] Continuation handoff opened (attempt ${attemptId}). ` +
     `Reason: ${reason}. Your context is nearly exhausted; the dashboard will ` +
@@ -254,7 +264,7 @@ export function buildNoteRequestMessage(attemptId: string, reason: string): stri
     `Call the save_continuation_brick tool with a note of AT MOST 6 KB: current ` +
     `objective, per-owned-agent state (ids + what each is doing), decisions/questions ` +
     `pending with the human, and pointers (file paths, plan ids) instead of prose. ` +
-    `Do not start new work this turn.`
+    `Do not start new work this turn.` + deferOffer
   );
 }
 
@@ -263,6 +273,13 @@ export type HandshakeResult = 'ok' | 'unconfirmed' | 'failed';
 export interface CommittedBrickView {
   id: string;
   writtenAt: string;
+}
+
+export interface CommittedDeferralView {
+  id: string;
+  reason: string;
+  retryAfterMinutes: number;
+  deferredAt: string;
 }
 
 export interface ContinuationWatcherEffects {
@@ -300,6 +317,10 @@ export interface ContinuationWatcherEffects {
   /** GET /api/supervisor/continuation-brick?…&source=tool — the
    *  commit-observation read. Tool source ONLY; scrape never authorizes. */
   getCommittedToolBrick(agentId: string, attemptId: string): Promise<CommittedBrickView | null>;
+  /** Observe a durable deferral row committed for this exact attempt. */
+  getCommittedDeferral(agentId: string, attemptId: string): Promise<CommittedDeferralView | null>;
+  /** Remaining generation-scoped deferrals, used to condition the prompt. */
+  getRemainingDeferrals(agentId: string, attemptId: string): number;
   /** POST /api/agents/:id/continuation-relaunch — the ONLY kill path; the
    *  route re-checks every gate server-side. A 4xx is keep-alive AND carries
    *  the route's reason (which gate said no) onto the `backoff` phase. */
@@ -542,7 +563,11 @@ export class ContinuationWatcher {
     // 2. Inject the note request via the send handshake — never a bare write.
     const handshake = await this.fx.requestNote(
       agentId,
-      buildNoteRequestMessage(attempt.attemptId, `context ≥ ${CONTINUATION_TRIGGER_CONTEXT_PCT}%`),
+      buildNoteRequestMessage(
+        attempt.attemptId,
+        `context ≥ ${CONTINUATION_TRIGGER_CONTEXT_PCT}%`,
+        this.fx.getRemainingDeferrals(agentId, attempt.attemptId),
+      ),
     );
     if (handshake === 'failed') {
       // PRE-ATTEMPT failure: the turn provably never started, so no tool
@@ -578,6 +603,22 @@ export class ContinuationWatcher {
         // message + transcript tail are truncated ≤5 s after commit.
         await this.waitPostNoteGrace(agentId);
         await this.tryRelaunch(agentId, attempt.attemptId, st);
+        return;
+      }
+      const deferral = await this.fx.getCommittedDeferral(agentId, attempt.attemptId);
+      if (deferral) {
+        // The route atomically closed the attempt with disposition 'deferred'.
+        // This is a caller-chosen retry, not a failed note attempt: it never
+        // invokes abortAttempt and never advances the doubling failure backoff.
+        st.openAttempt = null;
+        st.committedReady = false;
+        st.lastBackoffMs = null;
+        st.backoffUntil = this.fx.now() + deferral.retryAfterMinutes * 60_000;
+        this.publish(agentId, 'backoff', {
+          attemptId: attempt.attemptId,
+          message: `Supervisor deferred the continuation: ${deferral.reason} Retry in ${deferral.retryAfterMinutes} minutes.`,
+          retryAt: st.backoffUntil,
+        });
         return;
       }
       if (this.fx.now() >= deadline) break;

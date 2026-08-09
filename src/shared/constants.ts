@@ -112,6 +112,12 @@ export const CONTINUATION_BACKOFF_CAP_MS = 3_600_000; // doubling backoff ceilin
 // aborted attempts OR stayed alive this long across the current successor cycle.
 export const CONTINUATION_ESCAPE_MAX_ATTEMPTS = 3;        // aborted attempts before escape
 export const CONTINUATION_ESCAPE_MAX_ALIVE_MS = 30 * 60_000; // 30 min alive before escape
+// A supervisor may briefly retain its current context when finishing work that
+// materially benefits from it. Deferrals are generation-scoped and bounded;
+// retry_after_minutes is clamped server-side to this range.
+export const CONTINUATION_MAX_DEFERRALS = 3;
+export const CONTINUATION_DEFER_RETRY_MINUTES_MIN = 5;
+export const CONTINUATION_DEFER_RETRY_MINUTES_MAX = 30;
 // BUG-39 (WP1) — graceful kill. The brick commit stays the sole kill-
 // AUTHORIZATION; these only soften kill-TIMING so the note-author's closing
 // turn (and any in-flight session-subagent) is not truncated ≤5 s after commit.

@@ -645,11 +645,12 @@ test('P1 auto-subscribe: run_orchestration with a plan_id upserts for the dispat
 // which args) — the SQL itself is exercised by continuation-lifecycle.test.ts.
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS } =
+const { CONTINUATION_BRICK_MAX_BYTES, CONTINUATION_ESCAPE_MAX_ATTEMPTS, CONTINUATION_ESCAPE_MAX_ALIVE_MS, CONTINUATION_MAX_DEFERRALS } =
   require('../shared/constants') as {
     CONTINUATION_BRICK_MAX_BYTES: number;
     CONTINUATION_ESCAPE_MAX_ATTEMPTS: number;
     CONTINUATION_ESCAPE_MAX_ALIVE_MS: number;
+    CONTINUATION_MAX_DEFERRALS: number;
   };
 
 type AttemptRow = {
@@ -659,6 +660,10 @@ type AttemptRow = {
 type BrickRow = {
   id: string; dashboardAgentId: string; handoffAttemptId: string; generation: number;
   note: string; noteSource: string; byteLen: number; writtenAt: string; supersededAt: string | null;
+};
+type DeferralRow = {
+  id: string; dashboardAgentId: string; handoffAttemptId: string; generation: number;
+  reason: string; retryAfterMinutes: number; deferredAt: string;
 };
 function attemptRow(over: Partial<AttemptRow> = {}): AttemptRow {
   return {
@@ -672,6 +677,13 @@ function brickRow(over: Partial<BrickRow> = {}): BrickRow {
     id: 'brick-1', dashboardAgentId: 'sup-1', handoffAttemptId: 'att-1',
     generation: 1, note: 'phase notes', noteSource: 'tool', byteLen: 11,
     writtenAt: '2026-07-03 10:00:01.000', supersededAt: null, ...over,
+  };
+}
+function deferralRow(over: Partial<DeferralRow> = {}): DeferralRow {
+  return {
+    id: 'defer-1', dashboardAgentId: 'sup-1', handoffAttemptId: 'att-1', generation: 1,
+    reason: 'finish the review', retryAfterMinutes: 10,
+    deferredAt: '2026-07-03 10:00:01.000', ...over,
   };
 }
 
@@ -885,6 +897,71 @@ test('Inc 4: continuation-brick GET returns the tool-sourced row for agent+attem
 });
 
 // ── POST /api/agents/:id/continuation-relaunch — the gate matrix ───────────
+
+// POST/GET /api/supervisor/continuation-deferral
+
+test('continuation-deferral POST is self-authored and clamps retry minutes to 5–30 (default 10)', () => {
+  const inserted: Array<Record<string, unknown>> = [];
+  return withContinuationDb({
+    getOpenContinuationAttempt: () => attemptRow(),
+    countContinuationDeferrals: () => 0,
+    insertContinuationDeferral: (input: Record<string, unknown>) => {
+      inserted.push(input);
+      return deferralRow({
+        reason: input.reason as string,
+        retryAfterMinutes: input.retryAfterMinutes as number,
+      });
+    },
+  }, async (port) => {
+    for (const body of [
+      { reason: 'finish review', retry_after_minutes: 1 },
+      { reason: 'finish tests' },
+      { reason: 'finish commit', retry_after_minutes: 99 },
+    ]) {
+      const res = await request(port, 'POST', '/api/supervisor/continuation-deferral', JSON_SUP, JSON.stringify(body));
+      assert.equal(res.status, 200, res.body);
+    }
+    assert.deepEqual(inserted.map(i => i.retryAfterMinutes), [5, 10, 30]);
+    assert.ok(inserted.every(i => i.agentId === 'sup-1'), 'author is derived from X-Supervisor-Id');
+    assert.ok(inserted.every(i => i.handoffAttemptId === 'att-1'));
+  });
+});
+
+test('continuation-deferral POST with no open attempt rejects clearly', () =>
+  withContinuationDb({ getOpenContinuationAttempt: () => null }, async (port) => {
+    const res = await request(port, 'POST', '/api/supervisor/continuation-deferral',
+      JSON_SUP, JSON.stringify({ reason: 'finish review' }));
+    assert.equal(res.status, 409);
+    assert.equal(JSON.parse(res.body).code, 'continuation-no-open-attempt');
+    assert.match(JSON.parse(res.body).error, /no handoff to defer/);
+  }));
+
+test('continuation-deferral POST rejects when the generation budget is spent', () => {
+  let inserts = 0;
+  return withContinuationDb({
+    getOpenContinuationAttempt: () => attemptRow(),
+    countContinuationDeferrals: () => CONTINUATION_MAX_DEFERRALS,
+    insertContinuationDeferral: () => { inserts++; return deferralRow(); },
+  }, async (port) => {
+    const res = await request(port, 'POST', '/api/supervisor/continuation-deferral',
+      JSON_SUP, JSON.stringify({ reason: 'one more minute' }));
+    assert.equal(res.status, 409);
+    assert.equal(JSON.parse(res.body).code, 'continuation-deferral-spent');
+    assert.match(JSON.parse(res.body).error, /note must be written now/);
+    assert.equal(inserts, 0);
+  });
+});
+
+test('continuation-deferral GET exposes the committed row for the watcher observation rail', () =>
+  withContinuationDb({
+    getContinuationDeferralForAttempt: (agentId: string, attemptId: string) =>
+      agentId === 'sup-1' && attemptId === 'att-1' ? deferralRow() : null,
+  }, async (port) => {
+    const res = await request(port, 'GET',
+      '/api/supervisor/continuation-deferral?agentId=sup-1&attemptId=att-1', SUP_HDR);
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse(res.body).deferral.id, 'defer-1');
+  }));
 
 /** All-clear defaults: committed attempt at expected gen 1, tool brick written
  *  after open, no owned agents, nothing in flight, no orchestration. Tests

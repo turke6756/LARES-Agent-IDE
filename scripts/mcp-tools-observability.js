@@ -168,6 +168,22 @@ function getObservabilityCoreToolDefinitions() {
         required: ['note'],
       },
     },
+    {
+      name: 'defer_continuation',
+      description:
+        'Defer your currently-open continuation handoff when you are close to finishing work that materially ' +
+        'benefits from the current context. The dashboard will ask again after the bounded delay. Takes no ' +
+        'agent id: your identity is derived from the caller. retry_after_minutes defaults to 10 and is clamped ' +
+        'to 5–30 minutes. Deferrals are limited per successor generation; when spent, write the note now.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string', description: 'Short reason the current work benefits from retaining context.' },
+          retry_after_minutes: { type: 'integer', description: 'Delay before the dashboard asks again (default 10, clamped to 5–30).' },
+        },
+        required: ['reason'],
+      },
+    },
     // NOTE (context-overhead pass): the team READ tools (`list_teams` /
     // `get_team`) were removed — zero calls corpus-wide since 2026-04-11, and no
     // lane documents a team workflow (the `teams` write toolset is ungranted to
@@ -373,6 +389,15 @@ async function handleObservabilityCoreToolCall(name, args, apiRequest) {
       // binds the author from the forwarded X-Supervisor-Id header (apiRequest
       // spreads CALLER_HEADERS on every call).
       const result = await apiRequest('POST', '/api/supervisor/continuation-brick', { note: args.note });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+
+    case 'defer_continuation': {
+      // Same self-authored rail as save_continuation_brick: no agent id; the
+      // proxy forwards the caller's injected X-Supervisor-Id on every request.
+      const body = { reason: args.reason };
+      if (args.retry_after_minutes !== undefined) body.retry_after_minutes = args.retry_after_minutes;
+      const result = await apiRequest('POST', '/api/supervisor/continuation-deferral', body);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
 
