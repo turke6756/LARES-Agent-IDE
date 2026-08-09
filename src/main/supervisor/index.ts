@@ -72,6 +72,7 @@ import { removeGlobalAgyStatusHook } from './agy-hooks';
 import { ensureAgyPermissions, ensureAgyTrust } from './agy-settings';
 import { addProviderAutoApproveFlag } from './provider-auto-approve';
 import { ensureNodeShimDir } from '../node-shim';
+import { prepareRestrictedOutboxLaunch } from '../sandbox/outbox-launcher';
 import { MEMORY_INDEX_MJS } from '../../shared/generated/memory-index-cli.generated';
 // WP-C — provider-neutral supervisor memory-index launch projection + Codex
 // pending-rail composition. The projection (readValidate + last-good/runtime
@@ -5151,12 +5152,31 @@ export class AgentSupervisor extends EventEmitter {
     // give a false impression of per-researcher action scoping. Browser actions
     // for the live test are enabled by the dashboard's GLOBAL toggle; true
     // per-researcher scoping waits on WP-D (scoped tokens).
+    let runnerCommand = launchCmd;
+    let runnerArgs = args;
+    let runnerDirectSpawn = useDirectSpawn;
+    if (roleLaneOf(agent) === 'researcher') {
+      const workspaceRoot = getEffectiveWorkspaceRoot(agent);
+      const stateDir = workspaceStateDirName(workspaceRoot);
+      const restricted = prepareRestrictedOutboxLaunch({
+        command: launchCmd,
+        args,
+        cwd: agent.workingDirectory,
+        outbox: path.join(workspaceRoot, stateDir, 'research', 'inbox'),
+        auditRoots: [workspaceRoot],
+        env: { ...process.env, ...extraEnv },
+      });
+      runnerCommand = restricted.command;
+      runnerArgs = restricted.args;
+      runnerDirectSpawn = true;
+      Object.assign(extraEnv, restricted.env);
+    }
     const extraEnvArg = Object.keys(extraEnv).length > 0 ? extraEnv : undefined;
     // P1 §2 step 4a(iii) — current-launch stamp for the tmux-option freshness
     // gate. Set IMMEDIATELY BEFORE the actual runner launch so no event this
     // launch produces can predate the stamp.
     this.launchStartedAt.set(agent.id, Date.now());
-    runner.launch(agent.workingDirectory, launchCmd, args, agent.logPath || '', useDirectSpawn, extraEnvArg);
+    runner.launch(agent.workingDirectory, runnerCommand, runnerArgs, agent.logPath || '', runnerDirectSpawn, extraEnvArg);
     updateAgentPid(agent.id, runner.pid);
     // BUG-23 — write `'launching'` (was `'working'`) and stamp the settle
     // timer. `StatusMonitor.poll()` will promote `'launching' → 'idle'` once
