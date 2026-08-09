@@ -28,80 +28,34 @@ export interface ParsedShellActivity {
  *   - `Add-Content [-LiteralPath] <path>` → write (append)
  *   - `Out-File [-LiteralPath] <path>` → create
  *   - `New-Item -Path <path>` → create
- *   - shell redirect `> <path>` → create
+ *   - shell redirect `> <path>` → conservative write
  *   - shell redirect `>> <path>` → write
+ *   - `tee`, `cp`/`mv`, `copy`/`move` destinations → write
+ *   - shell-invoked `apply_patch` literal heredoc headers
  *
  * Skipped (intentionally): `ls`, `find`, `Get-ChildItem`, `dir`, bare `rg <pattern>`,
- * `chmod`, `mv`, `cp`, command substitution `$(...)`, pipelines past the first
- * command, `xargs`, `for`/`foreach` loops.
+ * `chmod`, dynamic paths, inline interpreters, and individual stages containing
+ * command substitution, backticks, `xargs`, or `for`/`foreach`/`while` loops.
  */
 export function parseShellCommand(command: string, workdir: string): ParsedShellActivity[] {
   if (!command || typeof command !== 'string') return [];
-  if (hasComplexShellConstruct(command)) return [];
-  const scanCommand = command.split('|', 1)[0] || command;
   const out: ParsedShellActivity[] = [];
 
-  // Shell redirects — `>>` (append) before `>` (overwrite). The `(?<!>)` lookbehind
-  // prevents `>>` from matching twice.
-  let m: RegExpExecArray | null;
-  const appendRe = /(?<![>])>>\s*(['"]?)([^\s'"|;>]+)\1/g;
-  while ((m = appendRe.exec(scanCommand)) !== null) pushPath(out, m[2], workdir, 'write');
-  const overwriteRe = /(?<![>])>(?!>)\s*(['"]?)([^\s'"|;>]+)\1/g;
-  while ((m = overwriteRe.exec(scanCommand)) !== null) pushPath(out, m[2], workdir, 'create');
-
-  // PowerShell content cmdlets — single regex captures quoted-OR-bare path.
-  collectPowerShellCmdlet(out, scanCommand, workdir, 'Get-Content', 'read', {
-    pathFlags: ['Path', 'LiteralPath'],
-    valueFlags: ['TotalCount', 'Tail', 'ReadCount', 'Encoding', 'Delimiter', 'Filter', 'Include', 'Exclude', 'Stream', 'Credential'],
-    switchFlags: ['Raw', 'Wait', 'Force'],
-    allowPositionalPath: true,
-  });
-  collectPowerShellCmdlet(out, scanCommand, workdir, 'Select-String', 'read', {
-    pathFlags: ['Path', 'LiteralPath'],
-    valueFlags: ['Pattern', 'Encoding', 'Context', 'Include', 'Exclude', 'Culture'],
-    switchFlags: ['CaseSensitive', 'SimpleMatch', 'Quiet', 'List', 'NotMatch', 'AllMatches', 'Raw', 'NoEmphasis'],
-    allowPositionalPath: false,
-  });
-  collectPowerShellCmdlet(out, scanCommand, workdir, 'Set-Content', 'write', {
-    pathFlags: ['Path', 'LiteralPath'],
-    valueFlags: ['Value', 'Encoding', 'Filter', 'Include', 'Exclude', 'Stream', 'Credential'],
-    switchFlags: ['NoNewline', 'Force', 'Append'],
-    allowPositionalPath: true,
-  });
-  collectPowerShellCmdlet(out, scanCommand, workdir, 'Add-Content', 'write', {
-    pathFlags: ['Path', 'LiteralPath'],
-    valueFlags: ['Value', 'Encoding', 'Filter', 'Include', 'Exclude', 'Stream', 'Credential'],
-    switchFlags: ['NoNewline', 'Force'],
-    allowPositionalPath: true,
-  });
-  collectPowerShellCmdlet(out, scanCommand, workdir, 'Out-File', 'create', {
-    pathFlags: ['FilePath', 'LiteralPath', 'Path'],
-    valueFlags: ['InputObject', 'Encoding', 'Width'],
-    switchFlags: ['Append', 'NoClobber', 'NoNewline', 'Force'],
-    allowPositionalPath: true,
-  });
-  collectPowerShellCmdlet(out, scanCommand, workdir, 'New-Item', 'create', {
-    pathFlags: ['Path', 'LiteralPath'],
-    valueFlags: ['Name', 'ItemType', 'Value'],
-    switchFlags: ['Force'],
-    allowPositionalPath: true,
-  });
-
-  // Unix read commands. Allow `-n 50`-style flag/value pairs between command and path.
-  collectUnixRead(out, scanCommand, workdir, /\b(?:cat|head|tail|nl|wc)\b/g);
-  // sed -n '<range>' <file>
-  const sedRe = /\bsed\s+-n\s+(?:'[^']*'|"[^"]*")\s+(?:'([^']+)'|"([^"]+)"|(\S+))/g;
-  while ((m = sedRe.exec(scanCommand)) !== null) {
-    const p = m[1] || m[2] || m[3];
-    if (p) pushPath(out, p, workdir, 'read');
+  // Patch helpers are also invoked through shell heredocs. The literal patch
+  // headers are high-confidence and can reuse the structured patch parser.
+  if (/(?:^|[;&|]\s*)apply_patch\b/.test(command) && /\*\*\* Begin Patch/.test(command)) {
+    out.push(...parseApplyPatch(command, workdir));
   }
-  // `type foo.md` — Windows/PowerShell. Require pathy-looking arg to avoid unix `type` builtin.
-  collectIfPathy(out, scanCommand, workdir, /\btype\s+(?:'([^']+)'|"([^"]+)"|(\S+))/gi, 'read');
-  // `rg <pattern> <file>` — pattern is the first non-flag token; require file arg to look pathy.
-  const rgRe = /\brg\b(?:\s+-[^\s]+(?:\s+\S+)?)*\s+\S+\s+(?:'([^']+)'|"([^"]+)"|(\S+))/g;
-  while ((m = rgRe.exec(scanCommand)) !== null) {
-    const p = m[1] || m[2] || m[3];
-    if (p && looksLikePath(p)) pushPath(out, p, workdir, 'read');
+
+  for (const stage of splitShellStages(stripHeredocBodies(command))) {
+    // A heredoc body is data, not more shell syntax. Its redirect target lives
+    // on the header, so scan only that line and separately parse patch headers.
+    const scanText = /<<\s*['"]?[-\w]+['"]?/.test(stage) && /[\r\n]/.test(stage)
+      ? stage.split(/\r?\n/, 1)[0]
+      : stage;
+    const tokens = tokenizeShellStage(scanText);
+    if (!tokens || tokens.length === 0 || hasComplexShellConstruct(stage, tokens)) continue;
+    scanShellStage(out, tokens, workdir);
   }
 
   return dedup(out);
@@ -136,30 +90,197 @@ export function shellResultIndicatesSuccess(output: string): boolean {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+interface ShellToken {
+  value: string;
+  operator?: '>' | '>>' | '<' | '<<';
+  quoted: boolean;
+}
+
+function stripHeredocBodies(command: string): string {
+  const lines = command.split(/\r?\n/);
+  const headers: string[] = [];
+  let delimiter: string | null = null;
+  for (const line of lines) {
+    if (delimiter) {
+      if (line.trim() === delimiter) delimiter = null;
+      continue;
+    }
+    headers.push(line);
+    const match = /<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1/.exec(line);
+    if (match) delimiter = match[2];
+  }
+  return headers.join('\n');
+}
+
+function splitShellStages(command: string): string[] {
+  const stages: string[] = [];
+  let start = 0;
+  let quote: "'" | '"' | null = null;
+  let substitutionDepth = 0;
+  let backtickOpen = false;
+  const push = (end: number): void => {
+    const stage = command.slice(start, end).trim();
+    if (stage) stages.push(stage);
+  };
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (quote) {
+      if (ch === '\\' && quote === '"' && i + 1 < command.length) i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (backtickOpen) {
+      if (ch === '`') backtickOpen = false;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === '`') { backtickOpen = true; continue; }
+    if ((ch === '\\' || ch === '^') && i + 1 < command.length) { i += 1; continue; }
+    if (ch === '$' && next === '(') { substitutionDepth += 1; i += 1; continue; }
+    if (substitutionDepth > 0) {
+      if (ch === '(') substitutionDepth += 1;
+      else if (ch === ')') substitutionDepth -= 1;
+      continue;
+    }
+    const isSeparator = ch === ';' || (ch === '&' && next === '&') ||
+      (ch === '|' && next === '|') || ch === '|';
+    if (!isSeparator) continue;
+    push(i);
+    const width = (ch === '&' || (ch === '|' && next === '|')) ? 2 : 1;
+    i += width - 1;
+    start = i + 1;
+  }
+  push(command.length);
+  return stages;
+}
+
+function tokenizeShellStage(stage: string): ShellToken[] | null {
+  const tokens: ShellToken[] = [];
+  let current = '';
+  let quote: "'" | '"' | null = null;
+  let quoted = false;
+  const flush = (): void => {
+    if (current) tokens.push({ value: current, quoted });
+    current = '';
+    quoted = false;
+  };
+
+  for (let i = 0; i < stage.length; i++) {
+    const ch = stage[i];
+    if (quote) {
+      if (ch === '\\' && quote === '"' && i + 1 < stage.length) {
+        const escaped = stage[i + 1];
+        if ('\\"$`|'.includes(escaped)) { current += escaped; i += 1; }
+        else current += ch;
+      } else if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; quoted = true; continue; }
+    if ((ch === '\\' || ch === '^') && i + 1 < stage.length && /[\s|;&<>"'\\]/.test(stage[i + 1])) {
+      current += stage[i + 1];
+      i += 1;
+      continue;
+    }
+    if (/\s/.test(ch)) { flush(); continue; }
+    if (ch === '>' || ch === '<') {
+      flush();
+      const doubled = stage[i + 1] === ch;
+      const operator = (doubled ? ch + ch : ch) as '>' | '>>' | '<' | '<<';
+      tokens.push({ value: operator, operator, quoted: false });
+      if (doubled) i += 1;
+      continue;
+    }
+    current += ch;
+  }
+  if (quote) return null;
+  flush();
+  return tokens;
+}
+
+function scanShellStage(out: ParsedShellActivity[], tokens: ShellToken[], workdir: string): void {
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i].operator !== '>' && tokens[i].operator !== '>>') continue;
+    const target = tokens[i + 1];
+    if (target && !target.operator) pushStaticPath(out, target.value, workdir, 'write');
+  }
+
+  const i = tokens.findIndex((token) => !token.operator);
+  if (i < 0) return;
+  const command = commandName(tokens[i].value);
+  const args = tokens.slice(i + 1).filter((token) => !token.operator);
+  const powershell = POWERSHELL_COMMANDS[command];
+  if (powershell) {
+    const p = extractPowerShellPath(args.map((token) => token.value), powershell.options);
+    if (p) pushStaticPath(out, p, workdir, powershell.operation);
+    return;
+  }
+  if (['cat', 'head', 'tail', 'nl', 'wc'].includes(command)) {
+    if (tokens.slice(i + 1).some((token) => token.operator === '<<')) return;
+    const p = firstUnixOperand(args, command === 'head' || command === 'tail');
+    if (p) pushStaticPath(out, p, workdir, 'read');
+    return;
+  }
+  if (command === 'sed') {
+    const values = args.map((token) => token.value);
+    if (values.includes('-n')) {
+      const p = [...args].reverse().find((token) => !token.value.startsWith('-'))?.value;
+      if (p) pushStaticPath(out, p, workdir, 'read');
+    }
+    return;
+  }
+  if (command === 'type') {
+    const p = args[0]?.value;
+    if (p && looksLikePath(p)) pushStaticPath(out, p, workdir, 'read');
+    return;
+  }
+  if (command === 'rg') {
+    const positional = args.filter((token) => !token.value.startsWith('-'));
+    const p = positional[1]?.value;
+    if (p && looksLikePath(p)) pushStaticPath(out, p, workdir, 'read');
+    return;
+  }
+  if (command === 'tee') {
+    for (const target of args.filter((token) => !token.value.startsWith('-'))) {
+      pushStaticPath(out, target.value, workdir, 'write');
+    }
+    return;
+  }
+  if (['cp', 'mv', 'copy', 'move'].includes(command)) {
+    const positional = args.filter((token) => !token.value.startsWith('-'));
+    if (positional.length >= 2) pushStaticPath(out, positional[positional.length - 1].value, workdir, 'write');
+  }
+}
+
+const POWERSHELL_COMMANDS: Record<string, { operation: FileOperation; options: PowerShellCmdletOptions }> = {
+  'get-content': { operation: 'read', options: { pathFlags: ['Path', 'LiteralPath'], valueFlags: ['TotalCount', 'Tail', 'ReadCount', 'Encoding', 'Delimiter', 'Filter', 'Include', 'Exclude', 'Stream', 'Credential'], switchFlags: ['Raw', 'Wait', 'Force'], allowPositionalPath: true } },
+  'select-string': { operation: 'read', options: { pathFlags: ['Path', 'LiteralPath'], valueFlags: ['Pattern', 'Encoding', 'Context', 'Include', 'Exclude', 'Culture'], switchFlags: ['CaseSensitive', 'SimpleMatch', 'Quiet', 'List', 'NotMatch', 'AllMatches', 'Raw', 'NoEmphasis'], allowPositionalPath: false } },
+  'set-content': { operation: 'write', options: { pathFlags: ['Path', 'LiteralPath'], valueFlags: ['Value', 'Encoding', 'Filter', 'Include', 'Exclude', 'Stream', 'Credential'], switchFlags: ['NoNewline', 'Force', 'Append'], allowPositionalPath: true } },
+  'add-content': { operation: 'write', options: { pathFlags: ['Path', 'LiteralPath'], valueFlags: ['Value', 'Encoding', 'Filter', 'Include', 'Exclude', 'Stream', 'Credential'], switchFlags: ['NoNewline', 'Force'], allowPositionalPath: true } },
+  'out-file': { operation: 'create', options: { pathFlags: ['FilePath', 'LiteralPath', 'Path'], valueFlags: ['InputObject', 'Encoding', 'Width'], switchFlags: ['Append', 'NoClobber', 'NoNewline', 'Force'], allowPositionalPath: true } },
+  'new-item': { operation: 'create', options: { pathFlags: ['Path', 'LiteralPath'], valueFlags: ['Name', 'ItemType', 'Value'], switchFlags: ['Force'], allowPositionalPath: true } },
+  'tee-object': { operation: 'write', options: { pathFlags: ['FilePath', 'LiteralPath', 'Path'], valueFlags: ['InputObject', 'Variable'], switchFlags: ['Append'], allowPositionalPath: true } },
+};
+
+function firstUnixOperand(args: ShellToken[], flagMayTakeValue: boolean): string | null {
+  for (let i = 0; i < args.length; i++) {
+    if (!args[i].value.startsWith('-')) return args[i].value;
+    if (flagMayTakeValue && i + 1 < args.length && /^\d+$/.test(args[i + 1].value)) i += 1;
+  }
+  return null;
+}
+
+function commandName(value: string): string {
+  return value.replace(/^.*[\\/]/, '').replace(/\.exe$/i, '').toLowerCase();
+}
+
 interface PowerShellCmdletOptions {
   pathFlags: string[];
   valueFlags: string[];
   switchFlags: string[];
   allowPositionalPath: boolean;
-}
-
-function collectPowerShellCmdlet(
-  out: ParsedShellActivity[],
-  command: string,
-  workdir: string,
-  cmdlet: string,
-  op: FileOperation,
-  options: PowerShellCmdletOptions
-): void {
-  const headerRe = new RegExp(`\\b${escapeRegExp(cmdlet)}\\b`, 'gi');
-  let m: RegExpExecArray | null;
-  while ((m = headerRe.exec(command)) !== null) {
-    const after = command.slice(headerRe.lastIndex);
-    const tokens = tokenizePowerShellArgs(after);
-    const p = extractPowerShellPath(tokens, options);
-    if (!p) continue;
-    pushPath(out, p, workdir, op);
-  }
 }
 
 function extractPowerShellPath(tokens: string[], options: PowerShellCmdletOptions): string | null {
@@ -193,87 +314,16 @@ function extractPowerShellPath(tokens: string[], options: PowerShellCmdletOption
   return null;
 }
 
-function tokenizePowerShellArgs(input: string): string[] {
-  const tokens: string[] = [];
-  let current = '';
-  let quote: "'" | '"' | null = null;
-
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
-    if (quote) {
-      if (ch === quote) {
-        quote = null;
-      } else {
-        current += ch;
-      }
-      continue;
-    }
-
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      continue;
-    }
-    if (ch === '|' || ch === ';' || ch === '>' || ch === '\n' || ch === '\r') break;
-    if (/\s/.test(ch)) {
-      if (current.length > 0) {
-        tokens.push(current);
-        current = '';
-      }
-      continue;
-    }
-    current += ch;
-  }
-
-  if (current.length > 0) tokens.push(current);
-  return tokens;
-}
-
 function flagName(token: string | undefined): string | null {
   if (!token || !token.startsWith('-') || token === '-') return null;
   return token.replace(/^-+/, '').toLowerCase();
 }
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
- * Match a unix-y read command (`cat`/`head`/`tail`/...). Allow short flags with
- * optional values (e.g. `-n 50`) between the command and the path.
- */
-function collectUnixRead(out: ParsedShellActivity[], command: string, workdir: string, headerRe: RegExp): void {
-  let m: RegExpExecArray | null;
-  while ((m = headerRe.exec(command)) !== null) {
-    const after = command.slice(headerRe.lastIndex);
-    // Strip leading flag/value pairs: `-n 50 ` or `-foo `
-    const stripped = after.replace(/^(\s+-[A-Za-z]+\b(?:\s+\d+)?)+/, '');
-    const pathMatch = /^\s*(?:'([^']+)'|"([^"]+)"|([^\s|;>]+))/.exec(stripped);
-    if (!pathMatch) continue;
-    const p = pathMatch[1] || pathMatch[2] || pathMatch[3];
-    if (!p) continue;
-    if (p.startsWith('-')) continue;
-    pushPath(out, p, workdir, 'read');
-  }
-}
-
-function collectIfPathy(
-  out: ParsedShellActivity[],
-  command: string,
-  workdir: string,
-  re: RegExp,
-  op: FileOperation
-): void {
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(command)) !== null) {
-    const p = m[1] || m[2] || m[3];
-    if (!p) continue;
-    if (!looksLikePath(p)) continue;
-    pushPath(out, p, workdir, op);
-  }
-}
-
-function hasComplexShellConstruct(command: string): boolean {
-  return /\$\(|`/.test(command) || /\b(?:for|foreach|while|xargs)\b/i.test(command);
+function hasComplexShellConstruct(stage: string, tokens: ShellToken[]): boolean {
+  if (/\$\(|`/.test(stage)) return true;
+  return tokens.some((token) =>
+    !token.quoted && /^(?:for|foreach|while|xargs)$/i.test(commandName(token.value))
+  );
 }
 
 function looksLikePath(s: string): boolean {
@@ -285,6 +335,17 @@ function pushPath(out: ParsedShellActivity[], rawPath: string, workdir: string, 
   const resolved = resolveAgainstWorkdir(rawPath, workdir);
   if (!resolved) return;
   out.push({ filePath: resolved, operation: op });
+}
+
+function pushStaticPath(out: ParsedShellActivity[], rawPath: string, workdir: string, op: FileOperation): void {
+  if (!isStaticPath(rawPath)) return;
+  pushPath(out, rawPath, workdir, op);
+}
+
+function isStaticPath(rawPath: string): boolean {
+  if (!rawPath || /[\r\n|;&<>()*?`]/.test(rawPath)) return false;
+  if (/\$|\$\{|%[^%]+%/.test(rawPath)) return false;
+  return rawPath !== '-' && rawPath !== '/dev/stdout' && rawPath !== '/dev/stderr';
 }
 
 function resolveAgainstWorkdir(raw: string, workdir: string): string | null {

@@ -156,7 +156,7 @@ test('Claude Bash redirection captures a write using the frozen workspace root',
   ));
   reader.emit('tool-result', toolResult('bash-write', ''));
   assert.deepEqual(emitted, [
-    { agentId: 'agent-1', filePath: 'C:\\repo\\reports\\bash-output.txt', operation: 'create' },
+    { agentId: 'agent-1', filePath: 'C:\\repo\\reports\\bash-output.txt', operation: 'write' },
   ]);
 });
 
@@ -185,6 +185,33 @@ test('Claude is_error result drops pending Bash activity even without a parseabl
   reader.emit('tool-use', toolUse('Bash', { command: 'cat src/missing.ts' }, 'bash-failed'));
   reader.emit('tool-result', toolResult('bash-failed', 'Exit code 1\ncat: file not found', true));
   assert.deepEqual(emitted, []);
+});
+
+test('failed-after-write preserves only the shell write-family destination', () => {
+  const { reader, emitted } = makeHarness('C:\\repo');
+  reader.emit('tool-use', toolUse(
+    'Bash',
+    { command: 'cat src/input.ts; echo changed > reports/partial.txt; exit 1' },
+    'bash-partial',
+  ));
+  reader.emit('tool-result', toolResult('bash-partial', 'Exit code: 1\nfailed'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\repo\\reports\\partial.txt', operation: 'write' },
+  ]);
+});
+
+test('killed shell command preserves a high-confidence write and terminates pending state', () => {
+  const { reader, monitor, emitted } = makeHarness('C:\\repo');
+  reader.emit('tool-use', toolUse(
+    'run_terminal_command',
+    { command: 'tee reports/killed.txt' },
+    'killed-write',
+  ));
+  reader.emit('tool-result', toolResult('killed-write', 'Command killed after timeout', true));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\repo\\reports\\killed.txt', operation: 'write' },
+  ]);
+  assert.equal((monitor as any).pendingShellActivity.has('agent-1:killed-write'), false);
 });
 
 test('Claude Monitor and non-command tools stay ignored', () => {
@@ -338,12 +365,22 @@ test('deferred exec still running after first wait, resolved by a later wait', (
   assert.deepEqual(emitted, [{ agentId: 'agent-1', filePath: 'C:\\ws\\src\\e.ts', operation: 'write' }]);
 });
 
-test('failed exec (nonzero nested exit) drops all pending activity', () => {
+test('failed exec (nonzero nested exit) drops pending read activity', () => {
   const { reader, emitted } = makeHarness('C:\\ws');
   const src = `const r = await tools.shell_command({command:"Get-Content -Raw 'C:\\\\ws\\\\src\\\\f.ts'","workdir":"C:\\\\ws\\\\codex"});\ntext(r);\n`;
   reader.emit('tool-use', execUse('call_F', src));
   reader.emit('tool-result', toolResult('call_F', 'Script failed\nOutput:\nExit code: 1\nnot found'));
   assert.deepEqual(emitted, []);
+});
+
+test('failed exec preserves a nested shell write-family destination', () => {
+  const { reader, emitted } = makeHarness('C:\\ws');
+  const src = `const r = await tools.shell_command({command:"echo changed > 'C:\\\\ws\\\\src\\\\partial.ts'; exit 1",workdir:"C:\\\\ws\\\\codex"});\ntext(r);\n`;
+  reader.emit('tool-use', execUse('call_partial', src));
+  reader.emit('tool-result', toolResult('call_partial', 'Script failed\nOutput:\nExit code: 1\nfailed'));
+  assert.deepEqual(emitted, [
+    { agentId: 'agent-1', filePath: 'C:\\ws\\src\\partial.ts', operation: 'write' },
+  ]);
 });
 
 test('exec with only dynamic/computed calls captures nothing and does not crash', () => {
@@ -718,6 +755,33 @@ test('WP-1b: pendingShellActivity caps at 6000 under missing-result traffic', ()
   assert.equal(pending.size, CAP, 'pendingShellActivity bounded at exactly 6000');
   assert.equal(pending.has('agent-1:p0'), false, 'oldest pending entry evicted');
   assert.equal(pending.has(`agent-1:p${CAP}`), true, 'newest pending entry retained');
+});
+
+test('monitor stop terminates unresolved shell and exec/wait pending lifecycles', () => {
+  const { reader, monitor } = makeHarness();
+  reader.emit('tool-use', toolUse(
+    'shell_command',
+    { command: 'echo x > result.txt', workdir: 'C:\\repo' },
+    'pending-stop',
+  ));
+  assert.equal((monitor as any).pendingShellActivity.size, 1);
+  monitor.stop();
+  assert.equal((monitor as any).pendingShellActivity.size, 0);
+  assert.equal((monitor as any).pendingCellActivity.size, 0);
+  assert.equal((monitor as any).waitCallToCell.size, 0);
+});
+
+test('agent stop terminator clears pending activity but retains final stats', () => {
+  const { reader, monitor } = makeHarness();
+  reader.emit('usage', makeUsage('agent-1', 'session-final'));
+  reader.emit('tool-use', toolUse(
+    'shell_command',
+    { command: 'echo x > result.txt', workdir: 'C:\\repo' },
+    'pending-agent-stop',
+  ));
+  monitor.terminatePendingShellActivity('agent-1');
+  assert.equal((monitor as any).pendingShellActivity.has('agent-1:pending-agent-stop'), false);
+  assert.equal(monitor.getStats('agent-1')?.sessionId, 'session-final');
 });
 
 test('WP-1b: invalidateAgent empties all three capped structures', () => {

@@ -357,9 +357,20 @@ test('(c) stopAgent clears the pending entry; its done emission does not deliver
     h.injectWindowsRunner(agent.id);
     assert.equal(h.pendingMap().size, 1);
 
+    const contextMonitor = (h.supervisor as unknown as {
+      contextStatsMonitor: { pendingShellActivity: Map<string, unknown> };
+    }).contextStatsMonitor;
+    const orphanedShellKey = `${agent.id}:orphaned-shell-call`;
+    contextMonitor.pendingShellActivity.set(orphanedShellKey, []);
+
     await h.supervisor.stopAgent(agent.id);
     await flushMicrotasks();
     assert.equal(h.pendingMap().size, 0, 'entry cleared on stop');
+    assert.equal(
+      contextMonitor.pendingShellActivity.has(orphanedShellKey),
+      false,
+      'production stopAgent terminates unresolved shell capture state',
+    );
     assert.equal(h.sendInputCalls.length, 0, "stopAgent's 'done' transition delivered nothing");
   } finally {
     h.cleanup();

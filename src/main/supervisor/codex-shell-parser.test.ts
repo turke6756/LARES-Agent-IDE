@@ -135,10 +135,10 @@ test('New-Item -Path → create', () => {
   assert.equal(r[0].operation, 'create');
 });
 
-test('shell redirect > path → create', () => {
+test('shell redirect > path → conservative write', () => {
   const r = parseShellCommand('echo hi > log.txt', WSL_CWD);
   assert.equal(r.length, 1);
-  assert.equal(r[0].operation, 'create');
+  assert.equal(r[0].operation, 'write');
   assert.equal(r[0].filePath, '/home/edward/proj/log.txt');
 });
 
@@ -166,12 +166,85 @@ test('unknown PowerShell flag without a path -> empty', () => {
   assert.deepEqual(parseShellCommand('Get-Content -UnknownFlag', WIN_CWD), []);
 });
 
-test('pipeline output file in later stage -> empty', () => {
-  assert.deepEqual(parseShellCommand('Get-ChildItem | Out-File results.txt', WIN_CWD), []);
+test('pipeline output file in later stage is captured', () => {
+  assert.deepEqual(parseShellCommand('Get-ChildItem | Out-File results.txt', WIN_CWD), [
+    { operation: 'create', filePath: 'C:\\proj\\results.txt' },
+  ]);
 });
 
 test('command substitution -> empty', () => {
   assert.deepEqual(parseShellCommand('cat $(Get-Item package.json)', WIN_CWD), []);
+});
+
+test('complex construct skips only its segment', () => {
+  assert.deepEqual(parseShellCommand('cat $(Get-Item package.json); echo ok > result.txt', WIN_CWD), [
+    { operation: 'write', filePath: 'C:\\proj\\result.txt' },
+  ]);
+});
+
+test('xargs and loop segments do not suppress independent stages', () => {
+  assert.deepEqual(parseShellCommand('xargs tee bad.txt | cat safe.txt; for x in a > also-bad.txt; echo ok > good.txt', WIN_CWD), [
+    { operation: 'read', filePath: 'C:\\proj\\safe.txt' },
+    { operation: 'write', filePath: 'C:\\proj\\good.txt' },
+  ]);
+});
+
+test('quoted and escaped pipes remain data', () => {
+  assert.deepEqual(parseShellCommand('echo "a|b" > quoted.txt; echo a\\|b > escaped.txt', WSL_CWD), [
+    { operation: 'write', filePath: '/home/edward/proj/quoted.txt' },
+    { operation: 'write', filePath: '/home/edward/proj/escaped.txt' },
+  ]);
+});
+
+test('escaped quote does not expose a quoted pipe as an operator', () => {
+  assert.deepEqual(parseShellCommand('echo "a\\\"|b" > escaped-quote.txt', WSL_CWD), [
+    { operation: 'write', filePath: '/home/edward/proj/escaped-quote.txt' },
+  ]);
+});
+
+test('all pipeline stages and sequential segments are scanned', () => {
+  assert.deepEqual(parseShellCommand('cat a.txt | tee out.txt | grep x; cmd2 > final.txt', WSL_CWD), [
+    { operation: 'read', filePath: '/home/edward/proj/a.txt' },
+    { operation: 'write', filePath: '/home/edward/proj/out.txt' },
+    { operation: 'write', filePath: '/home/edward/proj/final.txt' },
+  ]);
+});
+
+test('tee append, copy, and move destinations are writes', () => {
+  assert.deepEqual(parseShellCommand('tee -a log.txt; cp a.txt b.txt; move b.txt c.txt', WIN_CWD), [
+    { operation: 'write', filePath: 'C:\\proj\\log.txt' },
+    { operation: 'write', filePath: 'C:\\proj\\b.txt' },
+    { operation: 'write', filePath: 'C:\\proj\\c.txt' },
+  ]);
+});
+
+test('PowerShell pipeline sinks capture literal destinations', () => {
+  assert.deepEqual(parseShellCommand('Get-ChildItem | Set-Content result.txt | Tee-Object -FilePath copy.txt', WIN_CWD), [
+    { operation: 'write', filePath: 'C:\\proj\\result.txt' },
+    { operation: 'write', filePath: 'C:\\proj\\copy.txt' },
+  ]);
+});
+
+test('heredoc redirect scans the header but not body syntax', () => {
+  const command = 'cat <<EOF > output.txt\nbody | tee bogus.txt\nEOF';
+  assert.deepEqual(parseShellCommand(command, WSL_CWD), [
+    { operation: 'write', filePath: '/home/edward/proj/output.txt' },
+  ]);
+});
+
+test('apply_patch shell heredoc reuses literal patch-header parsing', () => {
+  const command = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/a.ts\n@@\n+x\n*** End Patch\nPATCH";
+  assert.deepEqual(parseShellCommand(command, WIN_CWD), [
+    { operation: 'write', filePath: 'C:\\proj\\src\\a.ts' },
+  ]);
+});
+
+test('dynamic destinations stay uncaptured', () => {
+  assert.deepEqual(parseShellCommand('echo x > "$OUT"; tee ${target}; cp a.txt %DEST%', WIN_CWD), []);
+});
+
+test('recognized command names used as ordinary arguments are not commands', () => {
+  assert.deepEqual(parseShellCommand('echo tee innocent.txt', WIN_CWD), []);
 });
 
 test('absolute path (Windows) is preserved', () => {

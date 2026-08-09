@@ -6949,6 +6949,9 @@ export class AgentSupervisor extends EventEmitter {
     // WP-P2 — a stopped agent must never receive its pending initial prompt
     // (clear BEFORE the 'done' emission below; 'done' is input-accepting).
     this.pendingInitialPrompts.delete(agentId);
+    // A terminal agent can no longer produce matching shell/exec/wait results.
+    // Retain final stats while terminating its unresolved capture state.
+    this.contextStatsMonitor.terminatePendingShellActivity(agentId);
 
     if (!killedRunner && (prior.status === 'done' || prior.status === 'crashed')) {
       // Idempotent no-op: already terminal with no runner to kill. Deliberately

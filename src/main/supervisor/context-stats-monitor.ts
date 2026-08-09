@@ -13,6 +13,13 @@ export interface JsonlFileActivity {
   operation: FileOperation;
 }
 
+interface PendingShellTouch {
+  activity: ParsedShellActivity;
+  /** Shell commands may have mutated before a terminal failure. Structured
+   * apply_patch keeps its existing success-only contract. */
+  preserveWriteOnFailure: boolean;
+}
+
 /** Optional durable last-snapshot cache. It is deliberately injected so the
  * monitor stays independently testable and remains usable without a database. */
 export interface ContextStatsPersistence {
@@ -85,10 +92,10 @@ export class ContextStatsMonitor extends EventEmitter {
   // call_id; on its immediate result it either captures (success), drops
   // (failure), or — when the exec deferred to a cell — moves to
   // `pendingCellActivity` to await the matching `wait` result.
-  private pendingShellActivity = new Map<string, ParsedShellActivity[]>();
+  private pendingShellActivity = new Map<string, PendingShellTouch[]>();
   // Deferred Codex exec activity, keyed `${agentId}:${cellId}`. Resolved when a
   // `wait(cell_id)` tool-result arrives (see handleToolResult).
-  private pendingCellActivity = new Map<string, ParsedShellActivity[]>();
+  private pendingCellActivity = new Map<string, PendingShellTouch[]>();
   // `wait` tool-use call_id → cell_id, keyed `${agentId}:${waitToolUseId}`, so
   // the wait's tool-result can be routed back to the deferred cell it polled.
   private waitCallToCell = new Map<string, string>();
@@ -125,6 +132,11 @@ export class ContextStatsMonitor extends EventEmitter {
     this.reader.off('usage', this.handleUsage);
     this.reader.off('tool-use', this.handleToolUse);
     this.reader.off('tool-result', this.handleToolResult);
+    // No result can arrive after the monitor detaches. Terminate every pending
+    // lifecycle now rather than retaining it until FIFO pressure or reuse.
+    this.pendingShellActivity.clear();
+    this.pendingCellActivity.clear();
+    this.waitCallToCell.clear();
     this.started = false;
   }
 
@@ -193,6 +205,12 @@ export class ContextStatsMonitor extends EventEmitter {
     try { this.persistence?.delete(agentId); } catch { /* best-effort cache */ }
     this.seenUuids.delete(agentId);
     this.seenFiles.delete(agentId);
+    this.terminatePendingShellActivity(agentId);
+  }
+
+  /** End unresolved command lifecycles when one agent stops, without erasing
+   * its final context stats or file dedupe history. */
+  terminatePendingShellActivity(agentId: string): void {
     const prefix = `${agentId}:`;
     for (const key of this.pendingShellActivity.keys()) {
       if (key.startsWith(prefix)) this.pendingShellActivity.delete(key);
@@ -339,7 +357,11 @@ export class ContextStatsMonitor extends EventEmitter {
         parsed = parseApplyPatch(input.input, workdir);
       }
       if (parsed.length > 0) {
-        this.pendingShellActivity.set(`${e.agentId}:${e.toolUseId}`, parsed);
+        const preserveWriteOnFailure = SHELL_TOOL_NAMES.has(e.toolName);
+        this.pendingShellActivity.set(
+          `${e.agentId}:${e.toolUseId}`,
+          parsed.map((activity) => ({ activity, preserveWriteOnFailure })),
+        );
         // WP-1b: global FIFO cap. pendingShellActivity grows forever when a
         // matching tool-result never arrives; bound it by evicting the oldest
         // pending entries (insertion-ordered Map keys).
@@ -420,12 +442,14 @@ export class ContextStatsMonitor extends EventEmitter {
       calls.find((c): c is Extract<typeof c, { kind: 'shell_command' }> =>
         c.kind === 'shell_command' && !!c.workdir)?.workdir ?? null;
 
-    const activities: ParsedShellActivity[] = [];
+    const activities: PendingShellTouch[] = [];
     for (const call of calls) {
       if (call.kind === 'shell_command') {
-        activities.push(...parseShellCommand(call.command, call.workdir || fallbackWorkdir));
+        activities.push(...parseShellCommand(call.command, call.workdir || fallbackWorkdir)
+          .map((activity) => ({ activity, preserveWriteOnFailure: true })));
       } else {
-        activities.push(...parseApplyPatch(call.patch, call.workdir || siblingWorkdir || fallbackWorkdir));
+        activities.push(...parseApplyPatch(call.patch, call.workdir || siblingWorkdir || fallbackWorkdir)
+          .map((activity) => ({ activity, preserveWriteOnFailure: false })));
       }
     }
     if (activities.length === 0) return;
@@ -446,7 +470,7 @@ export class ContextStatsMonitor extends EventEmitter {
     if (pending) {
       this.pendingShellActivity.delete(key);
       const outcome = classifyExecOutcome(e.content);
-      if (outcome.kind === 'deferred') {
+      if (outcome.kind === 'deferred' && !e.isError) {
         // A Codex exec that kept running: its real result arrives later via
         // wait(cell_id). Park the activity under the cell until then.
         const cellKey = `${e.agentId}:${outcome.cellId}`;
@@ -458,10 +482,7 @@ export class ContextStatsMonitor extends EventEmitter {
         }
         return;
       }
-      if (e.isError || outcome.kind === 'failure') return;
-      for (const a of pending) {
-        this.captureFileActivity(e.agentId, a.filePath, a.operation, e.toolUseId);
-      }
+      this.capturePendingTouches(e.agentId, e.toolUseId, pending, e.isError || outcome.kind === 'failure');
       return;
     }
 
@@ -473,13 +494,27 @@ export class ContextStatsMonitor extends EventEmitter {
     const cellPending = this.pendingCellActivity.get(cellKey);
     if (!cellPending) return;
     const outcome = classifyExecOutcome(e.content);
-    if (outcome.kind === 'deferred') return; // still running — a later wait resolves it
+    if (outcome.kind === 'deferred' && !e.isError) return; // still running — a later wait resolves it
     this.pendingCellActivity.delete(cellKey);
-    if (e.isError || outcome.kind === 'failure') return;
-    for (const a of cellPending) {
-      this.captureFileActivity(e.agentId, a.filePath, a.operation, e.toolUseId);
-    }
+    this.capturePendingTouches(e.agentId, e.toolUseId, cellPending, e.isError || outcome.kind === 'failure');
   };
+
+  private capturePendingTouches(
+    agentId: string,
+    toolUseId: string,
+    pending: PendingShellTouch[],
+    failed: boolean,
+  ): void {
+    for (const touch of pending) {
+      if (failed && (!touch.preserveWriteOnFailure || touch.activity.operation === 'read')) continue;
+      this.captureFileActivity(
+        agentId,
+        touch.activity.filePath,
+        touch.activity.operation,
+        toolUseId,
+      );
+    }
+  }
 }
 
 /**
