@@ -289,6 +289,9 @@ interface HarnessOverrides {
   queue?: CheckpointQueue;
   writeIntentLedger?: CommitCoordinatorDeps['writeIntentLedger'];
   contractVersion?: number;
+  resolvePlanningActivity?: CommitCoordinatorDeps['resolvePlanningActivity'];
+  advancePlanningActivityHead?: CommitCoordinatorDeps['advancePlanningActivityHead'];
+  promotePlanningActivity?: CommitCoordinatorDeps['promotePlanningActivity'];
 }
 
 function fakeHarness(snapshot: CandidateTokenSnapshot, git: ReturnType<typeof makeFakeGit>, overrides: HarnessOverrides = {}) {
@@ -320,9 +323,41 @@ function fakeHarness(snapshot: CandidateTokenSnapshot, git: ReturnType<typeof ma
     newAttemptId: () => 'attempt-1',
     writeIntentLedger: overrides.writeIntentLedger,
     contractVersion: overrides.contractVersion,
+    resolvePlanningActivity: overrides.resolvePlanningActivity,
+    advancePlanningActivityHead: overrides.advancePlanningActivityHead,
+    promotePlanningActivity: overrides.promotePlanningActivity,
   });
   return { coordinator, tokens, attempts, composeLocks };
 }
+
+test('production Save activity path atomically advances activity ref then originates eager promotion', async () => {
+  const parent = 'a'.repeat(40);
+  const committed = 'b'.repeat(40);
+  const snapshot = makeSnapshot({ members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }] });
+  const git = makeFakeGit({ currentHead: committed, reflog: `${committed} lares-commit:attempt-1`,
+    parents: { [committed]: parent }, trees: { [committed]: [{ pathB64: pathOf('a.txt').pathBytesBase64, mode: '100644', oid: 'c1' }] },
+    indexReads: [Buffer.alloc(0), Buffer.alloc(0)] });
+  const calls: string[] = [];
+  const { coordinator } = fakeHarness(snapshot, git, {
+    resolvePlanningActivity: () => ({
+      executionRunId: 'run-activity', planId: 'plan', logicalWorkspaceId: 'ws', objectDatabaseKey: 'odb',
+      activityRepositoryKey: REPOSITORY_KEY, primaryRepositoryKey: 'primary', path: 'X:/repo',
+      baselineOid: parent, activityHeadRef: 'refs/lares/activities/run-activity/head', promotedHeadOid: null,
+      state: 'active', failureCode: null, createdAt: 1, updatedAt: 1,
+    }),
+    advancePlanningActivityHead: async (input) => {
+      calls.push(`advance:${input.expectedOldOid}:${input.newOid}:${input.activityHeadRef}`);
+      return { ok: true };
+    },
+    promotePlanningActivity: async (runId) => { calls.push(`promote:${runId}`); },
+  });
+  const result = await coordinator.commit({ tokenId: 'tok-1', message: 'save activity task' });
+  assert.equal(result.kind, 'outcome');
+  assert.deepEqual(calls, [
+    `advance:${parent}:${committed}:refs/lares/activities/run-activity/head`,
+    'promote:run-activity',
+  ]);
+});
 
 // ── Ordering / rejection layer ─────────────────────────────────────────────────
 

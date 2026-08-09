@@ -2351,6 +2351,37 @@ function initContextOptimizerSchema(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_planning_activity_worktrees_state
     ON planning_activity_worktrees(state, logical_workspace_id)`);
 
+  // Save-card architecture WP-6 — durable merge-back journal. Attempts are
+  // written before merge plumbing starts; conflicts retain the exact stage OIDs
+  // so a restart can restore the same content decision instead of guessing.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS activity_merge_attempts (
+      id                  TEXT PRIMARY KEY,
+      execution_run_id    TEXT NOT NULL REFERENCES planning_activity_worktrees(execution_run_id) ON DELETE CASCADE,
+      base_oid            TEXT NOT NULL,
+      primary_head_oid    TEXT NOT NULL,
+      activity_head_oid   TEXT NOT NULL,
+      proposed_commit_oid TEXT,
+      state               TEXT NOT NULL CHECK (state IN ('pending','conflicted','committed','stale','failed')),
+      started_at          INTEGER NOT NULL,
+      ended_at            INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_activity_merge_attempts_run
+    ON activity_merge_attempts(execution_run_id, started_at DESC)`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS activity_merge_conflicts (
+      attempt_id          TEXT NOT NULL REFERENCES activity_merge_attempts(id) ON DELETE CASCADE,
+      path_bytes_base64   TEXT NOT NULL,
+      base_blob_oid       TEXT,
+      primary_blob_oid    TEXT,
+      activity_blob_oid   TEXT,
+      resolution_blob_oid TEXT,
+      resolution          TEXT CHECK (resolution IN ('keep-primary','take-activity','merged')),
+      PRIMARY KEY (attempt_id, path_bytes_base64)
+    )
+  `);
+
   // Planning-surface WP-P5-dispatch — durable send-before-confirmation ledger.
   // The pending row is committed before any worker bytes are sent. A confirmed
   // turn id then anchors the ready→executing transition and restart reconciliation;
@@ -8052,6 +8083,7 @@ export function updatePlanningActivityWorktree(input: {
   executionRunId: string;
   activityRepositoryKey?: string;
   objectDatabaseKey?: string;
+  promotedHeadOid?: string | null;
   state?: PlanningActivityWorktreeState;
   failureCode?: string | null;
   updatedAt: number;
@@ -8060,14 +8092,105 @@ export function updatePlanningActivityWorktree(input: {
   if (!current) throw new Error(`planning activity not found: ${input.executionRunId}`);
   run(
     `UPDATE planning_activity_worktrees SET activity_repository_key = ?, object_database_key = ?,
-       state = ?, failure_code = ?, updated_at = ? WHERE execution_run_id = ?`,
+       promoted_head_oid = ?, state = ?, failure_code = ?, updated_at = ? WHERE execution_run_id = ?`,
     [input.activityRepositoryKey ?? current.activityRepositoryKey,
       input.objectDatabaseKey ?? current.objectDatabaseKey,
+      input.promotedHeadOid === undefined ? current.promotedHeadOid : input.promotedHeadOid,
       input.state ?? current.state,
       input.failureCode === undefined ? current.failureCode : input.failureCode,
       input.updatedAt, input.executionRunId],
   );
   return getPlanningActivityWorktree(input.executionRunId)!;
+}
+
+// ── Save-card architecture WP-6 — activity merge journal ─────────────────────
+
+export type ActivityMergeAttemptState = 'pending' | 'conflicted' | 'committed' | 'stale' | 'failed';
+export interface ActivityMergeAttempt {
+  id: string; executionRunId: string;
+  baseOid: string; primaryHeadOid: string; activityHeadOid: string;
+  proposedCommitOid: string | null; state: ActivityMergeAttemptState;
+  startedAt: number; endedAt: number | null;
+}
+export interface ActivityMergeConflict {
+  attemptId: string; pathBytesBase64: string;
+  baseBlobOid: string | null; primaryBlobOid: string | null; activityBlobOid: string | null;
+  resolutionBlobOid: string | null;
+  resolution: 'keep-primary' | 'take-activity' | 'merged' | null;
+}
+
+function rowToActivityMergeAttempt(row: any): ActivityMergeAttempt {
+  return {
+    id: row.id, executionRunId: row.execution_run_id, baseOid: row.base_oid,
+    primaryHeadOid: row.primary_head_oid, activityHeadOid: row.activity_head_oid,
+    proposedCommitOid: row.proposed_commit_oid ?? null, state: row.state,
+    startedAt: row.started_at, endedAt: row.ended_at ?? null,
+  };
+}
+function rowToActivityMergeConflict(row: any): ActivityMergeConflict {
+  return {
+    attemptId: row.attempt_id, pathBytesBase64: row.path_bytes_base64,
+    baseBlobOid: row.base_blob_oid ?? null, primaryBlobOid: row.primary_blob_oid ?? null,
+    activityBlobOid: row.activity_blob_oid ?? null,
+    resolutionBlobOid: row.resolution_blob_oid ?? null, resolution: row.resolution ?? null,
+  };
+}
+
+export function insertActivityMergeAttempt(row: ActivityMergeAttempt): ActivityMergeAttempt {
+  run(`INSERT INTO activity_merge_attempts
+    (id, execution_run_id, base_oid, primary_head_oid, activity_head_oid,
+     proposed_commit_oid, state, started_at, ended_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  [row.id, row.executionRunId, row.baseOid, row.primaryHeadOid, row.activityHeadOid,
+    row.proposedCommitOid, row.state, row.startedAt, row.endedAt]);
+  return getActivityMergeAttempt(row.id)!;
+}
+export function getActivityMergeAttempt(id: string): ActivityMergeAttempt | null {
+  const row = queryOne('SELECT * FROM activity_merge_attempts WHERE id = ?', [id]);
+  return row ? rowToActivityMergeAttempt(row) : null;
+}
+export function listActivityMergeAttempts(executionRunId?: string): ActivityMergeAttempt[] {
+  const rows = executionRunId
+    ? queryAll('SELECT * FROM activity_merge_attempts WHERE execution_run_id = ? ORDER BY started_at DESC, id DESC', [executionRunId])
+    : queryAll('SELECT * FROM activity_merge_attempts ORDER BY started_at DESC, id DESC', []);
+  return rows.map(rowToActivityMergeAttempt);
+}
+export function updateActivityMergeAttempt(input: {
+  id: string; state?: ActivityMergeAttemptState; proposedCommitOid?: string | null; endedAt?: number | null;
+}): ActivityMergeAttempt {
+  const current = getActivityMergeAttempt(input.id);
+  if (!current) throw new Error(`activity merge attempt not found: ${input.id}`);
+  run(`UPDATE activity_merge_attempts SET state = ?, proposed_commit_oid = ?, ended_at = ? WHERE id = ?`,
+    [input.state ?? current.state,
+      input.proposedCommitOid === undefined ? current.proposedCommitOid : input.proposedCommitOid,
+      input.endedAt === undefined ? current.endedAt : input.endedAt, input.id]);
+  return getActivityMergeAttempt(input.id)!;
+}
+export function replaceActivityMergeConflicts(attemptId: string, rows: readonly ActivityMergeConflict[]): void {
+  const tx = getDb().transaction(() => {
+    run('DELETE FROM activity_merge_conflicts WHERE attempt_id = ?', [attemptId]);
+    for (const row of rows) run(`INSERT INTO activity_merge_conflicts
+      (attempt_id, path_bytes_base64, base_blob_oid, primary_blob_oid, activity_blob_oid,
+       resolution_blob_oid, resolution) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [attemptId, row.pathBytesBase64, row.baseBlobOid, row.primaryBlobOid, row.activityBlobOid,
+      row.resolutionBlobOid, row.resolution]);
+  });
+  tx();
+}
+export function listActivityMergeConflicts(attemptId: string): ActivityMergeConflict[] {
+  return queryAll('SELECT * FROM activity_merge_conflicts WHERE attempt_id = ? ORDER BY path_bytes_base64', [attemptId])
+    .map(rowToActivityMergeConflict);
+}
+export function resolveActivityMergeConflict(input: {
+  attemptId: string; pathBytesBase64: string;
+  resolution: ActivityMergeConflict['resolution']; resolutionBlobOid: string | null;
+}): ActivityMergeConflict | null {
+  run(`UPDATE activity_merge_conflicts SET resolution = ?, resolution_blob_oid = ?
+    WHERE attempt_id = ? AND path_bytes_base64 = ?`,
+  [input.resolution, input.resolutionBlobOid, input.attemptId, input.pathBytesBase64]);
+  const row = queryOne(`SELECT * FROM activity_merge_conflicts
+    WHERE attempt_id = ? AND path_bytes_base64 = ?`, [input.attemptId, input.pathBytesBase64]);
+  return row ? rowToActivityMergeConflict(row) : null;
 }
 
 function rowToSaveIntent(row: any): SaveIntent {

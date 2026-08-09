@@ -137,6 +137,7 @@ function buildRoutes(overrides: RouteOverrides = {}): SaveCardRoutes {
       observedCommands.push([...args]);
       return runGitBytes(cwd, args, { ...options, gitExe });
     },
+    listPlanningActivities: () => [],
     ...overrides,
   });
 }
@@ -222,6 +223,35 @@ test('flagged production inventory returns intentUnits beside parity bundles', a
       .flatMap((bundle) => bundle.members.map((member) => member.entry.entryId)).sort(),
     'intent and legacy bundle projections agree on identical evidence bytes',
   );
+});
+
+test('flagged inventory projects each planning activity as its own card with persisted conflicts', async () => {
+  const pathBytesBase64 = Buffer.from('conflicted/path.ts').toString('base64');
+  const routes = buildRoutes({
+    intentPackaging: true,
+    listSaveIntents: () => [], listNamedSaveSetMembers: () => [],
+    listPlanningActivities: () => [{
+      executionRunId: 'run-plan-b', planId: 'plan-b', logicalWorkspaceId: 'workspace-a',
+      objectDatabaseKey: 'odb', activityRepositoryKey: 'activity', primaryRepositoryKey: 'primary',
+      path: '/activity', baselineOid: 'a'.repeat(40), activityHeadRef: 'refs/lares/activities/run-plan-b/head',
+      promotedHeadOid: null, state: 'merge-conflicted', failureCode: null, createdAt: 1, updatedAt: 2,
+    }],
+    listActivityMergeAttempts: () => [{
+      id: 'attempt-b', executionRunId: 'run-plan-b', baseOid: 'a'.repeat(40),
+      primaryHeadOid: 'b'.repeat(40), activityHeadOid: 'c'.repeat(40), proposedCommitOid: null,
+      state: 'conflicted', startedAt: 2, endedAt: 3,
+    }],
+    listActivityMergeConflicts: () => [{
+      attemptId: 'attempt-b', pathBytesBase64, baseBlobOid: '1'.repeat(40),
+      primaryBlobOid: '2'.repeat(40), activityBlobOid: '3'.repeat(40),
+      resolutionBlobOid: null, resolution: null,
+    }],
+    getPlan: (() => ({ id: 'plan-b', slug: 'Plan B', path: '/plan-b' })) as any,
+  });
+  const inventory = await routes.getInventory({ workspaceId: 'workspace-a' });
+  assert.equal(inventory.planningActivities?.length, 1);
+  assert.equal(inventory.planningActivities?.[0].status, 'merge-conflicted');
+  assert.equal(inventory.planningActivities?.[0].conflicts[0].displayPath, 'conflicted/path.ts');
 });
 
 test('projects immutable turn stamps into Save-card plan labels', async () => {

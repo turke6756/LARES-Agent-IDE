@@ -6,8 +6,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import {
+  getActiveAgents,
   getPlanningActivityWorktree,
   insertPlanningActivityWorktreeProvisioning,
+  listActivityMergeAttempts,
   updatePlanningActivityWorktree,
   type PlanningActivityWorktree,
 } from '../database';
@@ -263,4 +265,96 @@ export async function advancePlanningActivityHead(input: {
     ...GIT_OPTS, gitExe: input.gitExe, stdin,
   });
   return result.code === 0 ? { ok: true } : { ok: false, diagnostic: result.stderr.trim() };
+}
+
+export interface PlanningActivityCleanupProofs {
+  activityCompleted: boolean;
+  reachable: boolean;
+  worktreeClean: boolean;
+  noLiveLease: boolean;
+  noPendingMerge: boolean;
+  fullyPromoted: boolean;
+  ownershipMarker: boolean;
+}
+
+export type PlanningActivityCleanupResult =
+  | { ok: true; state: 'cleaned'; proofs: PlanningActivityCleanupProofs }
+  | { ok: false; state: 'recovery-required'; proofs: PlanningActivityCleanupProofs; reason: string };
+
+function markerOwnedByRun(markerPath: string, executionRunId: string): boolean {
+  try {
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as Record<string, unknown>;
+    return marker.owner === 'lares' && marker.version === 1 && marker.executionRunId === executionRunId;
+  } catch { return false; }
+}
+
+/** Design §5.3 proof gate. The activity directory/ref are removed only after every
+ * proof passes, and Git's non-forced worktree removal is the final authority. */
+export async function cleanupPlanningActivity(input: {
+  executionRunId: string;
+  primaryRepoRoot: string;
+  activityCompleted: boolean;
+  gitExe?: string;
+}, deps: {
+  runGit?: PlanningGitRunner;
+  getActivity?: typeof getPlanningActivityWorktree;
+  updateActivity?: typeof updatePlanningActivityWorktree;
+  hasLiveLease?: (activityPath: string) => boolean;
+  hasPendingMerge?: (executionRunId: string) => boolean;
+  now?: () => number;
+} = {}): Promise<PlanningActivityCleanupResult> {
+  const runGit = deps.runGit ?? realRunGit;
+  const getActivity = deps.getActivity ?? getPlanningActivityWorktree;
+  const updateActivity = deps.updateActivity ?? updatePlanningActivityWorktree;
+  const now = deps.now ?? Date.now;
+  const activity = getActivity(input.executionRunId);
+  if (!activity) throw new Error(`planning activity not found: ${input.executionRunId}`);
+  const opts = { ...GIT_OPTS, gitExe: input.gitExe };
+  const [reachableResult, status, activityHead] = await Promise.all([
+    activity.promotedHeadOid
+      ? runGit(input.primaryRepoRoot, ['merge-base', '--is-ancestor', activity.activityHeadRef, activity.promotedHeadOid], opts)
+      : Promise.resolve({ code: 1, stdout: '', stderr: 'not promoted' }),
+    fs.existsSync(activity.path)
+      ? runGit(activity.path, ['status', '--porcelain', '--untracked-files=all'], opts)
+      : Promise.resolve({ code: 1, stdout: '', stderr: 'activity path missing' }),
+    runGit(input.primaryRepoRoot, ['rev-parse', '--verify', activity.activityHeadRef], opts),
+  ]);
+  const pending = deps.hasPendingMerge?.(input.executionRunId)
+    ?? listActivityMergeAttempts(input.executionRunId).some((row) => row.state === 'pending' || row.state === 'conflicted');
+  const liveLease = deps.hasLiveLease?.(activity.path)
+    ?? getActiveAgents().some((agent) => keyPath(agent.workingDirectory) === keyPath(activity.path));
+  const proofs: PlanningActivityCleanupProofs = {
+    activityCompleted: input.activityCompleted,
+    reachable: reachableResult.code === 0,
+    worktreeClean: status.code === 0 && status.stdout.split(/\r?\n/).filter(Boolean)
+      .every((line) => line.endsWith(PLANNING_WORKTREE_MARKER)),
+    noLiveLease: !liveLease,
+    noPendingMerge: !pending,
+    fullyPromoted: Boolean(activity.promotedHeadOid) && activityHead.code === 0
+      && reachableResult.code === 0,
+    ownershipMarker: markerOwnedByRun(path.join(activity.path, PLANNING_WORKTREE_MARKER), input.executionRunId),
+  };
+  const failed = Object.entries(proofs).find(([, passed]) => !passed)?.[0];
+  if (failed) {
+    updateActivity({ executionRunId: input.executionRunId, state: 'recovery-required',
+      failureCode: `cleanup-proof-failed:${failed}`, updatedAt: now() });
+    return { ok: false, state: 'recovery-required', proofs, reason: `cleanup-proof-failed:${failed}` };
+  }
+  updateActivity({ executionRunId: input.executionRunId, state: 'cleanup-pending', failureCode: null, updatedAt: now() });
+  const removed = await runGit(input.primaryRepoRoot, ['worktree', 'remove', activity.path], opts);
+  if (removed.code !== 0) {
+    updateActivity({ executionRunId: input.executionRunId, state: 'recovery-required',
+      failureCode: 'worktree-remove-refused', updatedAt: now() });
+    return { ok: false, state: 'recovery-required', proofs, reason: 'worktree-remove-refused' };
+  }
+  await runGit(input.primaryRepoRoot, ['worktree', 'prune'], opts);
+  const deleted = await runGit(input.primaryRepoRoot,
+    ['update-ref', '-d', activity.activityHeadRef, activityHead.stdout.trim()], opts);
+  if (deleted.code !== 0) {
+    updateActivity({ executionRunId: input.executionRunId, state: 'recovery-required',
+      failureCode: 'activity-ref-delete-refused', updatedAt: now() });
+    return { ok: false, state: 'recovery-required', proofs, reason: 'activity-ref-delete-refused' };
+  }
+  updateActivity({ executionRunId: input.executionRunId, state: 'cleaned', failureCode: null, updatedAt: now() });
+  return { ok: true, state: 'cleaned', proofs };
 }

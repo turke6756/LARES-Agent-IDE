@@ -25,6 +25,7 @@ import {
   getWorkspace,
   setWitnessObserver, getAgent, listTurnRecords,
   insertPendingCommitAttempt, resolveCommitAttempt,
+  listPlanningActivityWorktrees,
 } from './database';
 import { validateAndRepairClaudeJson, validateAndRepairWslClaudeJson, startClaudeJsonRuntimeWatcher, stopClaudeJsonRuntimeWatcher } from './claude-config-repair';
 import { checkManagedWebContents } from './security/webcontents-guard';
@@ -33,10 +34,11 @@ import { startContinuationWatcher } from './supervisor/continuation-watcher-wiri
 import { runCheckpointStartupMaintenance } from './git-checkpoints/reconciler';
 import { createCheckpointEngine } from './git-checkpoints/engine-bootstrap';
 import { RETENTION_CYCLE_INTERVAL_MS } from '../shared/constants';
-import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardMintRoutes, setSaveCardFinalizeRoutes, setCommitCoordinatorRoutes, setSaveSweepService, setSaveCardAttentionProvider } from './ipc-handlers';
+import { registerIpcHandlers, setHumanCheckpointRoutes, setSaveCardRoutes, setSaveCardPreviewRoutes, setSaveCardMintRoutes, setSaveCardFinalizeRoutes, setCommitCoordinatorRoutes, setSaveSweepService, setSaveCardAttentionProvider, setActivityMergeService } from './ipc-handlers';
 import { createSaveCardRoutes } from './commit-candidates/save-card-routes';
 import { createPreviewRoutes } from './commit-candidates/preview-routes';
 import { CommitCoordinator } from './git-checkpoints/commit-coordinator';
+import { ActivityMergeService } from './git-checkpoints/activity-merge-service';
 import { runGit, runGitBytes } from './git-checkpoints/git-command';
 import { broadcastSaveCardAttention } from './commit-candidates/save-card-ipc';
 import { consumeCommitCoordinatorForSweep, type CommitCoordinatorRoutes } from './commit-candidates/commit-coordinator-ipc';
@@ -862,6 +864,8 @@ app.whenReady().then(async () => {
           providePlanPreviewRoutes(previewRoutes.planPreviewRoutes);
           setSaveCardFinalizeRoutes(previewRoutes.saveCardFinalizeRoutes);
           const candidateService = previewRoutes.productionSeams.candidateService;
+          const activityMergeService = new ActivityMergeService({ gitExe: engine.gitExe });
+          setActivityMergeService(activityMergeService);
           const coordinator = new CommitCoordinator({
             composeLocks: previewRoutes.productionSeams.composeLocks,
             queue: engine.queue,
@@ -880,6 +884,9 @@ app.whenReady().then(async () => {
             readMemberRepresentation: previewRoutes.productionSeams.readMemberRepresentation,
             locateRepository: previewRoutes.productionSeams.locateRepository,
             deriveTrailers: previewRoutes.productionSeams.deriveTrailers,
+            resolvePlanningActivity: (repositoryKey) =>
+              listPlanningActivityWorktrees().find((row) => row.activityRepositoryKey === repositoryKey) ?? null,
+            promotePlanningActivity: (executionRunId) => activityMergeService.promote(executionRunId),
           });
           const coordinatorRoutes: CommitCoordinatorRoutes = {
             coordinator,

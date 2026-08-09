@@ -63,6 +63,8 @@ import { encodeGitPath } from '../commit-candidates/dirty-inventory';
 import { parseStageEntries } from '../commit-candidates/commit-representation';
 import { ComposeLockRegistry } from '../commit-candidates/compose-lock-registry';
 import { CheckpointQueue, type SkippedDeadline } from './checkpoint-queue';
+import { advancePlanningActivityHead as advanceActivityHead } from './planning-worktree-service';
+import type { PlanningActivityWorktree } from '../database';
 import type {
   GitRunBytesResult,
   GitRunResult,
@@ -173,6 +175,11 @@ export interface CommitCoordinatorDeps {
    *  NEVER renderer-trusted. */
   deriveTrailers?(snapshot: CandidateTokenSnapshot): string[];
   contractVersion?: number;
+  /** WP-6 production Save seam: activity repositories advance detached HEAD and
+   * their durable activity ref in one CAS, then eagerly promote after ledgering. */
+  resolvePlanningActivity?(repositoryKey: string): PlanningActivityWorktree | null;
+  advancePlanningActivityHead?: typeof advanceActivityHead;
+  promotePlanningActivity?(executionRunId: string): Promise<unknown>;
 }
 
 export interface CommitRequest {
@@ -376,6 +383,7 @@ type LockedResult =
       integrity: IndexIntegrityResult;
       resolvedHeadOid: string;
       mismatchedTreePaths: EncodedGitPath[];
+      activityExecutionRunId: string | null;
     };
 
 // ── Coordinator ───────────────────────────────────────────────────────────────
@@ -606,6 +614,12 @@ export class CommitCoordinator {
             };
           }
         }
+        if (locked.activityExecutionRunId && this.d.promotePlanningActivity) {
+          // Promotion is eager but non-transactional with the already-durable Save.
+          // Any refusal/throw leaves the activity commit safe and projected as
+          // "Saved in plan; promotion pending" for retry/conflict resolution.
+          await this.d.promotePlanningActivity(locked.activityExecutionRunId).catch(() => undefined);
+        }
         resolveAttempt(locked.resolvedHeadOid, locked.commitOid, 'committed');
         return {
           status: 'committed',
@@ -736,13 +750,22 @@ export class CommitCoordinator {
       // Atomic old-OID compare-and-swap. A foreign HEAD move is a clean stale
       // refusal: our commit object may be dangling, but no Lares ref advanced.
       const expectedOldOid = pinnedHeadOid ?? zeroOidFor(snapshot);
-      const updateResult = await this.d.runGit(repoRoot, ['update-ref', '-m', reflogAction, 'HEAD', commitOid, expectedOldOid], {
-        gitExe, env: baseEnv, allowNonzero: true, timeoutMs: COMMIT_TIMEOUT_MS, maxBytes: SMALL_MAX_BYTES,
-      }).catch((error) => ({
-        code: 1,
-        stdout: '',
-        stderr: error instanceof Error ? error.message : String(error),
-      }));
+      const activity = this.d.resolvePlanningActivity?.(snapshot.repositoryKey) ?? null;
+      const activityAdvance = activity
+        ? await (this.d.advancePlanningActivityHead ?? advanceActivityHead)({
+          activityPath: repoRoot, activityHeadRef: activity.activityHeadRef,
+          expectedOldOid, newOid: commitOid, gitExe, runGit: this.d.runGit,
+        }).catch((error) => ({ ok: false, diagnostic: error instanceof Error ? error.message : String(error) }))
+        : null;
+      const updateResult = activityAdvance
+        ? { code: activityAdvance.ok ? 0 : 1, stdout: '', stderr: activityAdvance.diagnostic ?? '' }
+        : await this.d.runGit(repoRoot, ['update-ref', '-m', reflogAction, 'HEAD', commitOid, expectedOldOid], {
+          gitExe, env: baseEnv, allowNonzero: true, timeoutMs: COMMIT_TIMEOUT_MS, maxBytes: SMALL_MAX_BYTES,
+        }).catch((error) => ({
+          code: 1,
+          stdout: '',
+          stderr: error instanceof Error ? error.message : String(error),
+        }));
       if (updateResult.code !== 0) {
         const resolvedHeadOid = (await this.readHead(repoRoot, gitExe)) ?? '';
         const reason = (updateResult.stderr.trim() || 'HEAD compare-and-swap failed').slice(0, 500);
@@ -801,7 +824,8 @@ export class CommitCoordinator {
         }
       }
 
-      return { kind: 'committed', commitOid, integrity, resolvedHeadOid, mismatchedTreePaths };
+      return { kind: 'committed', commitOid, integrity, resolvedHeadOid, mismatchedTreePaths,
+        activityExecutionRunId: activity?.executionRunId ?? null };
     } catch (error) {
       return {
         kind: 'aborted-error',

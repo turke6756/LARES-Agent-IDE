@@ -68,6 +68,34 @@ const OID_A = 'a'.repeat(40);
 const OID_B = 'b'.repeat(40);
 const OID_C = 'c'.repeat(40);
 
+test('WP-6 activity merge attempts and path conflicts survive round-trip resolution', () => {
+  const ctx = context();
+  const runId = `run-merge-${seq}`;
+  dbm.getDb().prepare(`INSERT INTO planning_activity_worktrees
+    (execution_run_id, plan_id, logical_workspace_id, object_database_key,
+     activity_repository_key, primary_repository_key, path, baseline_oid,
+     activity_head_ref, promoted_head_oid, state, failure_code, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'merge-pending', NULL, ?, ?)`)
+    .run(runId, ctx.planId, ctx.workspaceId, 'odb', 'activity', 'primary', `C:/activity-${seq}`,
+      OID_A, `refs/lares/activities/${runId}/head`, 1, 1);
+  dbm.insertActivityMergeAttempt({ id: `merge-${seq}`, executionRunId: runId,
+    baseOid: OID_A, primaryHeadOid: OID_B, activityHeadOid: OID_C,
+    proposedCommitOid: null, state: 'pending', startedAt: 2, endedAt: null });
+  const pathBytesBase64 = Buffer.from('conflicted/path.ts').toString('base64');
+  dbm.replaceActivityMergeConflicts(`merge-${seq}`, [{
+    attemptId: `merge-${seq}`, pathBytesBase64, baseBlobOid: OID_A,
+    primaryBlobOid: OID_B, activityBlobOid: OID_C,
+    resolutionBlobOid: null, resolution: null,
+  }]);
+  assert.equal(dbm.listActivityMergeAttempts(runId)[0].state, 'pending');
+  assert.equal(dbm.listActivityMergeConflicts(`merge-${seq}`)[0].pathBytesBase64, pathBytesBase64);
+  dbm.resolveActivityMergeConflict({ attemptId: `merge-${seq}`, pathBytesBase64,
+    resolution: 'take-activity', resolutionBlobOid: OID_C });
+  dbm.updateActivityMergeAttempt({ id: `merge-${seq}`, state: 'conflicted', endedAt: 3 });
+  assert.equal(dbm.listActivityMergeConflicts(`merge-${seq}`)[0].resolution, 'take-activity');
+  assert.equal(dbm.getActivityMergeAttempt(`merge-${seq}`)?.endedAt, 3);
+});
+
 function context() {
   seq += 1;
   const workspace = dbm.createWorkspace({

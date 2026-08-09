@@ -33,6 +33,7 @@ import CandidatePreview, {
   type CandidatePreviewSelection,
 } from './CandidatePreview';
 import QuotaWeakeningBanner from './QuotaWeakeningBanner';
+import PlanMergeBack from './PlanMergeBack';
 import { groupExpiryEdgesByBundle, formatExpiresIn } from './save-card-expiry';
 import { renderSaveRefusal } from './save-refusal-copy';
 import { createCandidateSubmitter } from './candidate-submit';
@@ -514,6 +515,7 @@ type LoadState =
       intentUnits: SaveIntentUnitDto[] | null;
       unwitnessed: SaveCardInventoryResponse['unwitnessed'];
       legacyTaskIdentityUnavailable: SaveCardInventoryResponse['legacyTaskIdentityUnavailable'];
+      planningActivities: SaveCardInventoryResponse['planningActivities'];
       quotaWeakening: SaveCardQuotaWeakening | null;
     };
 
@@ -591,6 +593,7 @@ export default function SaveCard() {
           intentUnits: cached.inventory.intentUnits ?? null,
           unwitnessed: cached.inventory.unwitnessed,
           legacyTaskIdentityUnavailable: cached.inventory.legacyTaskIdentityUnavailable,
+          planningActivities: cached.inventory.planningActivities,
           quotaWeakening: cached.inventory.quotaWeakening,
         }
       : { status: 'loading' },
@@ -658,6 +661,7 @@ export default function SaveCard() {
             intentUnits: response.intentUnits ?? null,
             unwitnessed: response.unwitnessed,
             legacyTaskIdentityUnavailable: response.legacyTaskIdentityUnavailable,
+            planningActivities: response.planningActivities,
             quotaWeakening: response.quotaWeakening,
           });
         }
@@ -685,6 +689,7 @@ export default function SaveCard() {
         intentUnits: cached.inventory.intentUnits ?? null,
         unwitnessed: cached.inventory.unwitnessed,
         legacyTaskIdentityUnavailable: cached.inventory.legacyTaskIdentityUnavailable,
+        planningActivities: cached.inventory.planningActivities,
         quotaWeakening: cached.inventory.quotaWeakening,
       });
       if (isSaveCardInventoryFresh(cached)) return;
@@ -801,7 +806,7 @@ export default function SaveCard() {
     );
   }
 
-  const { bundles, intentUnits, unwitnessed, legacyTaskIdentityUnavailable, quotaWeakening } = state;
+  const { bundles, intentUnits, unwitnessed, legacyTaskIdentityUnavailable, planningActivities, quotaWeakening } = state;
   const quiet = bundles.filter(isQuietlySaved);
   const loud = bundles.filter((b) => !isQuietlySaved(b));
   const loudGroups = groupBySupervisor(loud);
@@ -892,7 +897,7 @@ export default function SaveCard() {
     }
   };
 
-  if (bundles.length === 0) {
+  if (bundles.length === 0 && (planningActivities?.length ?? 0) === 0) {
     return (
       <div className="sc-root" data-testid="save-card">
         {header}
@@ -922,6 +927,26 @@ export default function SaveCard() {
       {header}
 
       <QuotaWeakeningBanner warning={quotaWeakening} />
+
+      {(planningActivities?.length ?? 0) > 0 && (
+        <section className="sc-sect" data-testid="planning-activity-cards">
+          <h2>Plan activities</h2>
+          {planningActivities!.map((activity) => (
+            <article key={activity.executionRunId} className="sc-slot-wrap" data-testid="planning-activity-card">
+              <strong>{activity.planTitle}</strong>
+              <div>
+                {activity.status === 'saved-in-plan-promotion-pending' && 'Saved in plan; promotion pending'}
+                {activity.status === 'merge-conflicted' && 'Saved in plan; content conflict needs resolution'}
+                {activity.status === 'promoted' && 'Promoted to main'}
+                {activity.status === 'recovery-required' && 'Recovery required — no work was deleted'}
+                {activity.status === 'active' && 'Active plan workspace'}
+                {activity.status === 'cleaned' && 'Activity complete and safely cleaned'}
+              </div>
+              <PlanMergeBack activity={activity} onPromoted={refresh} />
+            </article>
+          ))}
+        </section>
+      )}
 
       {intentUnits !== null && (
         <div data-testid="save-intent-hierarchy">

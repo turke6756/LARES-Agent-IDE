@@ -34,6 +34,9 @@ import {
   getPlan as dbGetPlan,
   getPlanWorkPackage as dbGetPlanWorkPackage,
   createNamedSaveSet as dbCreateNamedSaveSet,
+  listPlanningActivityWorktrees as dbListPlanningActivityWorktrees,
+  listActivityMergeAttempts as dbListActivityMergeAttempts,
+  listActivityMergeConflicts as dbListActivityMergeConflicts,
   listTurnRecords as dbListTurnRecords,
   type TurnRecord,
   type TurnWitnessRead,
@@ -90,6 +93,9 @@ export interface SaveCardRoutesDeps {
   getPlan?: typeof dbGetPlan;
   getPlanItem?: typeof dbGetPlanWorkPackage;
   createNamedSaveSet?: typeof dbCreateNamedSaveSet;
+  listPlanningActivities?: typeof dbListPlanningActivityWorktrees;
+  listActivityMergeAttempts?: typeof dbListActivityMergeAttempts;
+  listActivityMergeConflicts?: typeof dbListActivityMergeConflicts;
 }
 
 function minTime(values: Array<number | null | undefined>): number | null {
@@ -458,6 +464,37 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     response.legacyTaskIdentityUnavailable = members(
       assembly.legacyTaskIdentityUnavailableEntryIds,
     );
+    response.planningActivities = (deps.listPlanningActivities ?? dbListPlanningActivityWorktrees)()
+      .filter((activity) => activity.logicalWorkspaceId === req.workspaceId)
+      .map((activity) => {
+        const attempt = (deps.listActivityMergeAttempts ?? dbListActivityMergeAttempts)(activity.executionRunId)[0] ?? null;
+        const conflicts = attempt
+          ? (deps.listActivityMergeConflicts ?? dbListActivityMergeConflicts)(attempt.id)
+          : [];
+        const status = activity.state === 'merge-conflicted' ? 'merge-conflicted' as const
+          : activity.state === 'merge-pending' ? 'saved-in-plan-promotion-pending' as const
+            : activity.state === 'recovery-required' ? 'recovery-required' as const
+              : activity.state === 'cleaned' ? 'cleaned' as const
+                : activity.promotedHeadOid ? 'promoted' as const : 'active' as const;
+        const plan = (deps.getPlan ?? dbGetPlan)(activity.planId);
+        return {
+          executionRunId: activity.executionRunId,
+          planId: activity.planId,
+          planTitle: plan ? plan.slug ?? plan.path : activity.planId,
+          status,
+          promotedHeadOid: activity.promotedHeadOid,
+          latestAttemptId: attempt?.id ?? null,
+          conflicts: conflicts.map((conflict) => ({
+            pathBytesBase64: conflict.pathBytesBase64,
+            displayPath: Buffer.from(conflict.pathBytesBase64, 'base64').toString('utf8'),
+            baseBlobOid: conflict.baseBlobOid,
+            primaryBlobOid: conflict.primaryBlobOid,
+            activityBlobOid: conflict.activityBlobOid,
+            resolution: conflict.resolution,
+          })),
+          failureCode: activity.failureCode,
+        };
+      });
     return response;
   }
 

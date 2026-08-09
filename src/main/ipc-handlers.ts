@@ -3,9 +3,10 @@ import type { WebContents } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import { persistTheme } from './theme-persistence';
-import type { ContinuationPhaseSignal, PathType, WslStatus, HealthCheck, RuntimePrerequisiteReport, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult, SaveSweepRequest } from '../shared/types';
+import type { ContinuationPhaseSignal, PathType, WslStatus, HealthCheck, RuntimePrerequisiteReport, FsEvent, DetachRequest, DetachResult, ViewDetachRequest, ScanOverheadRequest, ScanOverheadResult, ExtractKnowledgeRequest, ExtractKnowledgeResult, SkillUsageQuery, SkillUsageQueryResult, McpToolUsageQuery, McpToolUsageQueryResult, PriorSessionChat, ContextOptimizerQuery, ContextOptimizerQueryResult, MarkOptimizerActionAppliedRequest, MarkOptimizerActionAppliedResult, SignOptimizerDerivationRequest, SignOptimizerDerivationResult, SaveSweepRequest, SaveCardActivityMergeResolveRequest } from '../shared/types';
 import { TAB_CHANNELS, VIEW_CHANNELS } from '../shared/types';
-import { SAVE_SWEEP_CHANNEL } from '../shared/types';
+import { SAVE_SWEEP_CHANNEL, SAVECARD_ACTIVITY_MERGE_RESOLVE_CHANNEL } from '../shared/types';
+import type { ActivityMergeService } from './git-checkpoints/activity-merge-service';
 import { createDetachedWindow, createDetachedViewWindow, broadcastToDetachedViews, canWrite, handleDetachedCloseReply, type DetachedWindowDeps } from './detached-windows';
 import { handleFlushReply } from './close-flush';
 import type { FlushReplyPayload, SelectionComment } from '../shared/types';
@@ -170,6 +171,25 @@ export function registerSaveSweepIpc(
   });
 }
 
+let activityMergeService: ActivityMergeService | null = null;
+export function setActivityMergeService(service: ActivityMergeService | null): void {
+  activityMergeService = service;
+}
+export function registerActivityMergeIpc(
+  ipc: Pick<typeof ipcMain, 'handle'>,
+  getService: () => ActivityMergeService | null,
+): void {
+  ipc.handle(SAVECARD_ACTIVITY_MERGE_RESOLVE_CHANNEL, async (_event, request: SaveCardActivityMergeResolveRequest) => {
+    if (process.env.LARES_INTENT_PACKAGING !== '1') throw new Error('intent packaging is disabled');
+    const service = getService();
+    if (!service) throw new Error('activity merge unavailable (the engine has not finished bootstrapping)');
+    const result = await service.resolveAndPromote(request);
+    return result.status === 'conflicted'
+      ? { status: result.status, attemptId: result.attemptId }
+      : result;
+  });
+}
+
 // SC-WP-N2 — the checkpoint-expiry attention provider, injected by the same async
 // engine-bootstrap seam once the retention cycle begins publishing notices. Until
 // it lands the `savecard:getAttention` read answers null honestly (no expiry yet).
@@ -297,6 +317,7 @@ export function registerIpcHandlers(
   registerSaveCardFinalizeIpc(ipcMain, () => saveCardFinalizeRoutes);
   registerCommitCoordinatorIpc(ipcMain, () => commitCoordinatorRoutes);
   registerSaveSweepIpc(ipcMain, () => saveSweepService);
+  registerActivityMergeIpc(ipcMain, () => activityMergeService);
   // SC-WP-N2 — the lightweight checkpoint-expiry attention read. Registered here
   // (lazy provider getter) so `savecard:getAttention` exists before the async
   // engine bootstrap starts publishing notices; a missing provider answers null.

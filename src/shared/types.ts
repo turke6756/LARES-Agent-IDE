@@ -2233,6 +2233,27 @@ export interface SaveIntentUnitDto {
   membershipStale?: boolean;
 }
 
+export type PlanningActivityPromotionStatus =
+  | 'saved-in-plan-promotion-pending' | 'merge-conflicted' | 'promoted'
+  | 'recovery-required' | 'active' | 'cleaned';
+export interface SaveCardPlanningActivityDto {
+  executionRunId: string;
+  planId: string;
+  planTitle: string;
+  status: PlanningActivityPromotionStatus;
+  promotedHeadOid: string | null;
+  latestAttemptId: string | null;
+  conflicts: Array<{
+    pathBytesBase64: string;
+    displayPath: string;
+    baseBlobOid: string | null;
+    primaryBlobOid: string | null;
+    activityBlobOid: string | null;
+    resolution: 'keep-primary' | 'take-activity' | 'merged' | null;
+  }>;
+  failureCode: string | null;
+}
+
 /**
  * Read-only Save-card inventory response. Carries the renderer-safe WorkBundle
  * DTOs plus the SC-WP-2L retention quota-weakening warning (null unless the pin
@@ -2244,8 +2265,23 @@ export interface SaveCardInventoryResponse {
   intentUnits?: SaveIntentUnitDto[];
   unwitnessed?: SaveCardBundle['members'];
   legacyTaskIdentityUnavailable?: SaveCardBundle['members'];
+  planningActivities?: SaveCardPlanningActivityDto[];
   quotaWeakening: import('./commit-candidates').SaveCardQuotaWeakening | null;
 }
+
+export const SAVECARD_ACTIVITY_MERGE_RESOLVE_CHANNEL = 'savecard:resolveActivityMerge' as const;
+export interface SaveCardActivityMergeResolveRequest {
+  attemptId: string;
+  resolutions: Array<{
+    pathBytesBase64: string;
+    resolution: 'keep-primary' | 'take-activity' | 'merged';
+    resolutionBlobOid?: string | null;
+  }>;
+}
+export type SaveCardActivityMergeResolveResponse =
+  | { status: 'promoted'; attemptId: string; primaryHeadOid: string }
+  | { status: 'conflicted'; attemptId: string }
+  | { status: 'stale' | 'pending' | 'recovery-required'; attemptId: string; reason?: string };
 
 // ── SC-WP-N2 — checkpoint-expiry attention signal ─────────────────────────────
 //
@@ -3582,6 +3618,9 @@ export interface IpcApi {
     /** One reviewed, durable multi-package Save gesture. Main refreshes and
      *  re-verifies every intent immediately before its just-in-time mint. */
     sweep: (req: SaveSweepRequest) => Promise<SaveSweepResponse>;
+    resolveActivityMerge: (
+      req: SaveCardActivityMergeResolveRequest,
+    ) => Promise<SaveCardActivityMergeResolveResponse>;
     /** SC-WP-N2 — lightweight checkpoint-expiry attention read (no full inventory
      *  probe). Resolves the freshest notice for the workspace, or null. */
     getAttention: (req: SaveCardAttentionRequest) => Promise<SaveCardCheckpointExpiryNotice | null>;

@@ -174,6 +174,7 @@ let markDone: ReturnType<typeof vi.fn>;
 let preview: ReturnType<typeof vi.fn>;
 let sweep: ReturnType<typeof vi.fn>;
 let adoptAllAsBaseline: ReturnType<typeof vi.fn>;
+let resolveActivityMerge: ReturnType<typeof vi.fn>;
 
 async function render() {
   await act(async () => {
@@ -191,8 +192,9 @@ beforeEach(() => {
   preview = vi.fn();
   sweep = vi.fn();
   adoptAllAsBaseline = vi.fn();
+  resolveActivityMerge = vi.fn();
   (window as unknown as { api: unknown }).api = {
-    saveCard: { getInventory, markDone, preview, sweep, adoptAllAsBaseline },
+    saveCard: { getInventory, markDone, preview, sweep, adoptAllAsBaseline, resolveActivityMerge },
     demandProbe: { record: vi.fn(async () => undefined) },
   };
   container = document.createElement('div');
@@ -206,6 +208,21 @@ afterEach(() => {
 });
 
 describe('SaveCard bundle rendering', () => {
+  it('renders each activity as a separate card and mounts content-conflict resolution', async () => {
+    getInventory.mockResolvedValue(inv([], null, { planningActivities: [{
+      executionRunId: 'run-b', planId: 'plan-b', planTitle: 'Plan B', status: 'merge-conflicted',
+      promotedHeadOid: null, latestAttemptId: 'attempt-b', failureCode: null,
+      conflicts: [{ pathBytesBase64: Buffer.from('conflicted/path.ts').toString('base64'),
+        displayPath: 'conflicted/path.ts', baseBlobOid: 'a'.repeat(40),
+        primaryBlobOid: 'b'.repeat(40), activityBlobOid: 'c'.repeat(40), resolution: null }],
+    }] }));
+    await render();
+    expect(container.querySelectorAll('[data-testid="planning-activity-card"]')).toHaveLength(1);
+    expect(container.querySelector('[data-testid="plan-merge-back"]')).not.toBeNull();
+    expect(container.textContent).toContain('Saved in plan; content conflict needs resolution');
+    expect(container.textContent).not.toContain('Commit together');
+  });
+
   it('renders plan/item/intent hierarchy and adopts the whole Unwitnessed pool in one gesture', async () => {
     getInventory.mockResolvedValue(inv([unattributedBundle], null, {
       intentUnits: [{

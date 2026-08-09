@@ -12,6 +12,7 @@ import type {
 import type { RunGitOptions } from './git-command';
 import {
   advancePlanningActivityHead,
+  cleanupPlanningActivity,
   planningActivityHeadRef,
   provisionPlanningActivity,
   type PlanningGitRunner,
@@ -156,4 +157,62 @@ test('activity HEAD and durable ref advance in one CAS transaction', async (t) =
   assert.equal(advanced.ok, true, advanced.diagnostic);
   assert.equal(gitSync(result.activity.path, ['rev-parse', 'HEAD']), commit);
   assert.equal(gitSync(fixture.repo, ['rev-parse', result.activity.activityHeadRef]), commit);
+});
+
+test('cleanup requires every proof and uses only non-forced worktree removal', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lares-wp6-cleanup-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activityPath = path.join(root, 'activity');
+  fs.mkdirSync(activityPath);
+  fs.writeFileSync(path.join(activityPath, '.lares-planning-worktree.json'), JSON.stringify({
+    owner: 'lares', version: 1, executionRunId: 'run-cleanup',
+  }));
+  const oid = 'a'.repeat(40);
+  const activity: PlanningActivityWorktree = {
+    executionRunId: 'run-cleanup', planId: 'plan', logicalWorkspaceId: 'ws',
+    objectDatabaseKey: 'odb', activityRepositoryKey: 'activity', primaryRepositoryKey: 'primary',
+    path: activityPath, baselineOid: oid, activityHeadRef: 'refs/lares/activities/run-cleanup/head',
+    promotedHeadOid: oid, state: 'merged', failureCode: null, createdAt: 1, updatedAt: 1,
+  };
+  const commands: string[][] = [];
+  const result = await cleanupPlanningActivity({
+    executionRunId: activity.executionRunId, primaryRepoRoot: root, activityCompleted: true,
+  }, {
+    getActivity: () => activity,
+    updateActivity: (input) => { Object.assign(activity, input); return activity; },
+    hasLiveLease: () => false, hasPendingMerge: () => false, now: () => 2,
+    runGit: async (_cwd, args) => {
+      commands.push(args);
+      if (args[0] === 'status') return { code: 0, stdout: '?? .lares-planning-worktree.json\n', stderr: '' };
+      return { code: 0, stdout: `${oid}\n`, stderr: '' };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(activity.state, 'cleaned');
+  const remove = commands.find((args) => args[0] === 'worktree' && args[1] === 'remove');
+  assert.ok(remove);
+  assert.equal(remove.includes('--force'), false);
+});
+
+test('cleanup proof failure marks recovery-required and performs no deletion', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lares-wp6-cleanup-refuse-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activity: PlanningActivityWorktree = {
+    executionRunId: 'run-refuse', planId: 'plan', logicalWorkspaceId: 'ws', objectDatabaseKey: 'odb',
+    activityRepositoryKey: 'activity', primaryRepositoryKey: 'primary', path: root,
+    baselineOid: 'a'.repeat(40), activityHeadRef: 'refs/lares/activities/run-refuse/head',
+    promotedHeadOid: null, state: 'merged', failureCode: null, createdAt: 1, updatedAt: 1,
+  };
+  const commands: string[][] = [];
+  const result = await cleanupPlanningActivity({
+    executionRunId: activity.executionRunId, primaryRepoRoot: root, activityCompleted: true,
+  }, {
+    getActivity: () => activity,
+    updateActivity: (input) => { Object.assign(activity, input); return activity; },
+    hasLiveLease: () => true, hasPendingMerge: () => true,
+    runGit: async (_cwd, args) => { commands.push(args); return { code: 1, stdout: '', stderr: '' }; },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(activity.state, 'recovery-required');
+  assert.equal(commands.some((args) => args[0] === 'worktree' && args[1] === 'remove'), false);
 });
