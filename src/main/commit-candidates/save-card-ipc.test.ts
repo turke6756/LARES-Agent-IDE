@@ -7,11 +7,13 @@ import assert from 'node:assert/strict';
 
 import {
   registerSaveCardIpc,
+  registerSaveCardIntentIpc,
   type IpcLike,
   type SaveCardRoutes,
 } from './save-card-ipc';
 import {
   SAVECARD_CHANNELS,
+  SAVECARD_ADOPT_BASELINE_CHANNEL,
   type SaveCardInventoryRequest,
   type SaveCardInventoryResponse,
 } from '../../shared/types';
@@ -94,6 +96,27 @@ test('inventory fetch round-trips through the lazy routes getter', async () => {
   );
   assert.deepEqual(actual, expected);
   assert.deepEqual(calls, [{ workspaceId: 'ws-1' }]);
+});
+
+test('production intent registration invokes the main-owned baseline route', async () => {
+  const ipc = new FakeIpc();
+  const calls: SaveCardInventoryRequest[] = [];
+  registerSaveCardIntentIpc(ipc, () => ({
+    getInventory: async () => inventoryFixture(),
+    adoptAllAsBaseline: async (req) => {
+      calls.push(req);
+      return { intentId: 'intent-baseline', title: 'Baseline 2026-08-09', memberCount: 3 };
+    },
+  }));
+  assert.ok(ipc.handlers.get(SAVECARD_ADOPT_BASELINE_CHANNEL),
+    'production registerSaveCardIntentIpc must register baseline adoption');
+  const response = await ipc.invoke(SAVECARD_ADOPT_BASELINE_CHANNEL, {
+    workspaceId: 'ws-1', rendererInjectedMembers: ['forbidden'],
+  });
+  assert.deepEqual(calls, [{ workspaceId: 'ws-1' }]);
+  assert.deepEqual(response, {
+    intentId: 'intent-baseline', title: 'Baseline 2026-08-09', memberCount: 3,
+  });
 });
 
 test('rejects malformed inventory requests before calling the route', async () => {

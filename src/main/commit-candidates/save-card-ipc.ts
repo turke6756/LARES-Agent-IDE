@@ -15,6 +15,7 @@
 
 import {
   SAVECARD_CHANNELS,
+  SAVECARD_ADOPT_BASELINE_CHANNEL,
   SAVECARD_PREVIEW_CHANNEL,
   COMMIT_CANDIDATE_MINT_CHANNEL,
   SAVECARD_FINALIZE_CHANNEL,
@@ -22,6 +23,8 @@ import {
   SAVECARD_ATTENTION_CHANGED_CHANNEL,
   type SaveCardInventoryRequest,
   type SaveCardInventoryResponse,
+  type SaveCardAdoptBaselineRequest,
+  type SaveCardAdoptBaselineResponse,
   type SaveCardPreviewRequest,
   type SaveCardPreviewResponse,
   type SaveCardMintRequest,
@@ -97,6 +100,9 @@ export {
 /** Narrow read-only surface injected after the Save-card engine is available. */
 export interface SaveCardRoutes {
   getInventory(req: SaveCardInventoryRequest): Promise<SaveCardInventoryResponse>;
+  adoptAllAsBaseline?(
+    req: SaveCardAdoptBaselineRequest,
+  ): Promise<SaveCardAdoptBaselineResponse>;
 }
 
 /** Minimal `ipcMain.handle` shape for testing without a live Electron main. */
@@ -159,6 +165,21 @@ export function registerSaveCardIpc(
   ipc.handle(SAVECARD_CHANNELS.getInventory, async (_event, raw: unknown) => {
     const routes = requireRoutes(getRoutes());
     return routes.getInventory(requireRequest(raw));
+  });
+}
+
+/** Explicit intent-packaging mutation, registered separately from the audited
+ * read-only inventory transport. */
+export function registerSaveCardIntentIpc(
+  ipc: IpcLike,
+  getRoutes: () => SaveCardRoutes | null,
+): void {
+  ipc.handle(SAVECARD_ADOPT_BASELINE_CHANNEL, async (_event, raw: unknown) => {
+    const routes = requireRoutes(getRoutes());
+    if (!routes.adoptAllAsBaseline) {
+      throw new SaveCardIpcError('intent packaging is unavailable', 'save-card-engine-unavailable');
+    }
+    return routes.adoptAllAsBaseline(requireRequest(raw));
   });
 }
 

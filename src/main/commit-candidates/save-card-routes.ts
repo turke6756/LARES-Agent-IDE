@@ -19,7 +19,7 @@
 
 import * as fs from 'node:fs';
 
-import type { Agent, GitCapability, SaveCardBundle, SaveCardBundleIdentity, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveCardPackageSaveability, SaveCardWorkerUnit } from '../../shared/types';
+import type { Agent, GitCapability, SaveCardBundle, SaveCardBundleIdentity, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveIntentUnitDto, SaveCardPackageSaveability, SaveCardWorkerUnit } from '../../shared/types';
 import type { SaveCardQuotaWeakening } from '../../shared/commit-candidates';
 import {
   getAgentsByWorkspace as dbGetAgentsByWorkspace,
@@ -29,6 +29,11 @@ import {
   getTurnWitnessReads as dbGetTurnWitnessReads,
   listCommitPathLinks as dbListCommitPathLinks,
   listActivePackageFinalizationsForRepository as dbListActivePackageFinalizationsForRepository,
+  listSaveIntentsForRepository as dbListSaveIntentsForRepository,
+  listNamedSaveSetMembers as dbListNamedSaveSetMembers,
+  getPlan as dbGetPlan,
+  getPlanWorkPackage as dbGetPlanWorkPackage,
+  createNamedSaveSet as dbCreateNamedSaveSet,
   listTurnRecords as dbListTurnRecords,
   type TurnRecord,
   type TurnWitnessRead,
@@ -37,6 +42,7 @@ import { probeWorkspaceGit as realProbeWorkspaceGit } from '../git/git-runtime';
 import { runGit as realRunGit, runGitBytes as realRunGitBytes } from '../git-checkpoints/git-command';
 import {
   CommitCandidateService,
+  type CandidateInventoryRead,
   type CandidateWorkspaceInput,
   type CaptureTurnReader,
 } from './candidate-service';
@@ -46,6 +52,9 @@ import type { CommitPathLinkReader } from './protection-read';
 import { createTurnStampSource, type TurnStampRecordReader } from './stamp-projection';
 import type { SaveCardRoutes } from './save-card-ipc';
 import type { WorkBundle } from './work-bundle';
+import { projectWorkBundles } from './work-bundle';
+import { projectWitnesses } from './witness-projection';
+import { projectIntentUnits } from './intent-assembler';
 
 type BundleTurn = Pick<TurnRecord, 'id' | 'agentId' | 'agentTitle' | 'startedAt' | 'endedAt'>;
 
@@ -74,6 +83,13 @@ export interface SaveCardRoutesDeps {
    * source is wired in; the Save card simply omits the banner while it is null.
    */
   readQuotaWeakening?: (repositoryKey: string) => SaveCardQuotaWeakening | null;
+  /** Staged architecture flag. Production enables with LARES_INTENT_PACKAGING=1. */
+  intentPackaging?: boolean;
+  listSaveIntents?: typeof dbListSaveIntentsForRepository;
+  listNamedSaveSetMembers?: typeof dbListNamedSaveSetMembers;
+  getPlan?: typeof dbGetPlan;
+  getPlanItem?: typeof dbGetPlanWorkPackage;
+  createNamedSaveSet?: typeof dbCreateNamedSaveSet;
 }
 
 function minTime(values: Array<number | null | undefined>): number | null {
@@ -288,6 +304,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     readActiveFinalizations: deps.readActiveFinalizations ?? dbListActivePackageFinalizationsForRepository,
     readQuotaWeakening: deps.readQuotaWeakening,
   });
+  const latestReadByWorkspace = new Map<string, CandidateInventoryRead>();
 
   async function getInventory(
     req: SaveCardInventoryRequest,
@@ -315,10 +332,13 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
       }),
     );
 
-    const { bundles, quotaWeakening } = await service.listInventoryView({
+    const read = await service.assembleInventory({
       targetWorkspaceId: req.workspaceId,
       workspaces,
     });
+    latestReadByWorkspace.set(req.workspaceId, read);
+    const bundles = projectWorkBundles(read);
+    const quotaWeakening = read.quotaWeakening;
 
     const includedWorkspaceIds = new Set(bundles.flatMap((bundle) =>
       bundle.workspaces.map((workspace) => workspace.workspaceId),
@@ -341,8 +361,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
       }
     }
 
-    return {
-      bundles: bundles.map((bundle) => attachBundleIdentity(
+    const rendererBundles = bundles.map((bundle) => attachBundleIdentity(
         bundle,
         agents,
         turns,
@@ -350,10 +369,121 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
         capabilityByWorkspaceId,
         workspaceTitleById,
         req.workspaceId,
-      )),
+      ));
+    const response: SaveCardInventoryResponse = {
+      bundles: rendererBundles,
       quotaWeakening,
     };
+    const intentPackaging = deps.intentPackaging ?? process.env.LARES_INTENT_PACKAGING === '1';
+    if (!intentPackaging) return response;
+
+    const projectedWitnesses = projectWitnesses(
+      read.inventory.repository,
+      read.inventory.entries,
+      readTurnWitnesses,
+      createTurnStampSource(readTurnRecord),
+    );
+    const workspaceIds = read.inventory.repository.workspaces.map((workspace) => workspace.workspaceId);
+    const intents = (deps.listSaveIntents ?? dbListSaveIntentsForRepository)(
+      read.inventory.repository.repositoryKey,
+      workspaceIds,
+    );
+    const assembly = projectIntentUnits({
+      inventory: read.inventory,
+      witnesses: projectedWitnesses,
+      intents,
+      namedMembers: (deps.listNamedSaveSetMembers ?? dbListNamedSaveSetMembers)(
+        read.inventory.repository.repositoryKey,
+      ),
+      topology: { components: read.components } as import('./component-assembler').ComponentAssembly,
+    });
+    const entriesById = new Map(read.inventory.entries.map((entry) => [entry.entryId, entry]));
+    const workerByAgentId = new Map(rendererBundles.flatMap((bundle) =>
+      (bundle.identity?.workerUnits ?? []).flatMap((worker) =>
+        worker.agentId === null ? [] : [[worker.agentId, worker] as const])));
+    const targetCapability = capabilityByWorkspaceId.get(req.workspaceId);
+    const saveability: SaveCardPackageSaveability = targetCapability && !targetCapability.repoRoot
+      ? {
+          saveable: false,
+          reason: 'no-repository',
+          workspaceId: req.workspaceId,
+          workspaceTitle: workspaceTitleById.get(req.workspaceId) ?? req.workspaceId,
+          refusal: {
+            stage: 'saveability', code: 'save-card-no-repository',
+            message: `Saveability stage refused because workspace '${workspaceTitleById.get(req.workspaceId) ?? req.workspaceId}' has no Git repository.`,
+          },
+        }
+      : { saveable: true };
+    response.intentUnits = assembly.intentUnits.map((unit): SaveIntentUnitDto => {
+      const plan = unit.intent.planId ? (deps.getPlan ?? dbGetPlan)(unit.intent.planId) : null;
+      const planItem = unit.intent.planItemId
+        ? (deps.getPlanItem ?? dbGetPlanWorkPackage)(unit.intent.planItemId) : null;
+      const componentHealth = unit.topologyComponentIds.flatMap((id) =>
+        read.captureHealthByComponentId[id] ? [read.captureHealthByComponentId[id]] : []);
+      return {
+        intentId: unit.intent.id,
+        kind: unit.intent.kind,
+        title: unit.intent.title,
+        state: unit.intent.state,
+        plan: plan ? { id: plan.id, title: plan.slug ?? plan.path } : null,
+        planItem: planItem ? { id: planItem.id, title: planItem.title } : null,
+        members: unit.memberEntryIds.map((entryId) => ({
+          entry: entriesById.get(entryId)!,
+          protection: read.protectionByEntryId[entryId] ?? 'unprotected',
+        })),
+        contributors: unit.contributingAgentIds.flatMap((id) => {
+          const worker = workerByAgentId.get(id);
+          return worker ? [worker] : [];
+        }),
+        topologyEvidence: {
+          componentIds: unit.topologyComponentIds,
+          pathsWithMultipleTurns: unit.concurrency.pathsWithMultipleIntents,
+          captureHealth: {
+            turns: componentHealth.flatMap((health) => health.turns),
+            captureOutage: componentHealth.some((health) => health.captureOutage),
+            pathsWithoutFinalizationEdge: [...new Set(componentHealth.flatMap(
+              (health) => health.pathsWithoutFinalizationEdge))],
+          },
+        },
+        concurrencyCases: [],
+        saveability,
+        membershipStale: assembly.staleNamedSaveSetIds.includes(unit.intent.id),
+      };
+    });
+    const members = (entryIds: readonly string[]) => entryIds.map((entryId) => ({
+      entry: entriesById.get(entryId)!,
+      protection: read.protectionByEntryId[entryId] ?? 'unprotected' as const,
+    }));
+    response.unwitnessed = members(assembly.unwitnessedEntryIds);
+    response.legacyTaskIdentityUnavailable = members(
+      assembly.legacyTaskIdentityUnavailableEntryIds,
+    );
+    return response;
   }
 
-  return { getInventory };
+  async function adoptAllAsBaseline(
+    req: import('../../shared/types').SaveCardAdoptBaselineRequest,
+  ): Promise<import('../../shared/types').SaveCardAdoptBaselineResponse> {
+    const inventory = await getInventory(req);
+    const read = latestReadByWorkspace.get(req.workspaceId);
+    if (!read) throw new Error('fresh intent inventory unavailable');
+    const members = inventory.unwitnessed ?? [];
+    if (members.length === 0) throw new Error('there are no unwitnessed changes to adopt');
+    const createdAt = Date.now();
+    const title = `Baseline ${new Date(createdAt).toISOString().slice(0, 10)}`;
+    const intent = (deps.createNamedSaveSet ?? dbCreateNamedSaveSet)({
+      workspaceId: req.workspaceId,
+      repositoryKey: read.inventory.repository.repositoryKey,
+      title,
+      inventoryDigest: read.inventory.topologyDigest,
+      members: members.map((member) => ({
+        entryId: member.entry.entryId,
+        pathBytesBase64: member.entry.path.pathBytesBase64,
+      })),
+      createdAt,
+    });
+    return { intentId: intent.id, title: intent.title, memberCount: members.length };
+  }
+
+  return { getInventory, adoptAllAsBaseline };
 }

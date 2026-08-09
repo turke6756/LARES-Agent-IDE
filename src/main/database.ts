@@ -2360,6 +2360,18 @@ function initContextOptimizerSchema(): void {
       ON save_intents(plan_id, plan_item_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_save_intents_run_state
       ON save_intents(execution_run_id, state);
+
+    CREATE TABLE IF NOT EXISTS named_save_set_members (
+      save_intent_id       TEXT NOT NULL,
+      entry_id             TEXT NOT NULL,
+      path_bytes_base64    TEXT NOT NULL,
+      inventory_digest     TEXT NOT NULL,
+      created_at           INTEGER NOT NULL,
+      PRIMARY KEY (save_intent_id, entry_id),
+      FOREIGN KEY (save_intent_id) REFERENCES save_intents(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_named_save_set_members_digest
+      ON named_save_set_members(save_intent_id, inventory_digest);
   `);
   try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
   try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_stamp_source TEXT`); } catch { /* exists */ }
@@ -7541,6 +7553,84 @@ export function getSaveIntentByDispatchAttempt(dispatchAttemptId: string): SaveI
     [dispatchAttemptId],
   );
   return row ? rowToSaveIntent(row) : null;
+}
+
+export interface NamedSaveSetMember {
+  intentId: string;
+  entryId: string;
+  pathBytesBase64: string;
+  inventoryDigest: string;
+  createdAt: number;
+}
+
+function rowToNamedSaveSetMember(row: any): NamedSaveSetMember {
+  return {
+    intentId: row.save_intent_id,
+    entryId: row.entry_id,
+    pathBytesBase64: row.path_bytes_base64,
+    inventoryDigest: row.inventory_digest,
+    createdAt: row.created_at,
+  };
+}
+
+export function listSaveIntentsForRepository(
+  repositoryKey: string,
+  workspaceIds: readonly string[] = [],
+): SaveIntent[] {
+  const placeholders = workspaceIds.map(() => '?').join(',');
+  return queryAll(
+    `SELECT * FROM save_intents
+      WHERE (repository_key = ?${workspaceIds.length > 0 ? ` OR (repository_key IS NULL AND workspace_id IN (${placeholders}))` : ''})
+        AND state NOT IN ('committed','superseded','abandoned')
+      ORDER BY created_at, id`,
+    [repositoryKey, ...workspaceIds],
+  ).map(rowToSaveIntent);
+}
+
+export function listNamedSaveSetMembers(repositoryKey: string): NamedSaveSetMember[] {
+  return queryAll(
+    `SELECT m.* FROM named_save_set_members m
+       JOIN save_intents i ON i.id = m.save_intent_id
+      WHERE i.repository_key = ? ORDER BY m.save_intent_id, m.entry_id`,
+    [repositoryKey],
+  ).map(rowToNamedSaveSetMember);
+}
+
+export function createNamedSaveSet(input: {
+  id?: string;
+  workspaceId: string;
+  repositoryKey: string;
+  title: string;
+  inventoryDigest: string;
+  members: Array<{ entryId: string; pathBytesBase64: string }>;
+  createdById?: string | null;
+  createdAt: number;
+}): SaveIntent {
+  if (!input.title.trim()) throw new Error('named save-set title is required');
+  if (input.members.length === 0) throw new Error('named save-set requires at least one member');
+  const id = input.id ?? uuidv4();
+  const transaction = getDb().transaction(() => {
+    run(
+      `INSERT INTO save_intents
+        (id, workspace_id, repository_key, kind, title, created_by, created_by_id,
+         state, revision, created_at)
+       VALUES (?, ?, ?, 'named-save-set', ?, 'human-save-card', ?, 'open', 1, ?)`,
+      [id, input.workspaceId, input.repositoryKey, input.title.trim(), input.createdById ?? null, input.createdAt],
+    );
+    const seen = new Set<string>();
+    for (const member of input.members) {
+      if (seen.has(member.entryId)) continue;
+      seen.add(member.entryId);
+      run(
+        `INSERT INTO named_save_set_members
+          (save_intent_id, entry_id, path_bytes_base64, inventory_digest, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [id, member.entryId, member.pathBytesBase64, input.inventoryDigest, input.createdAt],
+      );
+    }
+  });
+  transaction();
+  return getSaveIntent(id)!;
 }
 
 export interface PlanDispatchAttempt {

@@ -109,6 +109,10 @@ type DbModule = {
   getCommitRecord(repositoryKey: string, commitOid: string): Record<string, unknown> | null;
   listCommitTurnLinks(repositoryKey: string, commitOid: string): Record<string, unknown>[];
   listCommitPathLinks(repositoryKey: string, paths?: readonly string[]): Record<string, unknown>[];
+  createNamedSaveSet(input: Record<string, unknown>): { id: string; title: string };
+  listNamedSaveSetMembers(repositoryKey: string): Array<{
+    intentId: string; entryId: string; pathBytesBase64: string; inventoryDigest: string; createdAt: number;
+  }>;
 };
 
 let dbm: DbModule;
@@ -165,6 +169,31 @@ test('WP-1 migration registers save_intents, intent columns, indexes, and immuta
       .map((row) => row.name);
     for (const column of columns) assert.ok(actual.includes(column), `${table}.${column}`);
   }
+});
+
+test('WP-2 migration creates byte-addressed named save-set membership', () => {
+  const schema = dbm.getDb().prepare(
+    `SELECT type, name FROM sqlite_master
+      WHERE name IN (?, ?) ORDER BY name`,
+  ).all('named_save_set_members', 'idx_named_save_set_members_digest');
+  assert.deepEqual(schema, [
+    { type: 'index', name: 'idx_named_save_set_members_digest' },
+    { type: 'table', name: 'named_save_set_members' },
+  ]);
+  const ws = freshWorkspace();
+  const created = dbm.createNamedSaveSet({
+    id: 'named-baseline', workspaceId: ws, repositoryKey: 'repo-named',
+    title: 'Baseline 2026-08-09', inventoryDigest: 'digest-a', createdAt: 123,
+    members: [
+      { entryId: 'entry-a', pathBytesBase64: 'YS50cw==' },
+      { entryId: 'entry-b', pathBytesBase64: 'Yi50cw==' },
+    ],
+  });
+  assert.equal(created.id, 'named-baseline');
+  assert.deepEqual(dbm.listNamedSaveSetMembers('repo-named'), [
+    { intentId: 'named-baseline', entryId: 'entry-a', pathBytesBase64: 'YS50cw==', inventoryDigest: 'digest-a', createdAt: 123 },
+    { intentId: 'named-baseline', entryId: 'entry-b', pathBytesBase64: 'Yi50cw==', inventoryDigest: 'digest-a', createdAt: 123 },
+  ]);
 });
 
 test('turn allocation writes an immutable intent stamp and raw mutation is rejected', () => {

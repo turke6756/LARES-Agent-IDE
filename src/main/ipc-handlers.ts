@@ -69,6 +69,7 @@ import { recordDemandProbe, isDemandProbeKind, DEMAND_PROBE_RECORD_CHANNEL } fro
 import { registerCheckpointIpc, type HumanCheckpointRoutes } from './git-checkpoints/checkpoint-ipc';
 import {
   registerSaveCardIpc,
+  registerSaveCardIntentIpc,
   registerSaveCardPreviewIpc,
   registerSaveCardMintIpc,
   registerSaveCardFinalizeIpc,
@@ -281,6 +282,7 @@ export function registerIpcHandlers(
   // channels exist before the async engine bootstrap injects the routes.
   registerCheckpointIpc(ipcMain, () => humanCheckpointRoutes);
   registerSaveCardIpc(ipcMain, () => saveCardRoutes);
+  registerSaveCardIntentIpc(ipcMain, () => saveCardRoutes);
   // SC-WP-W1 — Stage ③ candidate channels. Registered synchronously here (lazy
   // getters) so `savecard:preview` / `savecard:markDoneFleetAdhoc` exist before the
   // async engine bootstrap injects their routes — the reported "No handler

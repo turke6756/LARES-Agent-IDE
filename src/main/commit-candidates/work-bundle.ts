@@ -93,7 +93,7 @@ function weakest(members: readonly WorkBundleMember[]): ProtectionRung | null {
  * entry IDs are copied verbatim into one display-only pseudo-bundle. No witness
  * joins, connected-component pass, or inferred grouping occurs here.
  */
-export function projectWorkBundles(input: WorkBundleProjectionInput): WorkBundle[] {
+export function projectLegacyWorkBundles(input: WorkBundleProjectionInput): WorkBundle[] {
   const entriesById = new Map(
     input.inventory.entries.map((entry) => [entry.entryId, entry]),
   );
@@ -157,4 +157,10 @@ export function projectWorkBundles(input: WorkBundleProjectionInput): WorkBundle
   });
 
   return bundles;
+}
+
+/** Compatibility adapter retained until WP-7 cuts over the remaining v1
+ * consumers. Intent projection, not this topology view, owns primary grouping. */
+export function projectWorkBundles(input: WorkBundleProjectionInput): WorkBundle[] {
+  return projectLegacyWorkBundles(input);
 }

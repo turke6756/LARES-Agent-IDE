@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { IpcApi, DetachRequest, DetachedClosedPayload, ViewDetachRequest, ViewDetachedClosedPayload, FlushRequestPayload, FlushReplyPayload } from '../shared/types';
-import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_PREVIEW_CHANNEL, COMMIT_CANDIDATE_MINT_CHANNEL, SAVECARD_FINALIZE_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, SAVE_SWEEP_CHANNEL, PLAN_PREVIEW_CHANNEL, PLAN_REVIEW_PROJECTION_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
+import { TAB_CHANNELS, VIEW_CHANNELS, CHECKPOINT_CHANNELS, SAVECARD_CHANNELS, SAVECARD_ADOPT_BASELINE_CHANNEL, SAVECARD_PREVIEW_CHANNEL, COMMIT_CANDIDATE_MINT_CHANNEL, SAVECARD_FINALIZE_CHANNEL, SAVECARD_ATTENTION_CHANNEL, SAVECARD_ATTENTION_CHANGED_CHANNEL, SAVE_SWEEP_CHANNEL, PLAN_PREVIEW_CHANNEL, PLAN_REVIEW_PROJECTION_CHANNEL, COMMIT_COORDINATOR_CHANNEL } from '../shared/types';
 import { BROWSER_CHANNELS } from '../shared/browser';
 import type {
   AccessRequestDecision,
@@ -175,6 +175,7 @@ const api: IpcApi = {
   // preview (verdicts + server-derived read-only Lares-* trailer previews).
   saveCard: {
     getInventory: (req) => ipcRenderer.invoke(SAVECARD_CHANNELS.getInventory, req),
+    adoptAllAsBaseline: (req) => ipcRenderer.invoke(SAVECARD_ADOPT_BASELINE_CHANNEL, req),
     preview: (req) => ipcRenderer.invoke(SAVECARD_PREVIEW_CHANNEL, req),
     markDone: (req) => ipcRenderer.invoke(SAVECARD_FINALIZE_CHANNEL, req),
     sweep: (req) => ipcRenderer.invoke(SAVE_SWEEP_CHANNEL, req),

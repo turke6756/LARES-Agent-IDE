@@ -17,7 +17,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import type { SaveCardBundle, SaveCardPreviewResponse } from '../../../shared/types';
+import type { SaveCardBundle, SaveCardInventoryResponse, SaveCardPreviewResponse } from '../../../shared/types';
 import type { CommitCandidate, DirtyEntry, SaveCardQuotaWeakening } from '../../../shared/commit-candidates';
 import SaveCard from './SaveCard';
 import { useSaveCardStore } from '../../stores/save-card-store';
@@ -63,8 +63,9 @@ type WorkBundleDto = SaveCardBundle;
 function inv(
   bundles: WorkBundleDto[],
   quotaWeakening: SaveCardQuotaWeakening | null = null,
-): { bundles: WorkBundleDto[]; quotaWeakening: SaveCardQuotaWeakening | null } {
-  return { bundles, quotaWeakening };
+  extra: Partial<SaveCardInventoryResponse> = {},
+): SaveCardInventoryResponse {
+  return { bundles, quotaWeakening, ...extra };
 }
 
 const loudBundle: WorkBundleDto = {
@@ -172,6 +173,7 @@ let getInventory: ReturnType<typeof vi.fn>;
 let markDone: ReturnType<typeof vi.fn>;
 let preview: ReturnType<typeof vi.fn>;
 let sweep: ReturnType<typeof vi.fn>;
+let adoptAllAsBaseline: ReturnType<typeof vi.fn>;
 
 async function render() {
   await act(async () => {
@@ -188,8 +190,9 @@ beforeEach(() => {
   markDone = vi.fn();
   preview = vi.fn();
   sweep = vi.fn();
+  adoptAllAsBaseline = vi.fn();
   (window as unknown as { api: unknown }).api = {
-    saveCard: { getInventory, markDone, preview, sweep },
+    saveCard: { getInventory, markDone, preview, sweep, adoptAllAsBaseline },
     demandProbe: { record: vi.fn(async () => undefined) },
   };
   container = document.createElement('div');
@@ -203,6 +206,35 @@ afterEach(() => {
 });
 
 describe('SaveCard bundle rendering', () => {
+  it('renders plan/item/intent hierarchy and adopts the whole Unwitnessed pool in one gesture', async () => {
+    getInventory.mockResolvedValue(inv([unattributedBundle], null, {
+      intentUnits: [{
+        intentId: 'intent-1', kind: 'task', title: 'Implement intent inventory', state: 'open',
+        plan: { id: 'plan-1', title: 'Save Card checkpoints' },
+        planItem: { id: 'item-1', title: 'WP-2' },
+        members: loudBundle.members, contributors: loudBundle.identity!.workerUnits,
+        topologyEvidence: { componentIds: ['c1'], pathsWithMultipleTurns: [], captureHealth: loudBundle.captureHealth },
+        concurrencyCases: [], saveability: { saveable: true },
+      }],
+      unwitnessed: unattributedBundle.members,
+      legacyTaskIdentityUnavailable: loudBundle.members,
+    }));
+    adoptAllAsBaseline.mockResolvedValue({
+      intentId: 'named-1', title: 'Baseline 2026-08-09', memberCount: 1,
+    });
+    await render();
+    expect(container.querySelector('[data-testid="save-intent-hierarchy"]')?.textContent)
+      .toContain('Save Card checkpoints');
+    expect(container.textContent).toContain('WP-2');
+    expect(container.textContent).toContain('Implement intent inventory');
+    expect(container.textContent).toContain('Legacy task identity unavailable');
+    const button = [...container.querySelectorAll('button')]
+      .find((candidate) => candidate.textContent === 'Adopt all as baseline') as HTMLButtonElement;
+    await act(async () => { button.click(); await Promise.resolve(); });
+    expect(adoptAllAsBaseline).toHaveBeenCalledOnce();
+    expect(adoptAllAsBaseline).toHaveBeenCalledWith({ workspaceId: 'ws-1' });
+  });
+
   it('explains the save-protection ladder and dismisses it by keyboard or click-away', async () => {
     getInventory.mockResolvedValue(inv([loudBundle]));
     await render();

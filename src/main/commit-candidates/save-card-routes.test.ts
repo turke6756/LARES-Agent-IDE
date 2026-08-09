@@ -190,6 +190,40 @@ test('maps the renderer workspaceId to the shared-worktree repository inventory'
   assert.equal(allPaths.includes('outside.txt'), false);
 });
 
+test('flagged production inventory returns intentUnits beside parity bundles', async () => {
+  const routes = buildRoutes({
+    intentPackaging: true,
+    readTurnWitnesses: (workspaceId) => workspaceId === 'workspace-a'
+      ? [{ ...witness('turn-a', 'one.txt'), agentId: 'agent-a', intentId: 'intent-task' }]
+      : workspaceId === 'workspace-b'
+        ? [{ ...witness('turn-b', 'two.txt'), agentId: 'agent-b', intentId: 'intent-task' }]
+        : [],
+    listSaveIntents: () => [{
+      id: 'intent-task', workspaceId: 'workspace-a', executionRunId: null,
+      repositoryKey: null, kind: 'task', planId: null, planItemId: null,
+      title: 'Implement intent inventory', briefDigest: null,
+      dispatchAttemptId: 'dispatch-1', createdBy: 'task-dispatch', createdById: null,
+      state: 'open', revision: 1, createdAt: 1, readyAt: null, committedAt: null,
+    }],
+    listNamedSaveSetMembers: () => [],
+    getAgent: () => null,
+  });
+  const inventory = await routes.getInventory({ workspaceId: 'workspace-a' });
+  assert.ok(inventory.intentUnits, 'production route must expose flagged intentUnits');
+  assert.equal(inventory.intentUnits!.length, 1,
+    'one intent over disconnected agent topology remains one card');
+  assert.deepEqual(
+    inventory.intentUnits![0].members.map((member) => member.entry.path.displayPath).sort(),
+    ['packages/a/one.txt', 'packages/b/two.txt'],
+  );
+  assert.deepEqual(
+    inventory.intentUnits![0].members.map((member) => member.entry.entryId).sort(),
+    inventory.bundles.filter((bundle) => bundle.kind === 'component')
+      .flatMap((bundle) => bundle.members.map((member) => member.entry.entryId)).sort(),
+    'intent and legacy bundle projections agree on identical evidence bytes',
+  );
+});
+
 test('projects immutable turn stamps into Save-card plan labels', async () => {
   const routes = buildRoutes({
     readTurnRecord: (turnId) => ({

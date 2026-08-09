@@ -17,6 +17,7 @@ import type {
   SaveCardFleetAdhocMarkDoneResponse,
   SaveCardFleetAdhocMarkDoneSuccess,
   SaveCardInventoryResponse,
+  SaveIntentUnitDto,
   SaveSweepIntent,
   SaveSweepResponse,
   SaveSweepTerminalResult,
@@ -505,7 +506,14 @@ function ExpiryBlock({
 type LoadState =
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'ready'; bundles: WorkBundleDto[]; quotaWeakening: SaveCardQuotaWeakening | null };
+  | {
+      status: 'ready';
+      bundles: WorkBundleDto[];
+      intentUnits: SaveIntentUnitDto[] | null;
+      unwitnessed: SaveCardInventoryResponse['unwitnessed'];
+      legacyTaskIdentityUnavailable: SaveCardInventoryResponse['legacyTaskIdentityUnavailable'];
+      quotaWeakening: SaveCardQuotaWeakening | null;
+    };
 
 type SaveAllState =
   | { status: 'idle' }
@@ -578,6 +586,9 @@ export default function SaveCard() {
       ? {
           status: 'ready',
           bundles: cached.inventory.bundles,
+          intentUnits: cached.inventory.intentUnits ?? null,
+          unwitnessed: cached.inventory.unwitnessed,
+          legacyTaskIdentityUnavailable: cached.inventory.legacyTaskIdentityUnavailable,
           quotaWeakening: cached.inventory.quotaWeakening,
         }
       : { status: 'loading' },
@@ -587,6 +598,8 @@ export default function SaveCard() {
   const saveAllInFlightRef = useRef(false);
   const packageGestureRefs = useRef(new Map<string, PackageSaveGestureHandle>());
   const [infoOpen, setInfoOpen] = useState(false);
+  const [adoptingBaseline, setAdoptingBaseline] = useState(false);
+  const [baselineResult, setBaselineResult] = useState<string | null>(null);
   const infoRef = useRef<HTMLDivElement>(null);
   const infoButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -640,6 +653,9 @@ export default function SaveCard() {
           setState({
             status: 'ready',
             bundles: response.bundles,
+            intentUnits: response.intentUnits ?? null,
+            unwitnessed: response.unwitnessed,
+            legacyTaskIdentityUnavailable: response.legacyTaskIdentityUnavailable,
             quotaWeakening: response.quotaWeakening,
           });
         }
@@ -664,6 +680,9 @@ export default function SaveCard() {
       setState({
         status: 'ready',
         bundles: cached.inventory.bundles,
+        intentUnits: cached.inventory.intentUnits ?? null,
+        unwitnessed: cached.inventory.unwitnessed,
+        legacyTaskIdentityUnavailable: cached.inventory.legacyTaskIdentityUnavailable,
         quotaWeakening: cached.inventory.quotaWeakening,
       });
       if (isSaveCardInventoryFresh(cached)) return;
@@ -780,7 +799,7 @@ export default function SaveCard() {
     );
   }
 
-  const { bundles, quotaWeakening } = state;
+  const { bundles, intentUnits, unwitnessed, legacyTaskIdentityUnavailable, quotaWeakening } = state;
   const quiet = bundles.filter(isQuietlySaved);
   const loud = bundles.filter((b) => !isQuietlySaved(b));
   const loudGroups = groupBySupervisor(loud);
@@ -901,6 +920,71 @@ export default function SaveCard() {
       {header}
 
       <QuotaWeakeningBanner warning={quotaWeakening} />
+
+      {intentUnits !== null && (
+        <div data-testid="save-intent-hierarchy">
+          {[...new Set(intentUnits.map((unit) => unit.plan?.id ?? 'unplanned'))].map((planId) => {
+            const planUnits = intentUnits.filter((unit) => (unit.plan?.id ?? 'unplanned') === planId);
+            return (
+              <section className="sc-sect" key={planId}>
+                <h2>{planUnits[0]?.plan?.title ?? 'Unplanned tasks'}</h2>
+                <div>
+                  {[...new Set(planUnits.map((unit) => unit.planItem?.id ?? 'unplanned-item'))].map((itemId) => {
+                    const itemUnits = planUnits.filter((unit) =>
+                      (unit.planItem?.id ?? 'unplanned-item') === itemId);
+                    return (
+                      <div key={itemId} data-testid="save-intent-plan-item">
+                        {itemUnits[0]?.planItem && <h3>{itemUnits[0].planItem.title}</h3>}
+                        {itemUnits.map((unit) => (
+                          <article key={unit.intentId} data-testid="save-intent-unit">
+                            <strong>{unit.title}</strong>
+                            <span> · {unit.members.length} file{unit.members.length === 1 ? '' : 's'}</span>
+                            {unit.membershipStale && <span> · Membership stale — review required</span>}
+                            <details>
+                              <summary>Attribution evidence</summary>
+                              {unit.contributors.map((contributor) => contributor.name).join(', ') || 'No agent identity recorded'}
+                            </details>
+                          </article>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            );
+          })}
+          {(legacyTaskIdentityUnavailable?.length ?? 0) > 0 && (
+            <section className="sc-sect" data-testid="legacy-task-identity-unavailable">
+              <h2>Legacy task identity unavailable</h2>
+              <span>{legacyTaskIdentityUnavailable!.length} witnessed file{legacyTaskIdentityUnavailable!.length === 1 ? '' : 's'}</span>
+            </section>
+          )}
+          {(unwitnessed?.length ?? 0) > 0 && (
+            <section className="sc-sect" data-testid="unwitnessed-pool">
+              <h2>Unwitnessed changes</h2>
+              <span>{unwitnessed!.length} file{unwitnessed!.length === 1 ? '' : 's'}</span>
+              <button
+                type="button"
+                className="ui-btn ui-btn-primary px-3 py-1 text-[12.5px]"
+                disabled={adoptingBaseline || !workspaceId}
+                onClick={() => {
+                  if (!workspaceId) return;
+                  setAdoptingBaseline(true);
+                  void window.api.saveCard.adoptAllAsBaseline({ workspaceId })
+                    .then((result) => {
+                      setBaselineResult(`${result.title} · ${result.memberCount} files`);
+                      refresh();
+                    })
+                    .finally(() => setAdoptingBaseline(false));
+                }}
+              >
+                {adoptingBaseline ? 'Adopting baseline…' : 'Adopt all as baseline'}
+              </button>
+              {baselineResult && <div role="status">{baselineResult}</div>}
+            </section>
+          )}
+        </div>
+      )}
 
       <ExpiryBlock bundles={bundles} workspaceId={workspaceId ?? null} />
 

@@ -2030,10 +2030,15 @@ export const SAVECARD_CHANNELS = {
   getInventory: 'savecard:getInventory',
 } as const;
 
+export const SAVECARD_ADOPT_BASELINE_CHANNEL = 'savecard:adoptAllAsBaseline';
+
 /** Renderer request for the repository inventory containing this workspace. */
 export interface SaveCardInventoryRequest {
   workspaceId: string;
 }
+
+export interface SaveCardAdoptBaselineRequest { workspaceId: string; }
+export interface SaveCardAdoptBaselineResponse { intentId: string; title: string; memberCount: number; }
 
 /** Human identity attached by the main-process Save-card DB adapter. */
 export interface SaveCardBundleIdentity {
@@ -2092,6 +2097,36 @@ export interface SaveCardBundle {
   saveability?: SaveCardPackageSaveability;
 }
 
+/** Intent-first Save-card projection. Topology is disclosure evidence only. */
+export type SaveIntentState = 'open' | 'ready' | 'committed' | 'superseded' | 'abandoned';
+
+export interface ConcurrencyCaseDto {
+  caseId: string;
+  entryId: string;
+  intentIds: string[];
+  classification: 'evidence-incomplete' | 'same-intent' | 'cross-intent';
+}
+
+export interface SaveIntentUnitDto {
+  intentId: string;
+  kind: 'task' | 'named-save-set';
+  title: string;
+  state: SaveIntentState;
+  plan: { id: string; title: string } | null;
+  planItem: { id: string; title: string } | null;
+  members: SaveCardBundle['members'];
+  contributors: SaveCardWorkerUnit[];
+  topologyEvidence: {
+    componentIds: string[];
+    pathsWithMultipleTurns: string[];
+    captureHealth: import('./commit-candidates').BundleCaptureHealth;
+  };
+  concurrencyCases: ConcurrencyCaseDto[];
+  saveability: SaveCardPackageSaveability;
+  /** Named membership no longer matches this authoritative inventory digest. */
+  membershipStale?: boolean;
+}
+
 /**
  * Read-only Save-card inventory response. Carries the renderer-safe WorkBundle
  * DTOs plus the SC-WP-2L retention quota-weakening warning (null unless the pin
@@ -2099,6 +2134,10 @@ export interface SaveCardBundle {
  */
 export interface SaveCardInventoryResponse {
   bundles: SaveCardBundle[];
+  /** Staged beside bundles while intentPackaging is enabled. */
+  intentUnits?: SaveIntentUnitDto[];
+  unwitnessed?: SaveCardBundle['members'];
+  legacyTaskIdentityUnavailable?: SaveCardBundle['members'];
   quotaWeakening: import('./commit-candidates').SaveCardQuotaWeakening | null;
 }
 
@@ -3402,6 +3441,9 @@ export interface IpcApi {
    *  previews). No mutating method is exposed here. */
   saveCard: {
     getInventory: (req: SaveCardInventoryRequest) => Promise<SaveCardInventoryResponse>;
+    adoptAllAsBaseline: (
+      req: SaveCardAdoptBaselineRequest,
+    ) => Promise<SaveCardAdoptBaselineResponse>;
     preview: (req: SaveCardPreviewRequest) => Promise<SaveCardPreviewResponse>;
     /** Explicitly freeze and pin a fleet-adhoc package boundary. */
     markDone: (
