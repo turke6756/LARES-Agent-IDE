@@ -44,9 +44,11 @@ import {
 import type { PackageFinalization } from '../database';
 import {
   finalizePackage,
+  finalizeSaveUnit,
   type FinalizeOutcome,
   type FinalizePackageDeps,
   type FinalizePackageRequest,
+  type FinalizeSaveUnitDeps,
 } from './finalization-service';
 import {
   buildCandidate,
@@ -270,6 +272,7 @@ export type FleetAdhocBoundaryContext = Omit<
 export interface SaveCardFinalizeRoutes {
   resolveBoundary(req: SaveCardFleetAdhocMarkDoneRequest): Promise<FleetAdhocBoundaryContext>;
   finalizeDeps?: FinalizePackageDeps;
+  finalizeIntentDeps?: FinalizeSaveUnitDeps;
 }
 
 /** A known, renderer-actionable boundary refusal. Preview-route implementations
@@ -327,7 +330,7 @@ function toMarkDoneResponse(
   finalization: PackageFinalization,
   outcome: FinalizeOutcome,
   pinnedSelection: SaveCardPinnedSelection,
-): SaveCardFleetAdhocMarkDoneResponse {
+): Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }> {
   return {
     finalizationId: finalization.id,
     packageId: finalization.packageId,
@@ -382,9 +385,32 @@ export function registerSaveCardFinalizeIpc(
       planId: null,
       planItemId: null,
     };
-    const result = await finalizePackage(finalizeRequest, routes.finalizeDeps);
-    const response = toMarkDoneResponse(result.finalization, result.outcome, context.pinnedSelection);
-    if (result.outcome !== 'boundary-unavailable') {
+    const intentPackaging = process.env.LARES_INTENT_PACKAGING === '1';
+    let outcome: FinalizeOutcome;
+    let response: Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }>;
+    if (intentPackaging) {
+      const result = await finalizeSaveUnit({
+        ...context,
+        saveUnitId: context.packageId,
+        saveUnitKind: 'named-save-set',
+      }, routes.finalizeIntentDeps);
+      outcome = result.outcome;
+      response = {
+        finalizationId: result.finalization.id,
+        packageId: result.finalization.saveUnitId,
+        finalizationKind: 'fleet-adhoc',
+        outcome,
+        boundaryRef: result.finalization.boundaryRef,
+        boundaryStatus: result.finalization.boundaryStatus,
+        packageRevision: result.finalization.revision,
+        pinnedSelection: context.pinnedSelection,
+      };
+    } else {
+      const result = await finalizePackage(finalizeRequest, routes.finalizeDeps);
+      outcome = result.outcome;
+      response = toMarkDoneResponse(result.finalization, outcome, context.pinnedSelection);
+    }
+    if (outcome !== 'boundary-unavailable') {
       telemetry({ stage: 'freeze', code: 'freeze-ready' });
       return response;
     }

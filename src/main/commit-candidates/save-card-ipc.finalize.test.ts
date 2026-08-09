@@ -24,7 +24,9 @@ import {
   type FinalizationStore,
   type FinalizationRefWriter,
   type MemberFreezer,
+  type SaveIntentFinalizationStore,
 } from './finalization-service';
+import type { SaveIntentFinalization } from '../database';
 import type { CommitRepresentationEntry } from './commit-representation';
 import type { EncodedGitPath } from '../../shared/commit-candidates';
 import { finalizationRef } from '../git-checkpoints/finalization-refs';
@@ -84,6 +86,28 @@ class FakeStore implements FinalizationStore {
   }
   getPlanWorkPackage(): never { return null as never; }
   upsertPlanWorkPackage(): void { throw new Error('fleet-adhoc must never touch a plan work package'); }
+  transact<T>(fn: () => T): T { return fn(); }
+}
+
+class FakeIntentStore implements SaveIntentFinalizationStore {
+  rows = new Map<string, SaveIntentFinalization>();
+  getActive(saveUnitId: string): SaveIntentFinalization | null {
+    return [...this.rows.values()].find((row) =>
+      row.saveUnitId === saveUnitId && row.lifecycleStatus === 'active') ?? null;
+  }
+  maxRevision(saveUnitId: string): number {
+    return [...this.rows.values()].filter((row) => row.saveUnitId === saveUnitId)
+      .reduce((maximum, row) => Math.max(maximum, row.revision), 0);
+  }
+  insert(value: SaveIntentFinalization): void { this.rows.set(value.id, { ...value }); }
+  supersede(id: string, supersededBy: string): void {
+    const row = this.rows.get(id)!;
+    row.lifecycleStatus = 'superseded';
+    row.supersededByFinalizationId = supersededBy;
+  }
+  setBoundaryStatus(id: string, status: SaveIntentFinalization['boundaryStatus']): void {
+    this.rows.get(id)!.boundaryStatus = status;
+  }
   transact<T>(fn: () => T): T { return fn(); }
 }
 
@@ -169,6 +193,32 @@ test('fleet-adhoc mark-done creates a distinct finalization that captures bounda
   assert.equal(row!.planId, null);
   assert.equal(row!.planItemId, null);
   assert.equal(row!.boundaryRef, finalizationRef('pkg-fleet', 1));
+});
+
+test('intent-packaging production handler writes a v2 named-save-set finalization', async () => {
+  const ipc = new FakeIpc();
+  const store = new FakeIntentStore();
+  const previous = process.env.LARES_INTENT_PACKAGING;
+  process.env.LARES_INTENT_PACKAGING = '1';
+  try {
+    registerSaveCardFinalizeIpc(ipc, () => ({
+      resolveBoundary: async (req) => boundaryContext({ packageId: req.packageId, contractVersion: 2 }),
+      finalizeIntentDeps: {
+        store, writeRef: makeWriter(new FakeStore()), freeze: fakeFreeze,
+        now: () => 100, newId: () => 'fin-intent',
+      },
+    }));
+    const response = await ipc.invoke(SAVECARD_FINALIZE_CHANNEL, {
+      packageId: 'named-set-1', targetWorkspaceId: 'ws-1',
+    }) as Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }>;
+    assert.equal(response.finalizationId, 'fin-intent');
+    assert.equal(response.packageId, 'named-set-1');
+    assert.equal(store.rows.get('fin-intent')?.saveUnitKind, 'named-save-set');
+    assert.equal(store.rows.get('fin-intent')?.lifecycleStatus, 'active');
+  } finally {
+    if (previous === undefined) delete process.env.LARES_INTENT_PACKAGING;
+    else process.env.LARES_INTENT_PACKAGING = previous;
+  }
 });
 
 test('the mark-done channel is DISTINCT — it registers its own mutating channel name', () => {
