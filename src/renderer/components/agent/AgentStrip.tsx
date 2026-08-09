@@ -9,7 +9,7 @@ import {
   collectDescendantAgents,
   type AgentTreeNode,
 } from './agent-grouping';
-import { applyHorizontalWheelScroll } from '../../lib/horizontal-wheel';
+import { installHorizontalWheelScroll } from '../../lib/horizontal-wheel';
 
 // Mirrors StatusBadge's STATUS_CONFIG dot colors so the strip and the
 // full-size cards never disagree about what a status looks like.
@@ -249,6 +249,11 @@ export default function AgentStrip({ defaultExpanded = false }: { defaultExpande
     el?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }, [selectedAgentId, expanded]);
 
+  useEffect(() => {
+    if (expanded || !scrollRef.current) return;
+    return installHorizontalWheelScroll(scrollRef.current);
+  }, [expanded]);
+
   const handleSelect = (agentId: string) => {
     selectAgent(agentId);
     // You expanded to find someone; once found, give the space back.
@@ -279,7 +284,6 @@ export default function AgentStrip({ defaultExpanded = false }: { defaultExpande
       ) : (
         <div
           ref={scrollRef}
-          onWheel={(e) => applyHorizontalWheelScroll(e.currentTarget, e)}
           className="flex-1 flex gap-1.5 overflow-x-auto scrollbar-thin pb-0.5 min-w-0"
         >
           {cards}

@@ -56,7 +56,7 @@ the write. A capsule looks like:
 - status: active            # active | done | note | archived
 - <a named way to die>      # REQUIRED for an active memory — see gate 4
 - read-if: <when a future agent should fetch the detail>   # optional
-- detail: .lares/supervisor/memory/details/<id>.md         # optional, for long bodies
+- detail: memory/details/<id>.md                           # optional, for long bodies
 <the memory, tight — what's true and why it matters>
 ```
 

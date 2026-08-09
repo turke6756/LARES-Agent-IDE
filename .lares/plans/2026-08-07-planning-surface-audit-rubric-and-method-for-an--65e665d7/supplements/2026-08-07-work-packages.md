@@ -152,7 +152,7 @@ Independence is agent-level, not provider-level.
 - Insert the topology, budget, independence and read-only rules from the deliberation into the
   document so the rubric reads as one executable instrument.
 
-**Accept** — the five conditions listed for WP-1 in the machine block.
+**Accept** — the seven conditions listed for WP-1 in the machine block.
 
 **Non-goals**
 - Do **not** touch `ARC.md`, `plan.json`, or `deliberations/`.
@@ -225,7 +225,7 @@ distinctive phrase from each moved claim and confirm zero hits.
 - State in the Lead Auditor brief that collector packets are **leads, not evidence**, and enumerate
   exactly what the lead re-reads first-hand.
 
-**Accept** — the six conditions listed for WP-3 in the machine block.
+**Accept** — the eight conditions listed for WP-3 in the machine block.
 
 **Non-goals** — do not dispatch anyone; do not begin collecting evidence; do not edit `plan.md`.
 
@@ -250,7 +250,7 @@ candidate auditor ids against the disqualification list and record the result. D
 collectors concurrently with the WP-3 briefs, read-only, with the calibration supplement outside
 their read scope. Gate each returned packet against its schema.
 
-**Accept** — the four conditions listed for WP-4 in the machine block.
+**Accept** — the five conditions listed for WP-4 in the machine block.
 
 **Non-goals** — no scoring, no ranking, no moral labels, no Part C construction in a packet. No
 collector reads the calibration supplement.
@@ -271,7 +271,7 @@ independent baseline. Then unseal `supplements/audit-calibration-set.md` and res
 exactly one calibration turn. Run the post-run integrity check (`git status` plus `list_checkpoints`
 over the audit window) and confirm no audit-caused mutation.
 
-**Accept** — the six conditions listed for WP-5 in the machine block.
+**Accept** — the seven conditions listed for WP-5 in the machine block.
 
 **Non-goals** — the lead does not repair anything it finds; a repaired defect is an unmeasured
 defect. A calibration mismatch alone does not change a score. Do not let the lead cite a packet in

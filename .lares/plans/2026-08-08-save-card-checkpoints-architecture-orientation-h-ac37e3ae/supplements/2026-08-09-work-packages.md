@@ -499,6 +499,30 @@ at activity completion; the full startup-recovery matrix (design §5.4).
 **Verify:** merge-service suite over conflicting/compatible/racing fixtures; recovery matrix
 fixtures (each row of §5.4); renderer conflict-UI tests; end-to-end scenarios 4–6 and 10.
 
+## WP-6 addendum - Production seams for merge-back (supervisor scope addendum, 2026-08-09)
+
+Minted by the responsible supervisor (dc4a15ae) after WP-6 implementation proved three acceptance
+seams unreachable from the WP-6 Files list (worker stopped correctly, zero edits). WP-1b/WP-4
+precedent; machine block deliberately NOT amended. Additional authority, granted as the full
+production chain up front to avoid serial stops:
+
+- `src/main/git-checkpoints/commit-coordinator.ts` — invoke the existing
+  `advancePlanningActivityHead` primitive at the production Save call site (WP-5 carried gate
+  item 1), and originate eager per-task promotion from that path. No other coordinator changes.
+- `src/main/git-checkpoints/planning-worktree-reconciler.ts` — extend beyond `provisioning`
+  rows to implement every design §5.4 recovery row.
+- `src/renderer/components/save/SaveCard.tsx` — render/mount `PlanMergeBack` and the
+  per-activity card projection (WP-5 carried gate item 2); no other SaveCard changes.
+- Merge-back IPC production chain, minimal seam each: `src/shared/commit-candidates.ts` and/or
+  `src/shared/types.ts` (request/response + window API contract), `src/preload/index.ts`
+  (binding), `src/main/ipc-handlers.ts` or `src/main/commit-candidates/save-card-ipc.ts`
+  (registration), `src/main/git-checkpoints/engine-bootstrap.ts` (bootstrap wiring only if the
+  merge service requires it).
+- Sibling tests of each.
+
+**Non-goals (addendum):** everything WP-6 already excludes; no route/handler beyond the
+merge-back + promotion-status surface; no constants/scaffold edits.
+
 ## WP-D3 - Provenance durability: Assisted-by policy and checkpoint-ref pinning
 
 **Files:** `src/main/git-checkpoints/commit-coordinator.ts` (`defaultDeriveTrailers`, ~line 200);
@@ -518,6 +542,29 @@ past normal retention; ref-pointer trailers honest about local scope. No transpo
 
 **Verify:** trailer-derivation suite over witnessed/claimed/adopted fixtures; retention suite
 proving pinned refs survive a prune pass.
+
+## WP-D3 addendum - Production seams for trailer derivation and ref pinning (supervisor scope addendum, 2026-08-09)
+
+Minted by the responsible supervisor (dc4a15ae) after WP-D3 implementation proved both acceptance
+conditions unreachable from the two-file list (worker stopped correctly, zero edits): production
+trailer derivation was relocated by WP-4 into `preview-routes.ts` `productionSeams.deriveTrailers`
+(so `defaultDeriveTrailers` edits would be bypassed); `CandidateTokenSnapshot` freezes no
+provider/model provenance; retention has no production input mapping promoted commits to their
+checkpoint refs (that linkage lives in WP-6's merge surfaces). Full chain granted up front:
+
+- `src/main/commit-candidates/preview-routes.ts` — the `productionSeams.deriveTrailers`
+  implementation only.
+- `src/main/commit-candidates/candidate-service.ts` + `src/shared/commit-candidates.ts` —
+  freeze witnessed provider/model provenance into `CandidateTokenSnapshot` (minimal fields;
+  internal agent UUIDs stay OUT of any shareable shape).
+- `src/main/index.ts` — coordinator/retention construction seam only if injection must change.
+- `src/main/git-checkpoints/activity-merge-service.ts` and/or `src/main/database.ts` —
+  record/expose the promoted-commit → referenced-checkpoint-ref linkage as retention's
+  production input (minimal surface).
+- Sibling tests of each.
+
+**Non-goals (addendum):** no message-body changes; no UI; no cross-clone transport; nothing
+else in the granted files; no constants/scaffold edits.
 
 ## WP-D6 - Opt-in candidate-tree validation and repo-policy signing
 
@@ -560,3 +607,40 @@ recovered; run the design §9 ten end-to-end scenarios; remove the `intentPackag
 
 **Verify:** full commit-candidate, checkpoint, planning-lifecycle, renderer save, and
 production-IPC suites; the §9 scenario fixtures; a final dead-symbol audit of the removed names.
+
+## WP-7 addendum - Renderer chain completion for the cutover (supervisor scope addendum, 2026-08-09)
+
+Minted by the responsible supervisor (dc4a15ae) after WP-7 implementation proved the shared-DTO
+retirement unreachable from the WP-7 Files list: `SaveBundle.tsx` still defines and consumes
+`WorkBundleDto` and reads `component.overlap.requiresOverlapAck`, and `save-card-expiry.ts` still
+accepts `WorkBundleDto[]` — so removing the DTO and passing the dead-symbol audit is impossible
+without them. Worker stopped correctly, zero edits. WP-1b/WP-4/WP-6/WP-D3 precedent; machine
+block deliberately NOT amended. Granted as the full chain up front:
+
+**Files (additional):**
+- `src/renderer/components/save/SaveBundle.tsx` — retire, or convert to intent-unit rendering
+  (whichever the design §8 cutover implies; legacy finalizations keep read-only rendering).
+- `src/renderer/components/save/save-card-expiry.ts` — migrate expiry mapping from
+  `WorkBundleDto[]` to `SaveIntentUnitDto[]`.
+- Sibling tests: `save-card-expiry.test.ts`, any `SaveBundle` coverage affected by retirement
+  (`SaveCard.test.tsx` already in WP-7 scope).
+
+**Non-goals (addendum):** everything WP-7 already excludes; no new renderer features; no
+constants/scaffold edits.
+
+## WP-7 addendum 2 - Plan-review projection migration (supervisor scope addendum, 2026-08-09)
+
+Minted by the responsible supervisor (dc4a15ae) after the worker's second correct stop (zero
+edits): a full `src/` audit found one remaining production consumer of the retiring bundle
+shape beyond the granted surface — `PlanReviewProjectionInput.scBundles` is `SaveCardBundle[]`,
+with baseline-diff, selected-component, mixed-authorship, and capture-gap logic all consuming
+bundles. Same precedent; machine block deliberately NOT amended.
+
+**Files (additional):**
+- `src/main/plans/plan-review-projection.ts` — migrate the projection input and its logic from
+  `SaveCardBundle[]` to intent units plus read-only topology/inventory evidence (supplied by the
+  already-authorized `plan-ipc.ts`).
+- `src/main/plans/plan-review-projection.test.ts` — migrate fixtures and assertions accordingly.
+
+**Non-goals (addendum 2):** no behavior change to what the review projection reports beyond the
+evidence-shape migration; everything WP-7 already excludes.

@@ -97,6 +97,9 @@ type DbModule = {
   createAgent(data: Record<string, unknown>): DbAgentRow;
   updateAgentStatus(id: string, status: string): void;
   getActiveAgents(): DbAgentRow[];
+  saveAgentContextStats(stats: Record<string, unknown>): void;
+  getAgentContextStats(agentId: string): Record<string, unknown> | null;
+  deleteAgent(id: string): void;
 };
 let dbm: DbModule;
 let wsId = '';
@@ -144,6 +147,30 @@ test('a live agent leaves the registry the moment it goes terminal', () => {
   assert.ok(dbm.getActiveAgents().some((r) => r.id === a.id));
   dbm.updateAgentStatus(a.id, 'done');
   assert.ok(!dbm.getActiveAgents().some((r) => r.id === a.id));
+});
+
+test('last context snapshot remains readable after an agent goes terminal', () => {
+  const a = makeAgent('idle');
+  dbm.saveAgentContextStats({
+    agentId: a.id,
+    sessionId: 'session-1',
+    model: 'claude-sonnet-4-5',
+    inputTokens: 80_000,
+    cacheCreationTokens: 0,
+    cacheReadTokens: 0,
+    outputTokens: 1_000,
+    totalOutputTokens: 2_000,
+    totalContextTokens: 84_000,
+    contextWindowMax: 200_000,
+    contextPercentage: 42,
+    turnCount: 7,
+    lastUpdatedAt: '2026-08-03T12:00:00.000Z',
+  });
+  dbm.updateAgentStatus(a.id, 'done');
+
+  assert.equal(dbm.getAgentContextStats(a.id)?.contextPercentage, 42);
+  dbm.deleteAgent(a.id);
+  assert.equal(dbm.getAgentContextStats(a.id), null, 'deleting the card also deletes its snapshot');
 });
 
 // ── Runner ───────────────────────────────────────────────────────────────────

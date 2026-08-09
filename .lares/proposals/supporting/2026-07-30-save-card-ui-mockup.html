@@ -1,0 +1,292 @@
+<title>Save Card — final-form UI mockup</title>
+<style>
+  :root{
+    --surface-base:#181818; --surface-0:#1e1e1e; --surface-1:#252526;
+    --surface-2:#2d2d2d; --surface-3:#3e3e42;
+    --blue:#0078d4; --blue-bright:#3794ff; --blue-band:#04395e;
+    --green:#89d185; --yellow:#cca700; --orange:#d18616; --red:#f14c4c;
+    --fg:#cccccc; --fg-2:#9d9d9d; --fg-3:#6e6e6e; --fg-bright:#ffffff;
+    --mono:"Cascadia Code","Consolas",ui-monospace,Menlo,monospace;
+  }
+  html,body{background:var(--surface-0);color:var(--fg);margin:0;
+    font-family:"Segoe UI",-apple-system,BlinkMacSystemFont,sans-serif;font-size:13px;line-height:1.5;}
+  .frame{max-width:1150px;margin:0 auto;padding:0 20px 70px;}
+
+  /* ── app top bar ─────────────────────────────── */
+  .topbar{display:flex;align-items:center;gap:2px;padding:6px 12px;background:var(--surface-base);
+    border-bottom:1px solid var(--surface-3);position:sticky;top:0;z-index:5;}
+  .brand{font-size:12px;color:var(--fg-2);margin-right:16px;letter-spacing:.06em;}
+  .brand b{color:var(--fg);font-weight:600;}
+  .navbtn{font-size:13px;color:var(--fg-2);padding:4px 12px;border-radius:3px;}
+  .navbtn.on{color:var(--fg-bright);background:var(--surface-2);}
+  .savebtn{margin-left:auto;display:flex;align-items:center;gap:7px;padding:4px 12px 4px 9px;
+    border:1px solid var(--surface-3);border-radius:3px;background:var(--surface-1);
+    color:var(--fg);font-size:13px;cursor:pointer;position:relative;}
+  .savebtn.on{border-color:var(--blue);background:var(--blue-band);color:var(--fg-bright);}
+  .savebtn .chip{width:18px;height:14px;border:1.5px solid var(--blue-bright);border-radius:1px;position:relative;display:inline-block;}
+  .savebtn .chip::before{content:"";position:absolute;top:0;left:3px;right:3px;height:5px;
+    border-bottom:1.5px solid var(--blue-bright);border-left:1.5px solid var(--blue-bright);border-right:1.5px solid var(--blue-bright);}
+  .savebtn .badge{position:absolute;top:-7px;right:-7px;background:var(--blue-bright);color:#08131c;
+    font-size:10px;font-weight:700;border-radius:8px;padding:1px 5px;font-family:var(--mono);}
+  .hint{font-size:12px;color:var(--fg-3);text-align:center;margin:10px 0 28px;font-style:italic;}
+
+  /* ── header ──────────────────────────────────── */
+  h1{font-size:18px;font-weight:600;color:var(--fg-bright);margin:26px 0 2px;letter-spacing:.02em;}
+  .sub{color:var(--fg-2);font-size:12.5px;margin:0 0 22px;}
+  .sub b{color:var(--fg);font-weight:600;}
+
+  .layout{display:grid;grid-template-columns:236px 1fr;gap:18px;align-items:start;}
+  @media(max-width:840px){.layout{grid-template-columns:1fr;}}
+
+  /* ── left rail ───────────────────────────────── */
+  .rail{display:flex;flex-direction:column;gap:14px;position:sticky;top:56px;}
+  .railbox{background:var(--surface-1);border:1px solid var(--surface-3);border-radius:4px;padding:12px 14px;}
+  .railbox h3{margin:0 0 8px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--fg-3);font-weight:600;}
+  .tab{padding:5px 9px;border-radius:3px;font-size:12.5px;color:var(--fg-2);cursor:pointer;margin-bottom:2px;}
+  .tab.on{background:var(--blue-band);color:var(--fg-bright);}
+  .tab .note{font-size:11px;color:var(--fg-3);display:block;}
+  .tab.on .note{color:var(--fg-2);}
+  .meter{height:8px;border-radius:2px;background:var(--surface-0);border:1px solid var(--surface-3);overflow:hidden;margin:4px 0 7px;}
+  .meter i{display:block;height:100%;width:62%;background:var(--blue);}
+  .railnote{font-size:11.5px;color:var(--fg-2);margin:0;}
+  .rung{display:flex;justify-content:space-between;font-size:11.5px;padding:4px 0;
+    border-bottom:1px solid var(--surface-2);font-family:var(--mono);}
+  .rung:last-child{border-bottom:0;}
+  .rung .n{color:var(--fg);}
+
+  /* ── sections ────────────────────────────────── */
+  .sect{display:flex;align-items:center;gap:10px;margin:4px 0 10px;}
+  .sect h2{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--fg-2);margin:0;font-weight:600;}
+  .sect .rule{flex:1;height:1px;background:var(--surface-3);}
+  .sect .count{font-size:11px;color:var(--fg-3);font-family:var(--mono);}
+  .slots{display:flex;flex-direction:column;gap:12px;margin-bottom:30px;}
+
+  /* ── unsaved cards ───────────────────────────── */
+  .slot{background:var(--surface-1);border:1px solid var(--surface-3);border-left:3px solid var(--blue);
+    border-radius:4px;padding:14px 16px;}
+  .slot.ready{border-left-color:var(--green);}
+  .slot.blocked{border-left-color:var(--red);}
+  .slot.ghost{border-left-color:var(--surface-3);border-style:solid;background:var(--surface-0);}
+  .slothead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  .check{width:16px;height:16px;border:1.5px solid var(--fg-3);border-radius:3px;flex:none;}
+  .check.done{border-color:var(--green);background:var(--green);position:relative;}
+  .check.done::after{content:"✓";position:absolute;inset:0;color:#10240f;font-size:12px;font-weight:800;
+    display:flex;align-items:center;justify-content:center;}
+  .slot h2{font-size:13.5px;margin:0;font-weight:600;color:var(--fg-bright);flex:1;min-width:220px;letter-spacing:0;text-transform:none;}
+  .pill{font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+    padding:2px 8px;border-radius:2px;font-family:var(--mono);}
+  .p-done{background:#1e3320;color:var(--green);}
+  .p-live{background:var(--blue-band);color:var(--blue-bright);}
+  .p-warn{background:#33290a;color:var(--yellow);}
+  .p-block{background:#3a1616;color:var(--red);}
+  .p-ghost{background:var(--surface-2);color:var(--fg-2);}
+  .desc{font-size:12.5px;color:var(--fg);margin:7px 0 0;}
+  .desc .k{color:var(--fg-3);}
+  .meta{font-size:11.5px;color:var(--fg-2);margin:3px 0 0;}
+
+  .paths{font-family:var(--mono);font-size:12px;margin:10px 0 0;padding:8px 12px;background:var(--surface-0);
+    border:1px solid var(--surface-2);border-radius:3px;overflow-x:auto;}
+  .paths div{white-space:nowrap;padding:1px 0;color:var(--fg-2);}
+  .paths .add{color:var(--green);} .paths .mod{color:var(--blue-bright);} .paths .hot{color:var(--orange);}
+  .paths .more{color:var(--fg-3);font-style:italic;}
+  .byworker{font-size:11.5px;color:var(--fg-3);margin:8px 0 0;}
+  .byworker b{color:var(--fg-2);font-weight:600;}
+
+  .verify{display:flex;gap:9px;align-items:flex-start;margin-top:10px;padding:8px 12px;border-radius:3px;font-size:12.5px;}
+  .v-ok{background:#1c2b1c;border:1px solid #2f4a2f;color:#b9dcb6;}
+  .v-bad{background:#2e1818;border:1px solid #542626;color:#e3b8b8;}
+  .v-ico{font-family:var(--mono);font-weight:700;flex:none;}
+  .v-ok .v-ico{color:var(--green);} .v-bad .v-ico{color:var(--red);}
+
+  .msgdraft{margin-top:10px;font-family:var(--mono);font-size:11.5px;color:var(--fg-2);
+    border-left:2px solid var(--surface-3);padding:4px 12px;overflow-x:auto;}
+  .msgdraft b{color:var(--fg);font-weight:600;}
+  .trail{color:var(--fg-3);}
+
+  .actions{display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap;}
+  .btn{font-size:12.5px;padding:5px 14px;border-radius:3px;border:1px solid var(--surface-3);
+    background:var(--surface-2);color:var(--fg);cursor:pointer;}
+  .btn.primary{background:var(--blue);border-color:var(--blue);color:var(--fg-bright);font-weight:600;}
+  .btn.primary:hover{background:var(--blue-bright);}
+  .btn[disabled]{opacity:.45;cursor:not-allowed;}
+  .why{font-size:11.5px;color:var(--fg-3);}
+  .flag{display:inline-flex;gap:6px;font-size:11.5px;color:var(--yellow);margin-top:8px;}
+  .flag.gy{color:var(--fg-2);}
+  .pulse{width:7px;height:7px;border-radius:50%;background:var(--blue-bright);display:inline-block;flex:none;
+    animation:pulse 1.6s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
+  @media(prefers-reduced-motion:reduce){.pulse{animation:none;}}
+
+  /* ── saved section ───────────────────────────── */
+  .saved{display:flex;flex-direction:column;border:1px solid var(--surface-2);border-radius:4px;overflow:hidden;margin-bottom:14px;}
+  .savedrow{display:flex;align-items:center;gap:10px;padding:7px 14px;background:var(--surface-0);
+    border-bottom:1px solid var(--surface-2);font-size:12.5px;color:var(--fg-2);}
+  .savedrow:last-child{border-bottom:0;}
+  .savedrow .tick{color:var(--green);font-family:var(--mono);flex:none;}
+  .savedrow .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .savedrow .t b{color:var(--fg);font-weight:600;}
+  .savedrow .hash{font-family:var(--mono);font-size:11.5px;color:var(--fg-3);flex:none;}
+  .showall{font-size:12px;color:var(--blue-bright);padding:6px 14px;background:var(--surface-0);cursor:pointer;}
+  .pushrow{display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--surface-1);
+    border:1px solid var(--surface-3);border-radius:4px;}
+  .pushrow .txt{flex:1;font-size:12.5px;color:var(--fg-2);}
+  .pushrow .txt b{color:var(--fg);}
+
+  .keyline{margin:38px 0 0;padding-top:14px;border-top:1px solid var(--surface-2);
+    font-size:12px;color:var(--fg-3);}
+  .keyline b{color:var(--fg-2);}
+</style>
+
+<div class="topbar">
+  <span class="brand"><b>LARES</b> · AgentDashboard</span>
+  <span class="navbtn">Dashboard</span>
+  <span class="navbtn">Plans</span>
+  <span class="navbtn">Files</span>
+  <span class="savebtn on"><span class="chip"></span> Save <span class="badge">2</span></span>
+</div>
+<p class="hint">Save button in the top bar beside its peers — drawn like a little save card, badge = packages ready to save. Opens this surface in the main view.</p>
+
+<div class="frame">
+  <h1>Save Progress</h1>
+  <p class="sub">Workspace <b>AgentDashboard</b> · branch <b>master</b> · last save <b>2 h ago</b> · <b>23 files</b> uncommitted</p>
+
+  <div class="layout">
+    <div class="rail">
+      <div class="railbox">
+        <h3>Group by</h3>
+        <div class="tab on">Supervisor unit<span class="note">default — work toward one goal</span></div>
+        <div class="tab">Plan<span class="note">when work is plan-bound</span></div>
+        <div class="tab">Worker<span class="note">smallest unit — less ideal</span></div>
+      </div>
+      <div class="railbox">
+        <h3>Recovery space</h3>
+        <div class="meter"><i></i></div>
+        <p class="railnote">62% of quota. Restore points for unsaved work are pinned and won't expire. Saving frees space.</p>
+      </div>
+      <div class="railbox">
+        <h3>Protection ledger</h3>
+        <div class="rung"><span style="color:var(--blue-bright)">checkpoint only</span><span class="n">23 files</span></div>
+        <div class="rung"><span style="color:var(--green)">committed</span><span class="n">312</span></div>
+        <div class="rung"><span style="color:var(--yellow)">on origin</span><span class="n">257</span></div>
+      </div>
+    </div>
+
+    <div>
+      <!-- ═══ UNSAVED ═══ -->
+      <div class="sect"><h2>Unsaved work</h2><span class="rule"></span><span class="count">3 packages · 21 files</span></div>
+      <div class="slots">
+
+        <!-- supervisor unit, ready -->
+        <div class="slot ready">
+          <div class="slothead">
+            <span class="check done"></span>
+            <h2>Memory system v2 — recall tool, review UI, migration</h2>
+            <span class="pill p-done">Ready to save</span>
+          </div>
+          <p class="desc"><span class="k">From supervisor</span> <b>Memory Architecture</b> <span class="k">— coordinated the workspace memory rebuild: recall_memory tool, per-lane grants, review UI, janitor brief, migration.</span></p>
+          <p class="meta">Jul 28–29 · 3 workers, 14 turns · finished yesterday 18:40</p>
+          <div class="paths">
+            <div class="add">A src/main/memory/recall-tool.ts</div>
+            <div class="mod">M src/main/supervisor/toolsets.ts</div>
+            <div class="add">A src/renderer/memory/ReviewPane.tsx</div>
+            <div class="more">+9 more files…</div>
+          </div>
+          <p class="byworker">By worker: <b>memory-tool-worker</b> (5 turns) · <b>review-ui-worker</b> (6) · <b>migration-worker</b> (3)</p>
+          <div class="verify v-ok"><span class="v-ico">✓ Verified</span>
+            <span>Disk matches this package's final checkpoint byte-for-byte. Saving commits exactly the reviewed work.</span></div>
+          <div class="msgdraft">
+            <b>feat(memory): recall tool + review UI + migration (memory-v2)</b><br>
+            <span class="trail">Lares-Supervisor: memory-architecture · Lares-Turns: 14 · committed as Edward Turk</span>
+          </div>
+          <div class="actions">
+            <span class="btn primary">Save — commit 12 files</span>
+            <span class="btn">Preview diff</span>
+          </div>
+        </div>
+
+        <!-- plan-bound, blocked -->
+        <div class="slot blocked">
+          <div class="slothead">
+            <span class="check done"></span>
+            <h2>Codex worker auth — Path A hook carrier</h2>
+            <span class="pill p-block">Changed since done</span>
+          </div>
+          <p class="desc"><span class="k">From plan</span> <b>Codex native-Windows workers</b> <span class="k">— trusted-project hook carrier so Codex workers load guard hooks without --profile.</span></p>
+          <p class="meta">Jul 30 · 1 worker, 6 turns · finished 3 h ago</p>
+          <div class="paths">
+            <div class="mod">M src/main/codex/scaffold.ts</div>
+            <div class="hot">M src/main/supervisor/index.ts — edited again after the package finished</div>
+          </div>
+          <div class="verify v-bad"><span class="v-ico">✕ Held</span>
+            <span>1 file changed after this package finished — disk no longer matches the reviewed snapshot. Look before saving.</span></div>
+          <div class="actions">
+            <span class="btn primary" disabled>Save</span>
+            <span class="btn">View what changed</span>
+            <span class="btn">Restore package snapshot</span>
+          </div>
+        </div>
+
+        <!-- single worker, in progress -->
+        <div class="slot">
+          <div class="slothead">
+            <span class="pulse"></span>
+            <h2>Save-surface renderer pane</h2>
+            <span class="pill p-live">In progress</span>
+          </div>
+          <p class="desc"><span class="k">From worker</span> <b>save-ui-worker</b> <span class="k">— building the Save surface React pane (SC-WP-1C). Single-worker package — smallest saveable unit.</span></p>
+          <p class="meta">Today · turn 3 running now — file touches tick in live</p>
+          <div class="paths">
+            <div class="add">A src/renderer/save/SaveSurface.tsx</div>
+            <div class="mod">M src/renderer/App.tsx</div>
+          </div>
+          <div class="actions">
+            <span class="btn" disabled>Save</span>
+            <span class="why">Still in progress — only finished packages can be saved.</span>
+          </div>
+        </div>
+
+        <!-- unattributed -->
+        <div class="slot ghost">
+          <div class="slothead">
+            <h2 style="color:var(--fg-2)">Unattributed changes</h2>
+            <span class="pill p-ghost">No witness</span>
+          </div>
+          <p class="meta">2 dirty files no agent was seen touching — shell side effects, generated files, or a capture gap. Needs a human eye.</p>
+          <div class="paths">
+            <div class="mod">M .lares/researcher/scripts/research-write-guard.mjs</div>
+            <div class="mod">M package-lock.json</div>
+          </div>
+          <div class="actions"><span class="btn">Review manually</span></div>
+        </div>
+      </div>
+
+      <!-- ═══ SAVED ═══ -->
+      <div class="sect"><h2>Saved</h2><span class="rule"></span><span class="count">recent only</span></div>
+      <div class="saved">
+        <div class="savedrow"><span class="tick">✓</span>
+          <span class="t"><b>Codex Path A scaffold v6</b> — supervisor Codex Auth · Jul 30</span>
+          <span class="hash">48e088a · 2 h ago</span></div>
+        <div class="savedrow"><span class="tick">✓</span>
+          <span class="t"><b>Memory migration artifacts</b> — supervisor Memory Architecture · Jul 29</span>
+          <span class="hash">e01c5e4 · yesterday</span></div>
+        <div class="savedrow"><span class="tick">✓</span>
+          <span class="t"><b>Memory review UI + approvals</b> — supervisor Memory Architecture · Jul 29</span>
+          <span class="hash">a149bd9 · yesterday</span></div>
+        <div class="showall">Show all saves…</div>
+      </div>
+      <div class="pushrow">
+        <span class="txt"><b>55 saves</b> are local only — not yet on origin. Push makes them reachable from anywhere.</span>
+        <span class="btn">Push to origin</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="keyline">
+    <b>Reading the mockup:</b> packages default to the <b>supervisor unit / plan</b> level — work toward one goal, one commit;
+    single-worker is the smallest allowed unit. Each card leads with a plain-language description of <i>who</i> did the work and
+    <i>what it was for</i>, plus dates, to jog memory. Unsaved work is the loud top section with colored edges; saved work is the
+    quiet checkmarked list below (recent only — full history stays in git), ending with the future <b>Push to origin</b> step.
+    The byte-match hold, pinning quota, and protection ledger are unchanged from the hardened plan. The user is always the committer.
+  </div>
+</div>

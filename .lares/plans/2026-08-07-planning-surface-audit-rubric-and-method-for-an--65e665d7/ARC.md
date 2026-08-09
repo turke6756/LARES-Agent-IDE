@@ -1,5 +1,5 @@
 # ARC — Planning Surface Audit — rubric and method for an auditing agent   (plan_sku: 2026-08-07-planning-surface-audit-rubric-and-method-for-an--65e665d7 · plan_artifact_id: plan_65e665d7)
-<!--ARC-META {"last_refreshed_at":1786130261386,"source_cutoffs":{"folder_mtime_ms":1786130252803.7292,"ledger_updated_at":null}} -->
+<!--ARC-META {"last_refreshed_at":1786219995062,"source_cutoffs":{"folder_mtime_ms":1786219995062,"max_source_mtime_ms":1786217313176,"ledger_updated_at":null}} -->
 ## Decisions
 - 2026-08-07 — 2026-08-07 - one intent (int_7b3ce2a4, groupthink-serial) on auditor execution design; all other parts need neither deliberation nor research.
 - 2026-08-07 — **Scope ambiguity resolved by the responsible supervisor, not deliberated.** §1/§3.1
@@ -125,3 +125,98 @@ deliberations, supplements, packages; research omitted — directory holds only 
   every scoping claim rather than trust the brief, and barred from `ARC.md`/`plan.json`/
   `deliberations/`, from committing, and from the frozen audited folder. HANDSHAKE OK.
   WP-2 and WP-3 remain queued behind it.
+- **2026-08-08 ~12:11–12:18 PDT — WP-1, WP-2, WP-3 landed and gated.** All three by fresh codex
+  workers, each verified by `c30eb66f` against disk rather than testimony.
+  - `WP-1` (`e04531c9`) — `plan.md` corrected: retired plan-read instructions replaced with the
+    eight-step read order, A8 rewritten as durable lifecycle/handoff, §3.5 clean-run + `N/O`
+    scoring added, §7 gained the CoI and seal/unseal records, §2.2 gained the Amendment 4
+    interview protocol, case study named. 201 insertions / 58 deletions, `plan.md` only.
+    The worker **corrected three stale citations in the supervisor's brief** (`mcp-tools-plans.js:100`
+    is the getter; the live PLAN-EVENT assertion moved to `:3657`; the `groupthink-v2.ts:156`
+    claim did not hold as stated) instead of parroting them back.
+  - `WP-2` (`3e39d860`) — calibration set sealed to `supplements/audit-calibration-set.md`,
+    SHA-256 `eb63a67336e0c73852a5c110e1a75de295c82e7d4cef9dbf509b4be047b39f9f`, recorded in the
+    appendix notice at `plan.md:601`. All seven claims moved verbatim; none survive in `plan.md`.
+  - `WP-3` (`54915b58`) — `supplements/audit-dispatch-briefs.md` (37909 B): three self-contained
+    briefs, distinct outboxes, packet schema reproduced identically in both collector briefs
+    (verified by diff: only the agent-/surface- label differs).
+  - Protected regions byte-identical across all three packages, verified independently against
+    `HEAD` by the supervisor: Hardening scope `ba4f26a5…`, Hardening outputs `e28abdc4…`,
+    Supervisor amendments `3e172045…`.
+- **Known defect in THIS plan's own artifacts (left unfixed, deliberately).**
+  `supplements/2026-08-07-work-packages.md` says "the six conditions listed for WP-3 in the machine
+  block"; the machine block lists **eight**. `54915b58` satisfied all eight and flagged the
+  mismatch rather than scoping to the prose count. This is a live instance of the exact A2 probe
+  ("any brief scoped from a machine block when the authoritative list was prose") firing against
+  `plan_65e665d7` itself. **Not patched** — a quiet fix by the plan owner would erase evidence the
+  audit should see. Handed to the Surface-Evidence Collector as a seed, with instructions to look
+  for others.
+- **Seal weakness carried to WP-5 (not fixable by sealing).** A2's probe text and calibration
+  claim #3 share the phrase "mutually exclusive instructions". The probe predates this work
+  (`HEAD:217`), so it is not a leak, but a rubric written by someone who already knew the findings
+  can encode hints in its probes. The report must state that the independent pass was
+  hint-resistant, not hint-free.
+- **2026-08-08 ~12:2x PDT — WP-4 dispatched, both collectors concurrent, read-only.**
+  Agent-Evidence `502e219b`, Surface-Evidence `d22f4b7a`, both fresh codex sessions.
+  **Disqualification check recorded:** neither id appears in the audited run's participant set,
+  in `plan_5b3ea7d1`'s history, or in this plan's contributor list; both were created 2026-08-08
+  solely for collection. Each was told to self-report any involvement it discovers.
+  Each was given an HTTP `GET`-only fallback (`127.0.0.1:24678/api/...`) in case the dashboard MCP
+  read tools are absent from the codex worker toolset, and told to disclose which mechanism it used.
+- **Independence limits to disclose in the WP-5 report (supervisor's own account).**
+  (1) Collectors cannot message agents, so participant-interview questions must relay through
+  `c30eb66f` — the disqualified owner sits between auditor and audited agent.
+  (2) `c30eb66f` authored the rubric corrections' brief, all three dispatch briefs, and one
+  finding (the cumulative "Files touched" false positive) before any auditor saw the evidence.
+  Both collectors were explicitly told to re-derive that finding and to contradict it if they
+  disagree, and to treat steering in their briefs as itself a finding. Disclosure, not a cure.
+- **Owner steer received 2026-08-08 (workspace owner, verbatim intent):** the final deliverable
+  must be **plain-language and actionable** — a reader who was not present should understand what
+  happened and what to change. This is an addition to the WP-5 report shape, not a replacement:
+  the ten required sections stand, with an executive layer above them and prioritized,
+  concrete recommendations for improving the planning surface.
+
+- **2026-08-08 ~12:34 PDT — WP-4 pass 2 dispatched and gated.** The two concurrent collectors
+  both overran their 40K ceilings and returned population/register evidence that was thin on
+  agent BEHAVIOR, so `81d4b78d` (fresh codex) was dispatched for a second, narrower pass:
+  15 child launch briefs + finals, and the three supervisor renewal boundaries (gen 0→1→2→3)
+  from the staged transcripts. **Gated PASS against the file, not the summary** — jsonl line
+  numbers + millisecond timestamps on every row (E17–E25), hash-verified custody. It disclosed
+  its own custody conflict unprompted (CA09) and reported an 8K round-1 overrun rather than
+  hiding it. All three collectors reaped after gating.
+
+- **2026-08-08 ~12:45–13:10 PDT — WP-5 lead auditor `4416a2cd` dispatched, ran, and DELIVERED.**
+  Fresh codex session, read-only, briefed off Brief 3 by file path.
+  **Disqualification check recorded:** absent from the 16-agent/19-session audited population,
+  from orchestration membership, from source authorship, from plan responsibility, and from the
+  implementation commit chain. Eligible/fresh.
+  **Deliverable:** `.lares/research/inbox/planning-surface-audit-report.md` (37,287 bytes).
+  **Score: 42/68 = 61.8%, 0 N/O rows.** Ten formal sections + the owner-requested plain-language
+  executive layer and 9 impact-ranked recommendations above them.
+  **Seal protocol honored end to end:** calibration unread/unsearched through the complete
+  independent pass; provisional outbox hashed BEFORE unseal
+  (baseline `c43c6a483fb772f231cb6b1c17201c4732d1cfff87ac7da92746bd5d5fdda6d2` at
+  2026-08-08T20:03:46Z); unseal at 20:04:01Z recomputed the seal as
+  `eb63a673…b39f9f`, matching. Every post-unseal change labelled `[post-calibration lead]`.
+  Final report hash `3338c5a79828f864c6eac1d316c357b661f3fcf55feb50142f1ab728f4f9a4d0`.
+  **Calibration result, reported honestly: 1 caught independently, 5 verified only after unseal,
+  1 not verified, 0 wrong — and NO score was retroactively changed.** It also refused to inflate
+  two sealed claims it could not confirm (claim 4 supported 3-of-4 first-hand against the ARC's
+  "four"; the "untracked for days" clause of claim 6 left unresolved).
+  It disclosed the frozen-folder read prohibition as a mandatory coverage shortfall rather than
+  working around it, and recorded that all 15 post-return supervisor gates were never captured.
+  Independent spend ≈78K retrieved-source tokens; it compacted at 99% context mid-run and still
+  landed the file.
+
+- **2026-08-08 ~13:12 PDT — FREEZE LIFTED on `229530a1-04f9-4781-9c8d-a92cae9b7e18` ("new propsoal").**
+  Frozen since ~11:59 PDT so the audited specimen could not move under the auditors; unfrozen
+  immediately after the WP-5 baseline hash existed, as promised. Delivery confirmed (HANDSHAKE OK).
+  **Correction for the record:** the continuation note carried this agent's id as
+  `229530a1-7fda-4bf9-8ae6-b0f9d7bad48c`; only the first segment was right and that id does not
+  resolve ("agent not found"). Recovered by title lookup. An inherited id is an inherited value —
+  it needed re-deriving like any other, and a successor trusting the note verbatim would have
+  silently failed to honor the unfreeze and left an agent idled indefinitely.
+
+- **Audit CLOSED.** WP-1..5 all complete and gated. The instrument (plan.md rubric), the sealed
+  calibration set, the three briefs, five evidence artifacts, and the final report are the durable
+  outputs. Nothing in this plan remains dispatchable.

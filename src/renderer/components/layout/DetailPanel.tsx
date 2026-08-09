@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { ListEnd, Zap, Octagon, Search } from 'lucide-react';
+import { ListEnd, Zap, Hexagon, Search } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useDashboardStore } from '../../stores/dashboard-store';
 import StatusBadge from '../agent/StatusBadge';
@@ -13,6 +13,7 @@ import CollapseButton from './CollapseButton';
 import type { AgentProvider, PathType, ContextStats } from '../../../shared/types';
 import { PROVIDER_META } from '../../../shared/constants';
 import { loadStaging, saveStaging } from '../../lib/prompt-staging';
+import { restartNeedsAttention, stopNeedsAttention } from './agent-control-emphasis';
 
 const TABS = [
   { label: 'Context', icon: '\u{1F4D6}' },
@@ -71,12 +72,24 @@ export default function DetailPanel({ width }: DetailPanelProps) {
   const [showOverflow, setShowOverflow] = useState(false);
   const [stagingOpen, setStagingOpen] = useState(false);
   const [watchGlass, setWatchGlass] = useState(false);
+  const [restartPending, setRestartPending] = useState(false);
+  const [stopPending, setStopPending] = useState(false);
   const overflowRef = useRef<HTMLDivElement>(null);
   const collapsed = panelLayout.detailPanelCollapsed;
 
   const agent = agents.find((a) => a.id === selectedAgentId);
   const workspace = agent ? workspaces.find((w) => w.id === agent.workspaceId) : null;
   const pathType: PathType = workspace?.pathType || 'windows';
+
+  useEffect(() => {
+    setRestartPending(false);
+    setStopPending(false);
+  }, [agent?.id]);
+
+  useEffect(() => {
+    if (agent?.status !== 'done' && agent?.status !== 'crashed') setRestartPending(false);
+    if (agent?.status === 'done' || agent?.status === 'crashed') setStopPending(false);
+  }, [agent?.status]);
 
   // Hydrate the prompt-staging open/closed toggle when the selected agent
   // changes. Slot contents are loaded inside PromptStaging itself.
@@ -177,6 +190,18 @@ export default function DetailPanel({ width }: DetailPanelProps) {
 
   const isAttached = terminalAgentId === agent.id;
   const tabCounts = [contextCount, productsCount, null];
+  const emphasizeRestart = restartNeedsAttention(agent.status, restartPending);
+  const emphasizeStop = stopNeedsAttention(agent.status, stopPending);
+
+  const restartAgent = () => {
+    setRestartPending(true);
+    void window.api.agents.restart(agent.id).catch(() => setRestartPending(false));
+  };
+
+  const stopAgent = () => {
+    setStopPending(true);
+    void window.api.agents.stop(agent.id).catch(() => setStopPending(false));
+  };
 
   return (
     <div
@@ -324,19 +349,23 @@ export default function DetailPanel({ width }: DetailPanelProps) {
           <span className="truncate">Prompt Staging</span>
         </button>
         <button
-          onClick={() => window.api.agents.restart(agent.id)}
-          className="ui-btn ui-btn-ghost min-w-0 flex-1 px-2 py-2 text-[12px] font-bold text-accent-yellow"
+          onClick={restartAgent}
+          className={`ui-btn ui-btn-ghost min-w-0 flex-1 px-2 py-2 text-[12px] font-bold ${
+            emphasizeRestart ? 'text-accent-yellow' : 'text-gray-500'
+          }`}
           title="Restart"
         >
           <Zap size={13} className="shrink-0" />
           <span className="truncate">Restart</span>
         </button>
         <button
-          onClick={() => window.api.agents.stop(agent.id)}
-          className="ui-btn ui-btn-ghost min-w-0 flex-1 px-2 py-2 text-[12px] font-bold text-accent-red"
+          onClick={stopAgent}
+          className={`ui-btn ui-btn-ghost min-w-0 flex-1 px-2 py-2 text-[12px] font-bold ${
+            emphasizeStop ? 'text-accent-red' : 'text-gray-500'
+          }`}
           title="Stop"
         >
-          <Octagon size={13} className="shrink-0" />
+          <Hexagon size={13} className="shrink-0" />
           <span className="truncate">Stop</span>
         </button>
         <button

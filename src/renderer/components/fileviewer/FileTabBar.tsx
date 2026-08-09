@@ -3,7 +3,7 @@ import { BarChart3, Map } from 'lucide-react';
 import type { FileTab } from '../../../shared/types';
 import { fileDragStart } from '../../utils/drag-file';
 import { useDashboardStore, type ColoredFileTab } from '../../stores/dashboard-store';
-import { applyHorizontalWheelScroll } from '../../lib/horizontal-wheel';
+import { installHorizontalWheelScroll } from '../../lib/horizontal-wheel';
 import { positionFloating } from '../../lib/floating/positionFloating';
 import { hasUnsavedWork, requestSave } from './saveCoordinator';
 
@@ -155,6 +155,10 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
   const moveTab = useDashboardStore((state) => state.moveTab);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tab: ColoredFileTab } | null>(null);
   const [draggedTabId, setDraggedTabId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!scrollRef.current) return;
+    return installHorizontalWheelScroll(scrollRef.current);
+  }, []);
   // True when the in-progress drag has already reordered tabs in-strip — used
   // by handleDragEnd to distinguish a reorder (no tear-off) from a drag-out
   // onto empty desktop (detach). Reset at the end of every drag.
@@ -253,7 +257,6 @@ export default function FileTabBar({ tabs, activeTabId, onSelectTab, onCloseTab 
     <div className="flex items-stretch tab-bar shrink-0 overflow-hidden">
       <div
         ref={scrollRef}
-        onWheel={(e) => applyHorizontalWheelScroll(e.currentTarget, e)}
         className="flex items-stretch overflow-x-auto scrollbar-hide flex-1"
       >
         {tabs.map((tab) => {
