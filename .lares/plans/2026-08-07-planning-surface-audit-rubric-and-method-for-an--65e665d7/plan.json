@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_65e665d7",
+  "plan_sku": "2026-08-07-planning-surface-audit-rubric-and-method-for-an--65e665d7",
+  "source_proposal": {
+    "artifact_id": "prop_65e665d7",
+    "rel_path": ".lares/proposals/2026-08-07-planning-surface-audit-rubric.md"
+  },
+  "responsibility_events": [
+    {
+      "event_id": "rev_94a317b8debdc915",
+      "event": "assigned",
+      "agent_id": "c30eb66f-fc78-4c86-8974-bf5f8be12196",
+      "display": "Planning surface Performance Review",
+      "at": 1786128595538,
+      "source": "manual-skill"
+    }
+  ],
+  "created_at": 1786128595538,
+  "updated_at": 1786128595538
+}

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_ce97b9ad",
+  "plan_sku": "2026-08-08-planning-surface-mechanics-remediation-close-the-ce97b9ad",
+  "source_proposal": {
+    "artifact_id": "prop_ce97b9ad",
+    "rel_path": ".lares/proposals/2026-08-08-planning-surface-mechanics-remediation.md"
+  },
+  "responsibility_events": [
+    {
+      "event_id": "rev_cf7982b592c4221b",
+      "event": "assigned",
+      "agent_id": "manual-skill-agent",
+      "display": "manual-skill-agent",
+      "at": 1786235619428,
+      "source": "manual-skill"
+    },
+    {
+      "event_id": "rev_ed4f2585337423c3",
+      "event": "assigned",
+      "agent_id": "3390b90a-a17c-4b16-ad10-9fef5e868196",
+      "display": "Planning supervisor -- Updating the Planning Surface Mechanics",
+      "at": 1786235668559,
+      "source": "manual-skill"
+    }
+  ],
+  "created_at": 1786235619428,
+  "updated_at": 1786235668559
+}

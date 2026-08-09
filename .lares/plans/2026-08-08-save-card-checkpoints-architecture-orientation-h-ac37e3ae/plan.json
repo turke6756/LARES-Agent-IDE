@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_ac37e3ae",
+  "plan_sku": "2026-08-08-save-card-checkpoints-architecture-orientation-h-ac37e3ae",
+  "source_proposal": {
+    "artifact_id": "prop_ac37e3ae",
+    "rel_path": ".lares/proposals/2026-08-08-save-card-checkpoint-architecture-orientation-and-directions.md"
+  },
+  "responsibility_events": [
+    {
+      "event_id": "rev_56f4d30425f90f3d",
+      "event": "assigned",
+      "agent_id": "dc4a15ae-35ae-453d-8cce-dc9e08b66b0b",
+      "display": "Planning supervisor -- Refining Save Card in App Experience",
+      "at": 1786235594028,
+      "source": "manual-skill"
+    }
+  ],
+  "created_at": 1786235594028,
+  "updated_at": 1786235594028
+}

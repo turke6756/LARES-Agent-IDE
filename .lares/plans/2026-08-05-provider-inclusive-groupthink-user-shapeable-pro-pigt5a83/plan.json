@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_pigt5a83",
+  "plan_sku": "2026-08-05-provider-inclusive-groupthink-user-shapeable-pro-pigt5a83",
+  "source_proposal": {
+    "artifact_id": "prop_pigt5a83",
+    "rel_path": ".lares/proposals/2026-08-05-provider-inclusive-groupthink.md"
+  },
+  "responsibility_events": [
+    {
+      "event_id": "rev_0a861a3b5442498c",
+      "event": "assigned",
+      "agent_id": "f56fe814-3702-477f-a492-75e64b4ec141",
+      "display": "Planning supervisor - provider inclusive Groupthink",
+      "at": 1785960830626,
+      "source": "manual-skill"
+    }
+  ],
+  "created_at": 1785960830626,
+  "updated_at": 1785960830626
+}

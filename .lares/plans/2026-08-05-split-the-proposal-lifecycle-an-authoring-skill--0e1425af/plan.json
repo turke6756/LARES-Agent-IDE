@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_0e1425af",
+  "plan_sku": "2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af",
+  "source_proposal": {
+    "artifact_id": "prop_0e1425af",
+    "rel_path": ".lares/proposals/2026-08-05-proposal-lifecycle-split-authoring-vs-promotion.md"
+  },
+  "responsibility_events": [
+    {
+      "event_id": "rev_16c6529d301c94d6",
+      "event": "assigned",
+      "agent_id": "ac1cb0b6-ace3-4c76-bf88-b8bcad37ce89",
+      "display": "Planning supervisor - planning surface split",
+      "at": 1785973391308,
+      "source": "manual-skill"
+    }
+  ],
+  "created_at": 1785973391308,
+  "updated_at": 1785973391308
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_e3a91c4f",
+  "plan_sku": "2026-08-03-test-only-keyboard-shortcut-cheat-sheet-overlay-e3a91c4f",
+  "source_proposal": {
+    "artifact_id": "prop_e3a91c4f",
+    "rel_path": ".lares/proposals/2026-08-03-test-only-keyboard-shortcut-cheat-sheet.md"
+  },
+  "responsibility_events": [
+    {
+      "event_id": "rev_aa882cf124841fd6",
+      "event": "assigned",
+      "agent_id": "ee7110d7-3e00-4c05-bf7c-f170242134aa",
+      "display": "Planning-skill Wave-1 test run",
+      "at": 1785775264829,
+      "source": "manual-skill"
+    }
+  ],
+  "created_at": 1785775264829,
+  "updated_at": 1785775264829
+}

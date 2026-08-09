@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_5b3ea7d1",
+  "plan_sku": "2026-08-06-save-card-streamlining-one-gesture-no-ceremony-5b3ea7d1",
+  "source_proposal": {
+    "artifact_id": "prop_5b3ea7d1",
+    "rel_path": ".lares/proposals/2026-08-06-save-card-streamlining-restamped.md"
+  },
+  "responsibility_events": [
+    {
+      "event_id": "rev_3147cc7dd3d3191a",
+      "event": "assigned",
+      "agent_id": "229530a1-04f9-4781-9c8d-a92cae9b7e18",
+      "display": "new propsoal (supervisor, claude)",
+      "at": 1786054827253,
+      "source": "manual-skill"
+    }
+  ],
+  "created_at": 1786054827253,
+  "updated_at": 1786054827253
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plan_artifact_id": "plan_e0001372",
+  "plan_sku": "2026-08-05-bridge-the-proposal-to-plan-skill-and-the-planni-e0001372",
+  "source_proposal": {
+    "artifact_id": "prop_e0001372",
+    "rel_path": ".lares/proposals/2026-08-05-planning-surface-skill-bridge.md"
+  },
+  "responsibility_events": [
+    {
+      "event_id": "rev_f75aa1bdb6b41448",
+      "event": "assigned",
+      "agent_id": "ae889b24-df67-4b77-904b-2ee8db0b00cb",
+      "display": "Planning supervisor - planning surface fix",
+      "at": 1785973516724,
+      "source": "manual-skill"
+    }
+  ],
+  "created_at": 1785973516724,
+  "updated_at": 1785973516724
+}
