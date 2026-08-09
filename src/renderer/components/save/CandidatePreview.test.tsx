@@ -284,6 +284,34 @@ describe('CandidatePreview', () => {
     expect(save().disabled).toBe(false);
   });
 
+  it('labels unattributed acknowledgements with paths and acknowledges a backlog in one gesture', async () => {
+    const entries = Array.from({ length: 100 }, (_, index) => member(`u${index}`, 'verified-match'));
+    const atoms: ReviewChallengeAtom[] = entries.map((item, index) => ({
+      kind: 'unattributed', atomId: `unattributed-${index}`, digest: `digest-${index}`,
+      pathBytesBase64: item.path.pathBytesBase64, memberEffectDigest: `effect-${index}`,
+    }));
+    preview.mockResolvedValue(response({
+      candidate: candidate({ eligible: true }, entries),
+      unacknowledgedUnattributedEntryIds: entries.map((item) => item.entryId),
+      reviewedManifest: { ...response().reviewedManifest!, challengeAtoms: atoms },
+    }));
+    await render();
+
+    const rows = container.querySelectorAll('[data-testid="candidate-preview-unattributed-ack"]');
+    expect(rows).toHaveLength(100);
+    expect(rows[0].textContent).toContain('src/u0.ts');
+    expect(rows[0].textContent).not.toContain('u0 —');
+
+    const acknowledgeAll = q('candidate-preview-unattributed-ack-all')!.querySelector('input') as HTMLInputElement;
+    await act(async () => { acknowledgeAll.click(); });
+    expect(acknowledgeAll.checked).toBe(true);
+    expect(Array.from(rows).every((row) => (row.querySelector('input') as HTMLInputElement).checked)).toBe(true);
+
+    await act(async () => { (rows[0].querySelector('input') as HTMLInputElement).click(); });
+    expect((rows[0].querySelector('input') as HTMLInputElement).checked).toBe(false);
+    expect((rows[1].querySelector('input') as HTMLInputElement).checked).toBe(true);
+  });
+
   it('retains only acknowledgements whose atom id and digest are unchanged', async () => {
     const overlapAtom: ReviewChallengeAtom = {
       kind: 'overlap', atomId: 'overlap-1', digest: 'overlap-digest', reasonVersion: 1,

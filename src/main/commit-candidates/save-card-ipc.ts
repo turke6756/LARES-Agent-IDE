@@ -578,6 +578,7 @@ const DEFAULT_MESSAGE_MAX_LENGTH = 72;
 function sanitizeMessageMetadata(value: string): string {
   return value
     .normalize('NFKC')
+    .replace(/\u2026/g, '...')
     .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -592,7 +593,37 @@ function uniqueSorted(values: readonly string[]): string[] {
 function boundMessageLength(message: string): string {
   const characters = Array.from(message);
   if (characters.length <= DEFAULT_MESSAGE_MAX_LENGTH) return message;
-  return `${characters.slice(0, DEFAULT_MESSAGE_MAX_LENGTH - 1).join('').trimEnd()}…`;
+  return `${characters.slice(0, DEFAULT_MESSAGE_MAX_LENGTH - 3).join('').trimEnd()}...`;
+}
+
+function isOpaquePackageId(packageId: string): boolean {
+  return packageId.startsWith('component:')
+    || packageId.startsWith('unattributed:')
+    || /[0-9a-f]{40,64}/i.test(packageId);
+}
+
+function commonDisplayDirectory(paths: readonly string[]): string | null {
+  if (paths.length === 0) return null;
+  const directories = paths.map((path) => {
+    const normalized = path.replace(/\\/g, '/');
+    const separator = normalized.lastIndexOf('/');
+    return separator < 0 ? [] : normalized.slice(0, separator).split('/').filter(Boolean);
+  });
+  const common = [...directories[0]];
+  for (const directory of directories.slice(1)) {
+    while (common.length > 0
+      && common.some((segment, index) => directory[index] !== segment)) {
+      common.pop();
+    }
+  }
+  return common.length > 0 ? common.join('/') : null;
+}
+
+function fileSummary(candidate: CommitCandidate | SelectionPreview): string {
+  const memberCount = candidate.members.length;
+  const commonDirectory = commonDisplayDirectory(candidate.members.map((member) => member.path.displayPath));
+  const directory = commonDirectory ? sanitizeMessageMetadata(commonDirectory) : null;
+  return `Save: ${memberCount} file${memberCount === 1 ? '' : 's'}${directory ? ` in ${directory}` : ''}`;
 }
 
 /** Derive a stable commit subject from the immutable package/turn snapshot.
@@ -612,10 +643,21 @@ export function deriveDefaultMessageBody(
     requestedFinalizationIds.has(finalization.id),
   );
 
+  const taskIds = uniqueSorted([
+    ...selectedComponents.flatMap((component) =>
+      component.associations.flatMap((association) => association.planItemId ? [association.planItemId] : []),
+    ),
+    ...requestedFinalizations.flatMap((finalization) =>
+      finalization.planItemId ? [finalization.planItemId] : [],
+    ),
+  ].map(sanitizeMessageMetadata).filter(Boolean));
   const packageIds = uniqueSorted([
     ...requestedFinalizations.map((finalization) => finalization.packageId),
     ...(isCommitCandidate(candidate) ? candidate.finalizations.map((ref) => ref.packageId) : []),
-  ].map(sanitizeMessageMetadata).filter(Boolean));
+  ].map(sanitizeMessageMetadata).filter((packageId) => packageId && !isOpaquePackageId(packageId)));
+  const planIds = uniqueSorted(selectedComponents.flatMap((component) =>
+    component.associations.flatMap((association) => association.planId ? [association.planId] : []),
+  ).map(sanitizeMessageMetadata).filter(Boolean));
   const turnIds = uniqueSorted([
     ...selectedComponents.flatMap((component) =>
       component.associations.flatMap((association) => association.contributingTurnIds),
@@ -626,15 +668,22 @@ export function deriveDefaultMessageBody(
   ]);
 
   let message: string;
-  if (packageIds.length === 1) {
+  if (taskIds.length === 1) {
+    message = `Save ${taskIds[0]}`;
+  } else if (taskIds.length > 1) {
+    message = `Save tasks ${taskIds.join(', ')}`;
+  } else if (packageIds.length === 1) {
     message = `Save ${packageIds[0]}`;
   } else if (packageIds.length > 1) {
     message = `Save packages ${packageIds.join(', ')}`;
+  } else if (planIds.length === 1) {
+    message = `Save ${planIds[0]}`;
+  } else if (planIds.length > 1) {
+    message = `Save plans ${planIds.join(', ')}`;
   } else if (turnIds.length > 0) {
     message = `Save work from ${turnIds.length} turn${turnIds.length === 1 ? '' : 's'}`;
   } else {
-    const memberCount = candidate.members.length;
-    message = `Save ${memberCount} file${memberCount === 1 ? '' : 's'}`;
+    message = fileSummary(candidate);
   }
   if (packageIds.length > 0 && turnIds.length > 0) {
     message += ` (${turnIds.length} turn${turnIds.length === 1 ? '' : 's'})`;

@@ -221,7 +221,7 @@ test('unfinalized selection yields a previewable, never-committable SelectionPre
   });
   // Server-derived read-only trailers from the immutable snapshot: turns + plan.
   assert.deepEqual(response.laresTrailers, ['Lares-Turns: 2', 'Lares-Plan: plan-A']);
-  assert.equal(response.defaultMessageBody, 'Save work from 2 turns');
+  assert.equal(response.defaultMessageBody, 'Save plan-A');
 });
 
 test('finalization-backed, verified selection yields an eligible CommitCandidate + finalization trailer', async () => {
@@ -270,13 +270,13 @@ test('default message falls back deterministically when package and turn metadat
 
   const first = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, request) as SaveCardPreviewResponse;
   const second = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, request) as SaveCardPreviewResponse;
-  assert.equal(first.defaultMessageBody, 'Save 1 file');
+  assert.equal(first.defaultMessageBody, 'Save: 1 file in src');
   assert.equal(second.defaultMessageBody, first.defaultMessageBody);
 });
 
 test('default message sanitizes metadata, is length-bounded, and is deterministic', async () => {
   const ipc = new FakeIpc();
-  const unsafePackageId = `WP-10\nInjected\u0000${'x'.repeat(100)}`;
+  const unsafePackageId = `WP-10\u2026\nInjected\u0000${'x'.repeat(100)}`;
   const context = baseContext({
     finalizations: [finalization({ packageId: unsafePackageId })],
     currentCommitReps: new Map<string, CommitRepresentation>([
@@ -295,9 +295,38 @@ test('default message sanitizes metadata, is length-bounded, and is deterministi
   const second = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, request) as SaveCardPreviewResponse;
   assert.equal(first.defaultMessageBody, second.defaultMessageBody);
   assert.equal(Array.from(first.defaultMessageBody).length, 72);
-  assert.match(first.defaultMessageBody, /^Save WP-10 Injected x+/);
-  assert.ok(first.defaultMessageBody.endsWith('…'));
+  assert.match(first.defaultMessageBody, /^Save WP-10\.\.\. Injected x+/);
+  assert.ok(first.defaultMessageBody.endsWith('...'));
+  assert.doesNotMatch(first.defaultMessageBody, /\u2026/);
   assert.doesNotMatch(first.defaultMessageBody, /[\u0000-\u001f\u007f-\u009f]/);
+});
+
+test('default message prefers plan-item context and keeps opaque component ids out of the subject', async () => {
+  const ipc = new FakeIpc();
+  const componentHash = 'a'.repeat(64);
+  const context = baseContext({
+    components: [component(componentHash, ['e1'], {
+      associations: [{
+        planId: 'plan-A', planItemId: 'WP-U1', contributingTurnIds: ['t1'], memberEntryIds: ['e1'],
+      }],
+    })],
+    finalizations: [finalization({
+      packageId: `component:${componentHash}`, planId: 'plan-A', planItemId: 'WP-U1',
+    })],
+    currentCommitReps: new Map<string, CommitRepresentation>([
+      ['e1', { expectedState: 'present', rawBlobOid: 'raw-e1', commitBlobOid: 'commit-e1', commitMode: '100644' }],
+    ]),
+  });
+  registerSaveCardPreviewIpc(ipc, () => routesFor(context));
+
+  const result = await ipc.invoke(SAVECARD_PREVIEW_CHANNEL, {
+    workspaceId: 'ws-1', selectedComponentIds: [componentHash],
+    selectedUnattributedEntryIds: [], finalizationIds: ['fin-1'],
+  }) as SaveCardPreviewResponse;
+
+  assert.equal(result.defaultMessageBody, 'Save WP-U1');
+  assert.doesNotMatch(result.defaultMessageBody, /component:|a{40}/);
+  assert.ok(result.laresTrailers.includes(`Lares-Finalization: component:${componentHash}@3`));
 });
 
 test('overlap component + selected unattributed entry surface the acknowledgement gates', async () => {

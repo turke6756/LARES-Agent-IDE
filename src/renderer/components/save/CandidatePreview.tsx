@@ -326,6 +326,17 @@ export default function CandidatePreview({
     setAtomsAcknowledged([atom], !isAcknowledged(acknowledgedAtoms, atom));
   };
 
+  const unattributedRows = response.unacknowledgedUnattributedEntryIds.map((entryId) => ({
+    entryId,
+    atom: unattributedAtomForEntry(response, entryId),
+    displayPath: candidate.members.find((member) => member.entryId === entryId)?.path.displayPath ?? '[unknown path]',
+  }));
+  const unattributedAtoms = unattributedRows
+    .map(({ atom }) => atom)
+    .filter((atom): atom is ReviewChallengeAtom => atom !== undefined);
+  const allUnattributedAcknowledged = unattributedRows.length > 0
+    && unattributedRows.every(({ atom }) => isAcknowledged(acknowledgedAtoms, atom));
+
   return (
     <div className="sc-preview" data-testid="candidate-preview" data-eligible={String(eligible)}>
       {title && <h3 className="sc-preview-title">{title}</h3>}
@@ -382,8 +393,18 @@ export default function CandidatePreview({
           <span>This package fuses work from multiple agents or plans — I acknowledge the overlap.</span>
         </label>
       )}
-      {response.unacknowledgedUnattributedEntryIds.map((entryId) => {
-        const atom = unattributedAtomForEntry(response, entryId);
+      {unattributedRows.length > 1 && (
+        <label className="sc-preview-ack" data-testid="candidate-preview-unattributed-ack-all">
+          <input
+            type="checkbox"
+            checked={allUnattributedAcknowledged}
+            disabled={unattributedAtoms.length !== unattributedRows.length}
+            onChange={(event) => setAtomsAcknowledged(unattributedAtoms, event.target.checked)}
+          />
+          <span>Acknowledge all {unattributedRows.length} unattributed changes.</span>
+        </label>
+      )}
+      {unattributedRows.map(({ entryId, atom, displayPath }) => {
         return (
         <label
           key={entryId}
@@ -397,7 +418,7 @@ export default function CandidatePreview({
             disabled={!atom}
             onChange={() => toggleUnattributed(entryId)}
           />
-          <span>Include unattributed change {entryId} — I acknowledge no agent was seen touching it.</span>
+          <span>Include unattributed change {displayPath} — I acknowledge no agent was seen touching it.</span>
         </label>
         );
       })}
