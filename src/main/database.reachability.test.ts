@@ -156,7 +156,8 @@ test('assignment, execution transition, and dispatch refuse quarantined v1 packa
   apply(ctx, [legacy]);
   assert.throws(() => dbm.assignPlanWorkPackage(legacy.id, 'agent-any', 2), /legacy-unmigrated/);
   assert.throws(() => dbm.transitionPlanWorkPackageState({ eventId: `event-${seq}`,
-    packageId: legacy.id, toState: 'executing', actor: 'test', ts: 2 }), /legacy-unmigrated/);
+    packageId: legacy.id, toState: 'executing', actor: 'test', ts: 2 }),
+  /package lacks portable plan\/intent identity/);
   assert.throws(() => dbm.insertPlanDispatchAttempt({ id: `dispatch-${seq}`,
     packageId: legacy.id, planId: ctx.planId, executionRunId: `run-${seq}`,
     targetAgentId: null, requestedPlanItemId: legacy.id, createdAt: 3 }), /legacy-unmigrated/);

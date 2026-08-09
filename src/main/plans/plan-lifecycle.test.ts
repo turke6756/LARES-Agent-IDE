@@ -35,6 +35,7 @@ let sqlJsCtor: new () => SqlJsDatabase;
 class FakeBetterSqlite {
   private static stores = new Map<string, SqlJsDatabase>();
   private db: SqlJsDatabase;
+  private transactionSerial = 0;
 
   constructor(dbPath = ':memory:') {
     let store = FakeBetterSqlite.stores.get(dbPath);
@@ -74,13 +75,15 @@ class FakeBetterSqlite {
   }
   transaction<A extends unknown[]>(fn: (...args: A) => unknown) {
     return (...args: A) => {
-      this.db.exec('BEGIN');
+      const savepoint = `fake_transaction_${++this.transactionSerial}`;
+      this.db.exec(`SAVEPOINT ${savepoint}`);
       try {
         const result = fn(...args);
-        this.db.exec('COMMIT');
+        this.db.exec(`RELEASE ${savepoint}`);
         return result;
       } catch (err) {
-        this.db.exec('ROLLBACK');
+        this.db.exec(`ROLLBACK TO ${savepoint}`);
+        this.db.exec(`RELEASE ${savepoint}`);
         throw err;
       }
     };
@@ -90,7 +93,9 @@ class FakeBetterSqlite {
 type PlanWorkPackage = {
   id: string; workspaceId: string; planId: string; title: string;
   acceptanceCondition: string | null; state: string; assigneeAgentId: string | null;
-  revision: number; createdAt: number; updatedAt: number;
+  revision: number; createdAt: number; updatedAt: number; intentId?: string | null;
+  schemaVersion?: number | null; contentHash?: string | null;
+  projectionStatus?: 'synced' | 'legacy-unmigrated' | null;
 };
 type LifecycleEvent = {
   id: string; packageId: string; planId: string; fromState: string;
@@ -137,7 +142,8 @@ function makePackage(over: Partial<PlanWorkPackage> = {}): PlanWorkPackage {
   return {
     id: `wp-${seq}`, workspaceId: 'ws-1', planId: 'plan-1', title: 'WP',
     acceptanceCondition: null, state: 'ready', assigneeAgentId: null,
-    revision: 1, createdAt: 1000, updatedAt: 1000, ...over,
+    revision: 1, createdAt: 1000, updatedAt: 1000, intentId: 'int_00000001',
+    schemaVersion: 2, contentHash: `hash-${seq}`, projectionStatus: 'synced', ...over,
   };
 }
 
@@ -147,18 +153,14 @@ function setResponsibleSupervisor(planId: string, agentId: string | null): void 
 
 // ── DB primitive: transition + ledger ─────────────────────────────────────────
 
-test('a transition updates state and ledgers from/to/actor/ts atomically', () => {
+test('direct ready to executing is refused because dispatch confirmation owns that ledger edge', () => {
   const pkg = makePackage({ state: 'ready' });
   dbm.upsertPlanWorkPackage(pkg);
-  const ev = dbm.transitionPlanWorkPackageState({
+  assert.throws(() => dbm.transitionPlanWorkPackageState({
     eventId: 'ev-1', packageId: pkg.id, toState: 'executing', actor: 'agent-x', reason: 'go', ts: 2000,
-  });
-  assert.equal(dbm.getPlanWorkPackage(pkg.id)?.state, 'executing');
-  assert.deepEqual(
-    { from: ev.fromState, to: ev.toState, actor: ev.actor, reason: ev.reason, ts: ev.ts },
-    { from: 'ready', to: 'executing', actor: 'agent-x', reason: 'go', ts: 2000 },
-  );
-  assert.deepEqual(dbm.listPlanWpLifecycleEvents(pkg.id).map((e) => e.toState), ['executing']);
+  }), /witnessed package-ledger command/);
+  assert.equal(dbm.getPlanWorkPackage(pkg.id)?.state, 'ready');
+  assert.deepEqual(dbm.listPlanWpLifecycleEvents(pkg.id), []);
 });
 
 test('a `done` target is rejected — no state change, no ledger row', () => {
@@ -323,6 +325,20 @@ test('Mark Ready uses compare-and-set and refuses a raced hardening state', asyn
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   dbm = require('../database') as DbModule;
   dbm.initDatabase();
+  dbm.getDb().prepare(
+    `INSERT INTO workspaces (id, title, path, path_type) VALUES ('ws-1', 'fixture', 'C:/fixture', 'windows')`,
+  ).run();
+  dbm.getDb().prepare(
+    `INSERT INTO plans (id, workspace_id, path, format, mtime_ms, size_bytes, artifact_id)
+     VALUES ('plan-1', 'ws-1', '.lares/plans/fixture', 'structured', 0, 0, 'plan_00000001')`,
+  ).run();
+  dbm.getDb().prepare(
+    `INSERT INTO plan_intents
+       (id, workspace_id, plan_id, plan_artifact_id, intent_id, kind,
+        source_doc_rel_path, status, first_seen_at, updated_at, last_scanned_at)
+     VALUES ('intent-row-fixture', 'ws-1', 'plan-1', 'plan_00000001', 'int_00000001',
+             'research', 'plan.md', 'active', 1, 1, 1)`,
+  ).run();
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   svc = require('./plan-lifecycle') as ServiceModule;
 

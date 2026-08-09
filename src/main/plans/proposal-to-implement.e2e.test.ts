@@ -77,16 +77,18 @@ function packageDocument(artifactId: string): string {
       id: 'WP-A', order: 10, title: 'Ready leaf', initial_state: 'ready',
       acceptance_conditions: ['Ready work is actionable.'],
       paths: [{ path: 'src/ready.ts', intent_kind: 'edit' }], depends_on: [],
+      reachability: { kind: 'none', rationale: 'Fixture package has no independently reachable behavior.' },
     },
     {
       id: 'WP-B', order: 20, title: 'Blocked leaf', initial_state: 'blocked',
       acceptance_conditions: ['Blocked work stays blocked.'],
       paths: [{ path: 'src/blocked.ts', intent_kind: 'edit' }], depends_on: ['WP-A'],
+      reachability: { kind: 'none', rationale: 'Fixture package has no independently reachable behavior.' },
     },
   ];
   return `---\nplan_artifact_id: ${artifactId}\nkind: work-packages\n---\n\n`
-    + `<!--PLAN-WORK-PACKAGES:v1\n${JSON.stringify({
-      schema_version: 1, plan_artifact_id: artifactId, packages,
+    + `<!--PLAN-WORK-PACKAGES:v2\n${JSON.stringify({
+      schema_version: 2, plan_artifact_id: artifactId, packages,
     }, null, 2)}\n-->\n\n`
     + '## WP-A - Ready leaf\n\n**Accept**\n- Ready work is actionable.\n\n'
     + '## WP-B - Blocked leaf\n\n**Accept**\n- Blocked work stays blocked.\n';
@@ -413,10 +415,11 @@ test('post-split promotion fixture reaches exactly one Implement run through rea
   assert.deepEqual(db.listPlanWorkPackagesOrdered(planId).map((pkg) => pkg.revision), beforeRevision,
     'repeated refresh and boot reconciliation are semantically idempotent');
 
+  const beforeMark = await readiness();
   const marked = await markPlanReady({ planId, actor: 'human-fixture' }, {
     refreshAndGetReadiness: readiness,
   });
-  assert.equal(marked.ok, true);
+  assert.equal(marked.ok, true, JSON.stringify({ marked, beforeMark }));
   assert.equal(db.getPlan(planId)?.runState, 'ready');
 
   const implemented = await implementPlan({ planId, appUserId: 'workspace-owner' }, {
@@ -426,7 +429,7 @@ test('post-split promotion fixture reaches exactly one Implement run through rea
     newRunId: () => 'run-wp-z-fixture',
     now: () => 1_775_649_700_000,
   });
-  assert.equal(implemented.ok, true);
+  assert.equal(implemented.ok, true, JSON.stringify(implemented));
   assert.equal(db.getPlan(planId)?.runState, 'executing');
   assert.equal(db.getActivePlanExecutionRun(planId)?.id, 'run-wp-z-fixture');
   const second = await implementPlan({ planId, appUserId: 'workspace-owner' }, {

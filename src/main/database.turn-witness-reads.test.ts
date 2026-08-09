@@ -122,6 +122,7 @@ test('projects identity + owner attribution; ascending by turn_seq', () => {
   assert.deepEqual(reads[0], {
     turnId: a.id,
     agentId: 'agent-1',
+    intentId: null,
     ownerAgentId: 'sup-1',
     ownerBrickGeneration: 7,
     touched: [{ path: 'src/a.ts', op: 'write' }],
@@ -166,14 +167,14 @@ test('workspace-scoped: another workspace never leaks', () => {
   assert.equal(dbm.getTurnWitnessReads(ws1)[0].agentId, 'a1');
 });
 
-test('never exposes a planId field (no agents.plan_id read)', () => {
+test('never exposes a planId field, while carrying the immutable turn intent stamp', () => {
   const ws = freshWorkspace();
   dbm.allocateAndInsertTurn(ws, { agentId: 'a' });
   const [read] = dbm.getTurnWitnessReads(ws);
   assert.deepEqual(
     Object.keys(read).sort(),
-    ['agentId', 'ownerAgentId', 'ownerBrickGeneration', 'touched', 'turnId'],
-    'projection carries no plan attribution',
+    ['agentId', 'intentId', 'ownerAgentId', 'ownerBrickGeneration', 'touched', 'turnId'],
+    'projection carries the turn intent but no mutable agent plan attribution',
   );
 });
 

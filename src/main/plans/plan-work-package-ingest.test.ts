@@ -25,6 +25,7 @@ let sqlJsCtor: new () => SqlJsDatabase;
 class FakeBetterSqlite {
   private static stores = new Map<string, SqlJsDatabase>();
   private db: SqlJsDatabase;
+  private transactionSerial = 0;
   constructor(dbPath = ':memory:') {
     let store = FakeBetterSqlite.stores.get(dbPath);
     if (!store) { store = new sqlJsCtor(); FakeBetterSqlite.stores.set(dbPath, store); }
@@ -53,9 +54,12 @@ class FakeBetterSqlite {
   }
   transaction<A extends unknown[]>(fn: (...args: A) => unknown) {
     return (...args: A) => {
-      this.db.exec('BEGIN');
-      try { const result = fn(...args); this.db.exec('COMMIT'); return result; }
-      catch (err) { this.db.exec('ROLLBACK'); throw err; }
+      const savepoint = `fake_transaction_${++this.transactionSerial}`;
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+      try { const result = fn(...args); this.db.exec(`RELEASE ${savepoint}`); return result; }
+      catch (err) {
+        this.db.exec(`ROLLBACK TO ${savepoint}`); this.db.exec(`RELEASE ${savepoint}`); throw err;
+      }
     };
   }
 }
@@ -427,9 +431,32 @@ test('missing and malformed replacements preserve rows; valid omission tombstone
   assert.equal(dbm.listManagedPlanWorkPackages(ctx.plan.id).filter((row) => row.source.present).length, 2);
   const durableDiagnostics = JSON.parse(dbm.getPlanFolderProjectionState(ctx.plan.id)!.wpDiagnosticsJson) as Array<{ code: string }>;
   assert.equal(durableDiagnostics[0].code, 'identity-mismatch');
-  writePackages(ctx, [a]);
-  assert.equal(reconcile(ctx).workPackages.status, 'synced');
-  const rows = dbm.listManagedPlanWorkPackages(ctx.plan.id);
+  const omission = context(); writeManifest(omission);
+  const omissionA = spec();
+  const omissionB = spec({ id: 'WP-B', order: 20, title: 'Package B', depends_on: ['WP-A'] });
+  writePackages(omission, [omissionA, omissionB]);
+  const seededOmission = reconcile(omission).workPackages;
+  assert.equal(seededOmission.status, 'synced', JSON.stringify(seededOmission));
+  const omissionIntentId = `int_${seq.toString(16).padStart(8, '0')}`;
+  dbm.getDb().prepare('UPDATE plans SET artifact_id = ? WHERE id = ?')
+    .run(omission.artifactId, omission.plan.id);
+  dbm.getDb().prepare(
+    `INSERT INTO plan_intents
+       (id, workspace_id, plan_id, plan_artifact_id, intent_id, kind,
+        source_doc_rel_path, status, first_seen_at, updated_at, last_scanned_at)
+     VALUES (?, ?, ?, ?, ?, 'research', 'plan.md', 'active', 1, 1, 1)`,
+  ).run(`intent-row-omission-${seq}`, omission.workspace.id, omission.plan.id,
+    omission.artifactId, omissionIntentId);
+  dbm.getDb().prepare('UPDATE plan_work_packages SET intent_id = ? WHERE plan_id = ?')
+    .run(omissionIntentId, omission.plan.id);
+  assert.ok(dbm.listManagedPlanWorkPackages(omission.plan.id)
+    .every((row) => row.package.intentId === omissionIntentId));
+  assert.equal((dbm.getDb().prepare('SELECT artifact_id FROM plans WHERE id = ?')
+    .get(omission.plan.id) as { artifact_id: string | null }).artifact_id, omission.artifactId);
+  writePackages(omission, [omissionA]);
+  const appliedOmission = reconcile(omission).workPackages;
+  assert.equal(appliedOmission.status, 'synced', JSON.stringify(appliedOmission));
+  const rows = dbm.listManagedPlanWorkPackages(omission.plan.id);
   assert.equal(rows.find((row) => row.source.sourceLocalId === 'WP-A')?.source.present, true);
   assert.equal(rows.find((row) => row.source.sourceLocalId === 'WP-B')?.source.present, false);
 });

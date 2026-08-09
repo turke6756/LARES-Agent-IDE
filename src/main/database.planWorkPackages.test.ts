@@ -124,7 +124,7 @@ test('CRUD round-trips a package and lists it under its plan', () => {
   assert.deepEqual(dbm.listPlanWorkPackages('plan-none'), []);
 });
 
-test('upsert updates mutable fields in place and never duplicates the row', () => {
+test('upsert updates metadata in place, never mutates ledger-owned state, and never duplicates the row', () => {
   const pkg = makePackage({ id: 'wp-upsert', planId: 'plan-upsert' });
   dbm.upsertPlanWorkPackage(pkg);
   dbm.upsertPlanWorkPackage({
@@ -134,7 +134,7 @@ test('upsert updates mutable fields in place and never duplicates the row', () =
   const after = dbm.getPlanWorkPackage('wp-upsert');
   assert.deepEqual(
     { title: after?.title, state: after?.state, assigneeAgentId: after?.assigneeAgentId, revision: after?.revision },
-    { title: 'renamed', state: 'executing', assigneeAgentId: 'agent-x', revision: 2 },
+    { title: 'renamed', state: 'ready', assigneeAgentId: 'agent-x', revision: 2 },
   );
   assert.equal(dbm.listPlanWorkPackages('plan-upsert').length, 1);
 });

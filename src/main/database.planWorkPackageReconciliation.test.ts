@@ -25,6 +25,7 @@ let sqlJsCtor: new () => SqlJsDatabase;
 class FakeBetterSqlite {
   private static stores = new Map<string, SqlJsDatabase>();
   private db: SqlJsDatabase;
+  private transactionSerial = 0;
   constructor(dbPath = ':memory:') {
     let store = FakeBetterSqlite.stores.get(dbPath);
     if (!store) { store = new sqlJsCtor(); FakeBetterSqlite.stores.set(dbPath, store); }
@@ -53,9 +54,14 @@ class FakeBetterSqlite {
   }
   transaction<A extends unknown[]>(fn: (...args: A) => unknown) {
     return (...args: A) => {
-      this.db.exec('BEGIN');
-      try { const result = fn(...args); this.db.exec('COMMIT'); return result; }
-      catch (err) { this.db.exec('ROLLBACK'); throw err; }
+      const savepoint = `fake_transaction_${++this.transactionSerial}`;
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+      try { const result = fn(...args); this.db.exec(`RELEASE ${savepoint}`); return result; }
+      catch (err) {
+        this.db.exec(`ROLLBACK TO ${savepoint}`);
+        this.db.exec(`RELEASE ${savepoint}`);
+        throw err;
+      }
     };
   }
 }
@@ -78,7 +84,16 @@ function context(runState = 'hardening') {
   });
   const plan = dbm.createOrRevivePlan({ workspaceId: workspace.id,
     path: `.lares/plans/plan-${seq}`, format: 'structured', runState });
-  return { workspaceId: workspace.id, planId: plan.id };
+  const artifactId = `plan_${seq.toString(16).padStart(8, '0')}`;
+  const intentId = `int_${seq.toString(16).padStart(8, '0')}`;
+  dbm.getDb().prepare('UPDATE plans SET artifact_id = ? WHERE id = ?').run(artifactId, plan.id);
+  dbm.getDb().prepare(
+    `INSERT INTO plan_intents
+       (id, workspace_id, plan_id, plan_artifact_id, intent_id, kind,
+        source_doc_rel_path, status, first_seen_at, updated_at, last_scanned_at)
+     VALUES (?, ?, ?, ?, ?, 'research', 'plan.md', 'active', 1, 1, 1)`,
+  ).run(`intent-row-${seq}`, workspace.id, plan.id, artifactId, intentId);
+  return { workspaceId: workspace.id, planId: plan.id, intentId };
 }
 
 function pkg(over: Partial<PackageInput> = {}): PackageInput {
@@ -93,6 +108,13 @@ function apply(ctx: ReturnType<typeof context>, packages: PackageInput[], over: 
   return dbm.applyPlanWorkPackageSnapshot({ workspaceId: ctx.workspaceId, planId: ctx.planId,
     sourceRelPath: 'supplements/work-packages.md', projectionHash: 'projection-1',
     packages, reconciledAt: 1000 + seq, ...over });
+}
+
+function bindPackages(ctx: ReturnType<typeof context>, ...packageIds: string[]): void {
+  for (const packageId of packageIds) {
+    dbm.getDb().prepare('UPDATE plan_work_packages SET intent_id = ? WHERE id = ?')
+      .run(ctx.intentId, packageId);
+  }
 }
 
 function rawRows(sql: string, params: unknown[] = []): unknown[] {
@@ -167,23 +189,24 @@ test('order-only drift updates layout and provenance without incrementing revisi
   assert.deepEqual(dbm.listPlanWorkPackagesOrdered(ctx.planId).map((entry) => entry.id), [b.id, a.id]);
 });
 
-test('semantic state change uses the disk lifecycle ledger and increments revision once', () => {
+test('disk reconciliation cannot bypass the witnessed ledger for a semantic state change', () => {
   const ctx = context();
   const a = pkg();
   apply(ctx, [a]);
-  apply(ctx, [{ ...a, title: 'Package A revised', declaredState: 'blocked',
-    contentHash: 'hash-a-v2' }], { projectionHash: 'projection-2' });
-  assert.equal(dbm.getPlanWorkPackage(a.id)?.revision, 2);
-  assert.equal(dbm.getPlanWorkPackage(a.id)?.state, 'blocked');
-  assert.deepEqual(dbm.listPlanWpLifecycleEvents(a.id).map((event) =>
-    ({ actor: event.actor, from: event.fromState, to: event.toState })),
-  [{ actor: 'disk-reconciler', from: 'ready', to: 'blocked' }]);
+  bindPackages(ctx, a.id);
+  assert.throws(() => apply(ctx, [{ ...a, title: 'Package A revised', declaredState: 'blocked',
+    contentHash: 'hash-a-v2' }], { projectionHash: 'projection-2' }),
+  /requires a witnessed package-ledger command/);
+  assert.equal(dbm.getPlanWorkPackage(a.id)?.revision, 1);
+  assert.equal(dbm.getPlanWorkPackage(a.id)?.state, 'ready');
+  assert.deepEqual(dbm.listPlanWpLifecycleEvents(a.id), []);
 });
 
 test('valid omission tombstones without deleting and a pristine reappearance restores', () => {
   const ctx = context();
   const a = pkg();
   apply(ctx, [a]);
+  bindPackages(ctx, a.id);
   apply(ctx, [], { projectionHash: 'projection-empty', reconciledAt: 2000 + seq });
   assert.equal(dbm.getPlanWorkPackage(a.id)?.state, 'archived');
   assert.deepEqual(dbm.listManagedPlanWorkPackages(ctx.planId).map((entry) => ({
@@ -282,9 +305,10 @@ test('every mutation-stage fault rolls back the entire applied snapshot', () => 
     const ctx = context();
     const a = pkg();
     apply(ctx, [a]);
+    bindPackages(ctx, a.id);
     dbm.updatePlan(ctx.planId, { runState: 'ready' });
     const before = snapshot(ctx.planId);
-    assert.throws(() => apply(ctx, [{ ...a, title: 'Changed', declaredState: 'blocked',
+    assert.throws(() => apply(ctx, [{ ...a, title: 'Changed', declaredState: 'ready',
       contentHash: 'hash-a-v2', sortOrder: 1, paths: [{ path: 'src/changed.ts' }] },
     pkg({ id: `pkg-${seq}-b`, sourceLocalId: 'WP-B', title: 'New', contentHash: 'hash-b',
       sortOrder: 0, paths: [{ path: 'src/b.ts' }] })], {

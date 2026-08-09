@@ -26,6 +26,7 @@ let sqlJsCtor: new () => SqlJsDatabase;
 class FakeBetterSqlite {
   private static stores = new Map<string, SqlJsDatabase>();
   private db: SqlJsDatabase;
+  private transactionSerial = 0;
   constructor(dbPath = ':memory:') {
     let store = FakeBetterSqlite.stores.get(dbPath);
     if (!store) { store = new sqlJsCtor(); FakeBetterSqlite.stores.set(dbPath, store); }
@@ -55,9 +56,12 @@ class FakeBetterSqlite {
   }
   transaction<A extends unknown[]>(fn: (...args: A) => unknown) {
     return (...args: A) => {
-      this.db.exec('BEGIN');
-      try { const result = fn(...args); this.db.exec('COMMIT'); return result; }
-      catch (error) { this.db.exec('ROLLBACK'); throw error; }
+      const savepoint = `fake_transaction_${++this.transactionSerial}`;
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+      try { const result = fn(...args); this.db.exec(`RELEASE ${savepoint}`); return result; }
+      catch (error) {
+        this.db.exec(`ROLLBACK TO ${savepoint}`); this.db.exec(`RELEASE ${savepoint}`); throw error;
+      }
     };
   }
 }
@@ -76,7 +80,16 @@ function createPlan(label: string) {
     workspaceId, path: `.lares/plans/${label}/plan.md`, slug: label,
     format: 'structured', runState: 'executing', mtimeMs: timestamp, sizeBytes: 1,
   });
-  return { workspaceId, planId: plan.id, timestamp };
+  const artifactId = `plan_${Buffer.from(label).toString('hex').slice(0, 8).padEnd(8, '0')}`;
+  const intentId = `int_${Buffer.from(label).toString('hex').slice(0, 8).padEnd(8, '0')}`;
+  dbm.getDb().prepare('UPDATE plans SET artifact_id = ? WHERE id = ?').run(artifactId, plan.id);
+  dbm.getDb().prepare(
+    `INSERT INTO plan_intents
+       (id, workspace_id, plan_id, plan_artifact_id, intent_id, kind,
+        source_doc_rel_path, status, first_seen_at, updated_at, last_scanned_at)
+     VALUES (?, ?, ?, ?, ?, 'research', 'plan.md', 'active', 1, 1, 1)`,
+  ).run(`intent-row-${label}`, workspaceId, plan.id, artifactId, intentId);
+  return { workspaceId, planId: plan.id, timestamp, intentId };
 }
 
 function addPackage(
@@ -87,7 +100,8 @@ function addPackage(
   dbm.upsertPlanWorkPackage({
     id, workspaceId: fixture.workspaceId, planId: fixture.planId, title: `Package ${id}`,
     acceptanceCondition: 'Tests pass', state, assigneeAgentId: null, revision: 3,
-    createdAt: fixture.timestamp, updatedAt: fixture.timestamp,
+    createdAt: fixture.timestamp, updatedAt: fixture.timestamp, intentId: fixture.intentId,
+    schemaVersion: 2, contentHash: `hash-${id}`, projectionStatus: 'synced',
   });
   dbm.setPlanWorkPackagePaths(
     id,
@@ -128,7 +142,8 @@ async function run(): Promise<void> {
 
     dbm.allocateAndInsertTurn(fixture.workspaceId, {
       id: 'fresh-live-turn', planId: fixture.planId, planItemId: 'blocked-package',
-      planStampSource: 'explicit', taskLabel: 'fresh touch',
+      planStampSource: 'explicit', intentId: fixture.intentId,
+      intentStampSource: 'explicit', taskLabel: 'fresh touch',
     });
     dbm.updateTurnRecord('fresh-live-turn', {
       touched: [{ path: 'src/blocked-package.ts', op: 'write' }],
@@ -202,8 +217,8 @@ async function run(): Promise<void> {
     assert.deepEqual(timeline[0]?.events.map((event) => ({
       source: event.source, eventId: event.eventId, toState: event.toState,
     })), [
-      { source: 'lifecycle', eventId: 'lifecycle-executing', toState: 'executing' },
-      { source: 'lifecycle', eventId: 'lifecycle-blocked', toState: 'blocked' },
+      { source: 'lifecycle', eventId: 'package-ledger:lifecycle-executing', toState: 'executing' },
+      { source: 'lifecycle', eventId: 'package-ledger:lifecycle-blocked', toState: 'blocked' },
       { source: 'finalization', eventId: 'finalization-done', toState: 'done' },
     ]);
     assert.equal(dbm.getPlanWorkPackage('blocked-package')?.state, 'blocked');

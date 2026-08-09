@@ -27,6 +27,7 @@ let sqlJsCtor: new () => SqlJsDatabase;
 class FakeBetterSqlite {
   private static stores = new Map<string, SqlJsDatabase>();
   private db: SqlJsDatabase;
+  private transactionSerial = 0;
   constructor(dbPath = ':memory:') {
     let store = FakeBetterSqlite.stores.get(dbPath);
     if (!store) { store = new sqlJsCtor(); FakeBetterSqlite.stores.set(dbPath, store); }
@@ -56,9 +57,12 @@ class FakeBetterSqlite {
   }
   transaction<A extends unknown[]>(fn: (...args: A) => unknown) {
     return (...args: A) => {
-      this.db.exec('BEGIN');
-      try { const result = fn(...args); this.db.exec('COMMIT'); return result; }
-      catch (err) { this.db.exec('ROLLBACK'); throw err; }
+      const savepoint = `fake_transaction_${++this.transactionSerial}`;
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+      try { const result = fn(...args); this.db.exec(`RELEASE ${savepoint}`); return result; }
+      catch (err) {
+        this.db.exec(`ROLLBACK TO ${savepoint}`); this.db.exec(`RELEASE ${savepoint}`); throw err;
+      }
     };
   }
 }
@@ -77,7 +81,7 @@ let svc: ServiceModule;
 let serial = 0;
 
 function seed(activeRun = true): {
-  workspaceId: string; planId: string; packageId: string; agentId: string; runId: string;
+  workspaceId: string; planId: string; packageId: string; agentId: string; runId: string; intentId: string;
 } {
   serial += 1;
   const ws = dbm.createWorkspace({ title: `W${serial}`, path: `C:/w${serial}`, pathType: 'windows' });
@@ -85,6 +89,15 @@ function seed(activeRun = true): {
     workspaceId: ws.id, path: `p/${serial}`, format: 'structured',
     runState: activeRun ? 'executing' : 'ready',
   });
+  const artifactId = `plan_${serial.toString(16).padStart(8, '0')}`;
+  const intentId = `int_${serial.toString(16).padStart(8, '0')}`;
+  dbm.getDb().prepare('UPDATE plans SET artifact_id = ? WHERE id = ?').run(artifactId, plan.id);
+  dbm.getDb().prepare(
+    `INSERT INTO plan_intents
+       (id, workspace_id, plan_id, plan_artifact_id, intent_id, kind,
+        source_doc_rel_path, status, first_seen_at, updated_at, last_scanned_at)
+     VALUES (?, ?, ?, ?, ?, 'research', 'plan.md', 'active', 1, 1, 1)`,
+  ).run(`intent-row-${serial}`, ws.id, plan.id, artifactId, intentId);
   const agent = dbm.createAgent({
     workspaceId: ws.id, title: `worker-${serial}`, roleDescription: '',
     workingDirectory: `C:/w${serial}`, command: 'x', tmuxSessionName: null,
@@ -95,6 +108,7 @@ function seed(activeRun = true): {
     id: packageId, workspaceId: ws.id, planId: plan.id, title: `Package ${serial}`,
     acceptanceCondition: null, state: 'ready', assigneeAgentId: agent.id,
     revision: 1, createdAt: 1000 + serial, updatedAt: 1000 + serial,
+    intentId, schemaVersion: 2, contentHash: `hash-${serial}`, projectionStatus: 'synced',
   } as WorkPackage);
   const runId = `run-${serial}`;
   if (activeRun) {
@@ -105,7 +119,7 @@ function seed(activeRun = true): {
        VALUES (?, ?, NULL, 'unborn', NULL, NULL, 'renderer-user-action', NULL, ?, 'active')`,
     ).run(runId, plan.id, 1000);
   }
-  return { workspaceId: ws.id, planId: plan.id, packageId, agentId: agent.id, runId };
+  return { workspaceId: ws.id, planId: plan.id, packageId, agentId: agent.id, runId, intentId };
 }
 
 function openStampedTurn(
@@ -115,7 +129,7 @@ function openStampedTurn(
   dbm.allocateAndInsertTurn(s.workspaceId, {
     id, agentId: s.agentId, planId: s.planId, planItemId: s.packageId,
     planStampSource: 'explicit', startedAt, status: 'open',
-    intentId: intent?.intentId ?? null, intentStampSource: intent?.source ?? null,
+    intentId: intent?.intentId ?? s.intentId, intentStampSource: intent?.source ?? 'explicit',
   });
 }
 
@@ -156,7 +170,7 @@ test('planning activity row persists before run activation and flips active atom
   assert.equal(dbm.getPlan(s.planId)?.runState, 'executing');
 });
 
-test('pending precedes send; open turn confirmation moves ready→executing atomically', async () => {
+test('confirmation fails closed when the private dispatch intent differs from the package planning intent', async () => {
   const s = seed();
   let sawPendingBeforeSend = false;
   const result = await svc.dispatchPlanPackage({
@@ -193,11 +207,12 @@ test('pending precedes send; open turn confirmation moves ready→executing atom
     },
   });
   assert.equal(sawPendingBeforeSend, true);
-  assert.equal(result.ok, true);
-  assert.equal(result.attempt?.state, 'delivered');
-  assert.equal(result.attempt?.confirmedTurnId, `turn-${serial}`);
-  assert.equal(dbm.getPlanWorkPackage(s.packageId)?.state, 'executing');
-  assert.deepEqual(dbm.listPlanWpLifecycleEvents(s.packageId).map((e) => e.toState), ['executing']);
+  assert.equal(result.ok, false);
+  assert.equal(result.failure, 'confirmation-persist-failed');
+  assert.equal(result.attempt?.state, 'pending');
+  assert.equal(result.attempt?.confirmedTurnId, null);
+  assert.equal(dbm.getPlanWorkPackage(s.packageId)?.state, 'ready');
+  assert.deepEqual(dbm.listPlanWpLifecycleEvents(s.packageId), []);
   assert.equal(dbm.getTurnRecord(`turn-${serial}`)?.status, 'open',
     'terminal accepted is not required for executing');
 });
@@ -243,7 +258,7 @@ test('intent get-or-create is keyed by dispatch attempt while separate briefs mi
   assert.equal(first?.briefDigest?.length, 64);
 });
 
-test('production registrar obtains the package dispatch path and stamps the supervisor delivery', async () => {
+test('production registrar preserves an unconfirmed private-intent delivery as pending', async () => {
   const s = seed();
   let handler: ((event: unknown, request: unknown) => Promise<import('./plan-lifecycle').PlanPackageDispatchResponse>) | undefined;
   let deliveredIntent: string | null = null;
@@ -284,8 +299,8 @@ test('production registrar obtains the package dispatch path and stamps the supe
   });
   assert.equal(response.ok, true);
   assert.equal(dbm.getSaveIntentByDispatchAttempt(`route-attempt-${serial}`)?.id, deliveredIntent);
-  assert.equal(dbm.getPlanDispatchAttempt(`route-attempt-${serial}`)?.state, 'reconciled');
-  assert.equal(dbm.getPlanWorkPackage(s.packageId)?.state, 'executing');
+  assert.equal(dbm.getPlanDispatchAttempt(`route-attempt-${serial}`)?.state, 'pending');
+  assert.equal(dbm.getPlanWorkPackage(s.packageId)?.state, 'ready');
 });
 
 test('failed send marks the attempt failed and leaves the package ready', async () => {
@@ -337,6 +352,8 @@ test('confirmed-id reconciliation moves only to executing and marks reconciled',
     id: `attempt-${serial}`, packageId: s.packageId, planId: s.planId,
     executionRunId: s.runId, targetAgentId: s.agentId,
     requestedPlanItemId: s.packageId, createdAt: 2400,
+    intent: { id: s.intentId, workspaceId: s.workspaceId, title: 'fixture',
+      briefDigest: 'fixture-digest', createdById: null },
   });
   openStampedTurn(s, `turn-${serial}`, 2450);
   // Simulate confirmation persisted before a crash prevented the package txn.
@@ -357,6 +374,8 @@ test('fallback resolves one matching stamped turn after created_at', () => {
     id: `attempt-${serial}`, packageId: s.packageId, planId: s.planId,
     executionRunId: s.runId, targetAgentId: s.agentId,
     requestedPlanItemId: s.packageId, createdAt: 2600,
+    intent: { id: s.intentId, workspaceId: s.workspaceId, title: 'fixture',
+      briefDigest: 'fixture-digest', createdById: null },
   });
   openStampedTurn(s, `turn-${serial}`, 2610);
   const result = svc.reconcilePackageDispatches(2700);
@@ -371,6 +390,8 @@ test('ambiguous fallback stays pending and surfaces a diagnostic', () => {
     id: `attempt-${serial}`, packageId: s.packageId, planId: s.planId,
     executionRunId: s.runId, targetAgentId: s.agentId,
     requestedPlanItemId: s.packageId, createdAt: 2800,
+    intent: { id: s.intentId, workspaceId: s.workspaceId, title: 'fixture',
+      briefDigest: 'fixture-digest', createdById: null },
   });
   openStampedTurn(s, `turn-${serial}-a`, 2810);
   openStampedTurn(s, `turn-${serial}-b`, 2820);

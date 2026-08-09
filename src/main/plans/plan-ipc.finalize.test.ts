@@ -157,7 +157,7 @@ const fakeFreeze: MemberFreezer = async (entry) => ({
   commitMode: '100644',
 });
 
-test('done creates a plan-package finalization and flips the work package to done', async () => {
+test('legacy injected finalizer creates the boundary but does not bypass ledger completion', async () => {
   const store = new FakeStore();
   store.workPackages.set('wp-1', workPackage({ state: 'executing' }));
 
@@ -179,8 +179,8 @@ test('done creates a plan-package finalization and flips the work package to don
   assert.equal(res.finalization.boundaryRef, finalizationRef(planPackageId('wp-1'), 1));
   // the active row is queryable under the derived package id.
   assert.equal(store.getActivePackageFinalization(planPackageId('wp-1'))?.id, res.finalization.id);
-  // the work package flipped to done inside the service txn.
-  assert.equal(store.workPackages.get('wp-1')?.state, 'done');
+  // D3 owns completion: an injected legacy finalizer cannot mutate package state.
+  assert.equal(store.workPackages.get('wp-1')?.state, 'executing');
 });
 
 test('a boundary-unavailable finalize leaves the work package NOT done', async () => {
@@ -202,7 +202,7 @@ test('a boundary-unavailable finalize leaves the work package NOT done', async (
 
 // â”€â”€ identity-only Mission Board enrichment seam â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-test('identity-only done resolves full freeze inputs and writes done atomically', async () => {
+test('identity-only legacy finalizer resolves freeze inputs without bypassing ledger completion', async () => {
   const store = new FakeStore();
   store.workPackages.set('wp-1', workPackage({ state: 'executing' }));
   const enriched = doneRequest({
@@ -226,7 +226,7 @@ test('identity-only done resolves full freeze inputs and writes done atomically'
 
   assert.equal(result.finalization.repositoryKey, 'resolved-repo');
   assert.equal(result.finalization.checkpointOid, 'b'.repeat(40));
-  assert.equal(store.workPackages.get('wp-1')?.state, 'done');
+  assert.equal(store.workPackages.get('wp-1')?.state, 'executing');
   assert.equal(store.getActivePackageFinalization(planPackageId('wp-1'))?.id, 'fin-enriched');
 });
 
