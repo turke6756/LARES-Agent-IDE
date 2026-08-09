@@ -413,6 +413,55 @@ test('final byte revalidation mismatch → aborted-stale, no commit', async () =
   assert.equal(attempts.resolutions[0].resolution.outcomeStatus, 'aborted-stale');
 });
 
+test('100-file commit revalidation is bounded and completes in seconds', async () => {
+  const memberSpecs = Array.from({ length: 100 }, (_, index): MemberSpec => ({
+    entryId: `bulk-${index}`,
+    relative: `bulk/member-${index}.txt`,
+    rawBlobOid: `${index + 1}`.padStart(40, '1'),
+    commitBlobOid: `${index + 1}`.padStart(40, '2'),
+    commitMode: '100644',
+  }));
+  const snapshot = makeSnapshot({ members: memberSpecs });
+  const marked = 'b'.repeat(40);
+  const treeEntries = snapshot.candidate.members.map((member) => ({
+    pathB64: member.path.pathBytesBase64,
+    mode: member.expectedCommitMode!,
+    oid: member.expectedCommitBlobOid!,
+  }));
+  const git = makeFakeGit({
+    currentHead: marked,
+    reflog: `${marked} lares-commit:attempt-1 (initial): bulk`,
+    parents: { [marked]: 'a'.repeat(40) },
+    trees: { [marked]: treeEntries },
+    indexReads: [Buffer.alloc(0), Buffer.alloc(0)],
+  });
+  const expected = new Map(snapshot.candidate.members.map((member) => [member.entryId, member]));
+  let active = 0;
+  let peak = 0;
+  const { coordinator } = fakeHarness(snapshot, git, {
+    readMemberRepresentation: async ({ member }) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise<void>((resolve) => setTimeout(resolve, 15));
+      active--;
+      const frozen = expected.get(member.entryId)!;
+      return {
+        expectedState: frozen.expectedWorktreeState,
+        rawBlobOid: frozen.rawWorktreeBlobOid,
+        commitBlobOid: frozen.expectedCommitBlobOid,
+        commitMode: frozen.expectedCommitMode,
+      };
+    },
+  });
+  const started = Date.now();
+  const result = await coordinator.commit({ tokenId: 'tok-1', message: 'bulk' });
+  const elapsedMs = Date.now() - started;
+  assert.equal((result as any).outcome.status, 'committed', JSON.stringify(result));
+  assert.equal(peak, 8, 'revalidation must honor the bounded pool');
+  assert.ok(elapsedMs < 3_000, `100-file commit took ${elapsedMs}ms`);
+  console.log(`# timing - 100-file commit ${elapsedMs}ms, peak revalidation ${peak}`);
+});
+
 // ── Outcome classification layer ───────────────────────────────────────────────
 
 const A40 = 'a'.repeat(40);

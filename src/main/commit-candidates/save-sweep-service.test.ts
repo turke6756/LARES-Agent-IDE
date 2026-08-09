@@ -478,18 +478,24 @@ test('reconciliation failure halts with the known attempt and commit OIDs', asyn
   });
 });
 
-test('post-save inventory refresh failure halts and preserves the known commit OID', async () => {
+test('successful packages advance through fresh resolution without full post-save inventory refreshes', async () => {
   const one = reviewedIntent('refresh-a');
   const two = reviewedIntent('refresh-b');
+  let resolutions = 0;
+  let fullRefreshes = 0;
   const service = new SaveSweepService({
     candidateService: candidateService(),
-    resolveIntent: async (intent) => ready(intent.finalizationId === one.intent.finalizationId ? one : two),
+    resolveIntent: async (intent) => {
+      resolutions++;
+      return ready(intent.finalizationId === one.intent.finalizationId ? one : two);
+    },
     consume: async () => saved('attempt-refresh', COMMIT),
-    refreshInventory: async () => { throw new Error('refresh failed'); },
+    refreshInventory: async () => { fullRefreshes++; },
   });
   const result = await service.sweep(sweepRequest([one, two]));
-  assert.deepEqual(result.results.map((item) => item.kind), ['halted-uncertain', 'not-attempted']);
-  assert.equal(result.results[0].kind === 'halted-uncertain' && result.results[0].commitOid, COMMIT);
+  assert.deepEqual(result.results.map((item) => item.kind), ['saved', 'saved']);
+  assert.equal(resolutions, 2, 'each package is incrementally re-resolved');
+  assert.equal(fullRefreshes, 0, 'no redundant full status + attribution refresh runs after a package');
 });
 
 test('production IPC registration invokes savecard:sweep on a real SaveSweepService', async () => {

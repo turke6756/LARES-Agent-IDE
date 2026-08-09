@@ -73,6 +73,7 @@ const READ_MAX_BYTES = 64 << 20;
 const SMALL_MAX_BYTES = 1 << 20;
 const OID_RE = /^[0-9a-f]{40,64}$/;
 const MAX_MESSAGE_CHARS = 20_000;
+const REVALIDATION_CONCURRENCY = 8;
 
 // ── Injected seams ────────────────────────────────────────────────────────────
 
@@ -208,6 +209,23 @@ function defaultDeriveTrailers(snapshot: CandidateTokenSnapshot): string[] {
   for (const turnId of [...turnIds].sort()) trailers.push(`Lares-Turn: ${turnId}`);
   for (const planId of [...planIds].sort()) trailers.push(`Lares-Plan: ${planId}`);
   return trailers;
+}
+
+async function mapBounded<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  mapper: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (next < values.length) {
+      const index = next++;
+      results[index] = await mapper(values[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 // ── Pure byte helpers ─────────────────────────────────────────────────────────
@@ -582,19 +600,27 @@ export class CommitCoordinator {
 
     // FINAL raw + clean-filtered byte-match revalidation, immediately before commit
     // (guards the gap between reassembly and this lock). Any drift ⇒ safe abort.
-    for (const member of live.members) {
+    const revalidated = await mapBounded(live.members, REVALIDATION_CONCURRENCY, async (member) => {
       const expected = expectedByEntryId.get(member.entryId);
-      if (!expected) {
-        return { kind: 'stale', reason: `member ${member.entryId} vanished from the frozen manifest`, resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
-      }
-      let rep: MemberRepresentation;
+      if (!expected) return { member, kind: 'missing' as const };
       try {
-        rep = await this.d.readMemberRepresentation({ repoRoot, gitExe, pinnedHeadOid, member });
+        const rep = await this.d.readMemberRepresentation({ repoRoot, gitExe, pinnedHeadOid, member });
+        return representationMatches(rep, expected)
+          ? { member, kind: 'matching' as const }
+          : { member, kind: 'moved' as const };
       } catch (error) {
-        return { kind: 'stale', reason: `revalidation read failed for ${member.entryId}: ${error instanceof Error ? error.message : String(error)}`, resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
+        return { member, kind: 'failed' as const, error };
       }
-      if (!representationMatches(rep, expected)) {
-        return { kind: 'stale', reason: `selected bytes moved for ${member.path.displayPath}`, resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
+    });
+    for (const result of revalidated) {
+      if (result.kind === 'missing') {
+        return { kind: 'stale', reason: `member ${result.member.entryId} vanished from the frozen manifest`, resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
+      }
+      if (result.kind === 'failed') {
+        return { kind: 'stale', reason: `revalidation read failed for ${result.member.entryId}: ${result.error instanceof Error ? result.error.message : String(result.error)}`, resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
+      }
+      if (result.kind === 'moved') {
+        return { kind: 'stale', reason: `selected bytes moved for ${result.member.path.displayPath}`, resolvedHeadOid: await this.readHead(repoRoot, gitExe) };
       }
     }
 

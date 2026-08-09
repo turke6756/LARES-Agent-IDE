@@ -113,6 +113,48 @@ async function readAndProve(
   return result;
 }
 
+async function legacyPerMemberRead(
+  root: string,
+  pinnedHeadOid: string | null,
+  selected: CommitRepresentationEntry,
+): Promise<Awaited<ReturnType<typeof readCurrentCommitRepresentation>>> {
+  if (selected.commitPathspecs.length === 0) {
+    throw new Error('At least one authoritative commit pathspec is required.');
+  }
+  if (!selected.commitPathspecs.some((candidate) =>
+    candidate.pathBytesBase64 === selected.path.pathBytesBase64)) {
+    throw new Error('The represented path must be included in commitPathspecs.');
+  }
+  const tempRoot = tmp('lares-commit-repr-legacy-');
+  const indexFile = path.join(tempRoot, 'legacy.index');
+  const pathspecFile = path.join(tempRoot, 'legacy.paths');
+  const options = { gitExe: EXE, indexFile, timeoutMs: 10_000, maxBytes: 64 << 20 };
+  const pathspec = Buffer.concat(selected.commitPathspecs.flatMap((candidate) => [
+    Buffer.from(candidate.pathBytesBase64, 'base64'), Buffer.from([0]),
+  ]));
+  await runGit(root, pinnedHeadOid === null ? ['read-tree', '--empty'] : ['read-tree', pinnedHeadOid], options);
+  if (selected.expectedWorktreeState === 'absent') {
+    await runGit(root, ['update-index', '--force-remove', '-z', '--stdin'], { ...options, stdin: pathspec });
+  } else {
+    fs.writeFileSync(pathspecFile, pathspec);
+    await runGit(root, ['add', `--pathspec-from-file=${pathspecFile}`, '--pathspec-file-nul'], options);
+  }
+  const staged = await runGitBytes(root, ['ls-files', '--stage', '-z'], options);
+  const matches = parseStageEntries(staged.stdout)
+    .filter((candidate) => candidate.pathBytesBase64 === selected.path.pathBytesBase64);
+  if (selected.expectedWorktreeState === 'absent') {
+    if (matches.length !== 0) throw new Error('Temporary index still contains an expected-absent path.');
+    return { expectedState: 'absent', rawBlobOid: selected.rawWorktreeBlobOid, commitBlobOid: null, commitMode: null };
+  }
+  if (matches.length !== 1 || matches[0].stage !== '0') {
+    throw new Error('Temporary index did not produce exactly one stage-0 entry for the selected path.');
+  }
+  return {
+    expectedState: 'present', rawBlobOid: selected.rawWorktreeBlobOid,
+    commitBlobOid: matches[0].oid, commitMode: matches[0].mode,
+  };
+}
+
 test('modify returns the HEAD+worktree clean representation and preserves unrelated staging', async () => {
   const root = repo();
   fs.writeFileSync(path.join(root, 'selected.txt'), 'before\n');
@@ -277,6 +319,87 @@ test('temp index and pathspec files are cleaned when git add fails', async () =>
     /injected add failure/,
   );
   assert.deepEqual(fs.readdirSync(tempParent), [], 'failure cleanup leaves no temp artifacts');
+});
+
+test('batched path has per-member OID and refusal parity with sequential legacy reads', async () => {
+  const root = repo();
+  fs.writeFileSync(path.join(root, '.gitattributes'), '*.txt text eol=lf\n');
+  const entries: CommitRepresentationEntry[] = [];
+  for (let index = 0; index < 6; index++) {
+    const relativePath = `member-${index}.txt`;
+    fs.writeFileSync(path.join(root, relativePath), `base ${index}\n`);
+  }
+  commit(root);
+  for (let index = 0; index < 6; index++) {
+    const relativePath = `member-${index}.txt`;
+    fs.writeFileSync(path.join(root, relativePath), Buffer.from(`changed ${index}\r\n`));
+    entries.push(entry(relativePath, 'present', rawOid(root, relativePath)));
+  }
+  fs.writeFileSync(path.join(root, 'deleted.txt'), 'delete me\n');
+  const deletionHead = commit(root, 'add deletion fixture');
+  fs.unlinkSync(path.join(root, 'deleted.txt'));
+  entries.push(entry('deleted.txt', 'absent', null));
+
+  const legacy: Awaited<ReturnType<typeof readCurrentCommitRepresentation>>[] = [];
+  for (const selected of entries) {
+    legacy.push(await legacyPerMemberRead(root, deletionHead, selected));
+  }
+  const batched = await Promise.all(entries.map((selected) =>
+    readCurrentCommitRepresentation({ repoRoot: root, pinnedHeadOid: deletionHead, entry: selected, gitExe: EXE })));
+  assert.deepEqual(batched, legacy, 'every raw/clean OID, mode, and state matches the per-member path');
+
+  const invalid = { ...entries[0], commitPathspecs: [] };
+  const legacyRefusal = await legacyPerMemberRead(root, deletionHead, invalid)
+    .then(() => '', (error: unknown) => error instanceof Error ? error.message : String(error));
+  const batchRefusals = await Promise.all([invalid, entries[1]].map((selected) =>
+    readCurrentCommitRepresentation({ repoRoot: root, pinnedHeadOid: deletionHead, entry: selected, gitExe: EXE })
+      .then(() => '', (error: unknown) => error instanceof Error ? error.message : String(error))));
+  assert.equal(batchRefusals[0], legacyRefusal);
+  assert.equal(batchRefusals[1], legacyRefusal, 'a batch operation refuses atomically with the legacy message');
+});
+
+test('100-file preview representation harness uses one temp index and completes in seconds', async () => {
+  const count = 100;
+  const oid = '1'.repeat(40);
+  const entries = Array.from({ length: count }, (_, index) => {
+    const relativePath = `bulk/member-${index}.txt`;
+    return entry(relativePath, 'present', `${index}`.padStart(40, '2'));
+  });
+  const stage = Buffer.concat(entries.flatMap((selected) => [
+    Buffer.from(`100644 ${oid} 0\t`, 'ascii'),
+    Buffer.from(selected.path.pathBytesBase64, 'base64'),
+    Buffer.from([0]),
+  ]));
+  const commands: string[] = [];
+  const delay = () => new Promise<void>((resolve) => setTimeout(resolve, 15));
+  const fakeText = async (_cwd: string, args: string[]) => {
+    commands.push(args[0]);
+    await delay();
+    return { code: 0, stdout: '', stderr: '' };
+  };
+  const fakeBytes = async (_cwd: string, args: string[], options: Parameters<typeof runGitBytes>[2]) => {
+    commands.push(`${args[0]}:${options.indexFile ? 'temp' : 'real'}`);
+    await delay();
+    return { code: 0, stdout: options.indexFile ? stage : Buffer.from('real-index\0'), stderr: '' };
+  };
+  const started = Date.now();
+  const batchTmp = tmp('lares-commit-repr-100-');
+  const result = await Promise.all(entries.map((selected) => readCurrentCommitRepresentation({
+    repoRoot: 'C:/synthetic-100-file-preview',
+    pinnedHeadOid: '3'.repeat(40),
+    entry: selected,
+    tmpDir: batchTmp,
+    runGit: fakeText,
+    runGitBytes: fakeBytes,
+  })));
+  const elapsedMs = Date.now() - started;
+  assert.equal(result.length, count);
+  assert.equal(commands.filter((command) => command === 'read-tree').length, 1);
+  assert.equal(commands.filter((command) => command === 'add').length, 1);
+  assert.equal(commands.filter((command) => command === 'ls-files:temp').length, 1);
+  assert.equal(commands.filter((command) => command === 'ls-files:real').length, 2);
+  assert.ok(elapsedMs < 3_000, `100-file preview took ${elapsedMs}ms`);
+  console.log(`# timing - 100-file preview ${elapsedMs}ms, ${commands.length} git calls`);
 });
 
 async function main(): Promise<void> {

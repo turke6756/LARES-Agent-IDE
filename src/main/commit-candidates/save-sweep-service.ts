@@ -41,7 +41,8 @@ export interface SaveSweepServiceDeps {
     tokenId: string;
     message: string;
   }): Promise<SweepConsumableCoordinatorResult>;
-  /** Authoritative post-reconciliation refresh. */
+  /** Optional external refresh seam retained for wiring compatibility. Sweeps
+   *  derive each next package incrementally through resolveIntent instead. */
   refreshInventory(repositoryKey: string): Promise<void>;
 }
 
@@ -269,21 +270,6 @@ export class SaveSweepService {
           message: consumed.response.refusal.message,
           attemptId: consumed.attempt.attemptId,
           ...(consumed.attempt.commitOid ? { commitOid: consumed.attempt.commitOid } : {}),
-        });
-        this.markNotAttempted(results, intents.slice(index + 1), intent.finalizationId);
-        return { results, halted: true, haltKind: 'uncertain' };
-      }
-
-      try {
-        await this.deps.refreshInventory(intent.repositoryKey);
-      } catch (error) {
-        results.push({
-          ...base(intent),
-          kind: 'halted-uncertain',
-          code: 'post-save-inventory-refresh-failed',
-          message: errorMessage(error),
-          attemptId: consumed.attempt.attemptId,
-          commitOid: consumed.attempt.commitOid,
         });
         this.markNotAttempted(results, intents.slice(index + 1), intent.finalizationId);
         return { results, halted: true, haltKind: 'uncertain' };

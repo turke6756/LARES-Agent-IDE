@@ -71,6 +71,17 @@ interface StageEntry {
   pathBytesBase64: string;
 }
 
+const MEMBER_READ_CONCURRENCY = 8;
+
+interface PendingRepresentationRead {
+  options: ReadCurrentCommitRepresentationOptions;
+  resolve(value: CommitRepresentation): void;
+  reject(reason: unknown): void;
+}
+
+let pendingReads: PendingRepresentationRead[] = [];
+let flushScheduled = false;
+
 /** Parse the complete binary `ls-files --stage -z` stream without decoding paths. */
 export function parseStageEntries(stdout: Buffer): StageEntry[] {
   const entries: StageEntry[] = [];
@@ -119,18 +130,21 @@ function skipped(value: unknown): value is SkippedDeadline {
   return typeof value === 'object' && value !== null && (value as SkippedDeadline).skipped === 'deadline';
 }
 
-async function readRepresentation(
-  options: ReadCurrentCommitRepresentationOptions,
+async function readRepresentations(
+  options: Omit<ReadCurrentCommitRepresentationOptions, 'entry'>,
+  entries: readonly CommitRepresentationEntry[],
   runGit: CommitRepresentationRunGit,
   runGitBytes: CommitRepresentationRunGitBytes,
-): Promise<CommitRepresentation> {
-  if (options.entry.commitPathspecs.length === 0) {
-    throw new Error('At least one authoritative commit pathspec is required.');
-  }
-  if (!options.entry.commitPathspecs.some(
-    (candidate) => candidate.pathBytesBase64 === options.entry.path.pathBytesBase64,
-  )) {
-    throw new Error('The represented path must be included in commitPathspecs.');
+): Promise<CommitRepresentation[]> {
+  for (const entry of entries) {
+    if (entry.commitPathspecs.length === 0) {
+      throw new Error('At least one authoritative commit pathspec is required.');
+    }
+    if (!entry.commitPathspecs.some(
+      (candidate) => candidate.pathBytesBase64 === entry.path.pathBytesBase64,
+    )) {
+      throw new Error('The represented path must be included in commitPathspecs.');
+    }
   }
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   const tempRoot = await fs.promises.mkdtemp(path.join(options.tmpDir ?? os.tmpdir(), 'lares-commit-repr-'));
@@ -154,43 +168,47 @@ async function readRepresentation(
       gitOptions,
     );
 
-    if (options.entry.expectedWorktreeState === 'absent') {
-      await runGit(options.repoRoot, ['update-index', '--force-remove', '-z', '--stdin'], {
-        ...gitOptions,
-        stdin: nulDelimited(options.entry.commitPathspecs),
-      });
-    } else {
-      await fs.promises.writeFile(pathspecFile, nulDelimited(options.entry.commitPathspecs));
-      await runGit(options.repoRoot, [
-        'add',
-        `--pathspec-from-file=${pathspecFile}`,
-        '--pathspec-file-nul',
-      ], gitOptions);
+    const uniquePathspecs = new Map<string, EncodedGitPath>();
+    for (const entry of entries) {
+      for (const pathspec of entry.commitPathspecs) {
+        uniquePathspecs.set(pathspec.pathBytesBase64, pathspec);
+      }
     }
+    await fs.promises.writeFile(pathspecFile, nulDelimited([...uniquePathspecs.values()]));
+    await runGit(options.repoRoot, [
+      'add',
+      `--pathspec-from-file=${pathspecFile}`,
+      '--pathspec-file-nul',
+    ], gitOptions);
 
     const staged = await runGitBytes(options.repoRoot, ['ls-files', '--stage', '-z'], gitOptions);
-    const matches = parseStageEntries(staged.stdout)
-      .filter((candidate) => candidate.pathBytesBase64 === options.entry.path.pathBytesBase64);
-
-    if (options.entry.expectedWorktreeState === 'absent') {
-      if (matches.length !== 0) throw new Error('Temporary index still contains an expected-absent path.');
+    const stagedByPath = new Map<string, StageEntry[]>();
+    for (const candidate of parseStageEntries(staged.stdout)) {
+      const matches = stagedByPath.get(candidate.pathBytesBase64) ?? [];
+      matches.push(candidate);
+      stagedByPath.set(candidate.pathBytesBase64, matches);
+    }
+    return entries.map((entry) => {
+      const matches = stagedByPath.get(entry.path.pathBytesBase64) ?? [];
+      if (entry.expectedWorktreeState === 'absent') {
+        if (matches.length !== 0) throw new Error('Temporary index still contains an expected-absent path.');
+        return {
+          expectedState: 'absent',
+          rawBlobOid: entry.rawWorktreeBlobOid,
+          commitBlobOid: null,
+          commitMode: null,
+        };
+      }
+      if (matches.length !== 1 || matches[0].stage !== '0') {
+        throw new Error('Temporary index did not produce exactly one stage-0 entry for the selected path.');
+      }
       return {
-        expectedState: 'absent',
-        rawBlobOid: options.entry.rawWorktreeBlobOid,
-        commitBlobOid: null,
-        commitMode: null,
+        expectedState: 'present',
+        rawBlobOid: entry.rawWorktreeBlobOid,
+        commitBlobOid: matches[0].oid,
+        commitMode: matches[0].mode,
       };
-    }
-
-    if (matches.length !== 1 || matches[0].stage !== '0') {
-      throw new Error('Temporary index did not produce exactly one stage-0 entry for the selected path.');
-    }
-    return {
-      expectedState: 'present',
-      rawBlobOid: options.entry.rawWorktreeBlobOid,
-      commitBlobOid: matches[0].oid,
-      commitMode: matches[0].mode,
-    };
+    });
   } finally {
     // Git normally removes its lock, but clean it defensively after killed/failed
     // commands as well. The isolated directory guarantees no foreign file is hit.
@@ -200,6 +218,82 @@ async function readRepresentation(
       fs.promises.unlink(`${indexFile}.lock`).catch(() => undefined),
     ]);
     await fs.promises.rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+function compatible(
+  left: ReadCurrentCommitRepresentationOptions,
+  right: ReadCurrentCommitRepresentationOptions,
+): boolean {
+  return left.repoRoot === right.repoRoot
+    && left.pinnedHeadOid === right.pinnedHeadOid
+    && left.gitExe === right.gitExe
+    && left.deadlineAt === right.deadlineAt
+    && left.maxBytes === right.maxBytes
+    && left.tmpDir === right.tmpDir
+    && (left.runGit ?? realRunGit) === (right.runGit ?? realRunGit)
+    && (left.runGitBytes ?? realRunGitBytes) === (right.runGitBytes ?? realRunGitBytes)
+    && left.queue === right.queue
+    && left.commonDirQueueKey === right.commonDirQueueKey;
+}
+
+async function executeBatch(batch: PendingRepresentationRead[]): Promise<void> {
+  const first = batch[0].options;
+  const runGit = first.runGit ?? realRunGit;
+  const runGitBytes = first.runGitBytes ?? realRunGitBytes;
+  const maxBytes = first.maxBytes ?? DEFAULT_MAX_BYTES;
+  const operation = async (): Promise<CommitRepresentation[]> => {
+    const snapshotOptions: RunGitOptions = {
+      gitExe: first.gitExe,
+      deadlineAt: first.deadlineAt,
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+      maxBytes,
+    };
+    const before = (await runGitBytes(first.repoRoot, ['ls-files', '--stage', '-z'], snapshotOptions)).stdout;
+    try {
+      return await readRepresentations(first, batch.map((pending) => pending.options.entry), runGit, runGitBytes);
+    } finally {
+      const after = (await runGitBytes(first.repoRoot, ['ls-files', '--stage', '-z'], snapshotOptions)).stdout;
+      if (!before.equals(after)) {
+        throw new Error('Real Git index changed during read-only commit-representation computation.');
+      }
+    }
+  };
+
+  try {
+    let representations: CommitRepresentation[];
+    if (!first.queue || !first.commonDirQueueKey) {
+      representations = await operation();
+    } else {
+      const settled = await first.queue.withPriority(
+        first.commonDirQueueKey,
+        {
+          priority: 'MAINTENANCE',
+          deadlineAt: first.deadlineAt ?? Date.now() + DEFAULT_TIMEOUT_MS,
+        },
+        operation,
+      );
+      if (skipped(settled)) throw new Error('Commit-representation read expired in the object-db queue.');
+      representations = settled;
+    }
+    batch.forEach((pending, index) => pending.resolve(representations[index]));
+  } catch (error) {
+    batch.forEach((pending) => pending.reject(error));
+  }
+}
+
+async function flushPendingReads(): Promise<void> {
+  flushScheduled = false;
+  const reads = pendingReads;
+  pendingReads = [];
+  const groups: PendingRepresentationRead[][] = [];
+  for (const pending of reads) {
+    const group = groups.find((candidate) => compatible(candidate[0].options, pending.options));
+    if (group) group.push(pending);
+    else groups.push([pending]);
+  }
+  for (let offset = 0; offset < groups.length; offset += MEMBER_READ_CONCURRENCY) {
+    await Promise.all(groups.slice(offset, offset + MEMBER_READ_CONCURRENCY).map(executeBatch));
   }
 }
 
@@ -214,37 +308,11 @@ export async function readCurrentCommitRepresentation(
   if ((options.queue === undefined) !== (options.commonDirQueueKey === undefined)) {
     throw new Error('queue and commonDirQueueKey must be provided together.');
   }
-  const runGit = options.runGit ?? realRunGit;
-  const runGitBytes = options.runGitBytes ?? realRunGitBytes;
-  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
-
-  const operation = async (): Promise<CommitRepresentation> => {
-    const snapshotOptions: RunGitOptions = {
-      gitExe: options.gitExe,
-      deadlineAt: options.deadlineAt,
-      timeoutMs: DEFAULT_TIMEOUT_MS,
-      maxBytes,
-    };
-    const before = (await runGitBytes(options.repoRoot, ['ls-files', '--stage', '-z'], snapshotOptions)).stdout;
-    try {
-      return await readRepresentation(options, runGit, runGitBytes);
-    } finally {
-      const after = (await runGitBytes(options.repoRoot, ['ls-files', '--stage', '-z'], snapshotOptions)).stdout;
-      if (!before.equals(after)) {
-        throw new Error('Real Git index changed during read-only commit-representation computation.');
-      }
+  return new Promise<CommitRepresentation>((resolve, reject) => {
+    pendingReads.push({ options, resolve, reject });
+    if (!flushScheduled) {
+      flushScheduled = true;
+      queueMicrotask(() => { void flushPendingReads(); });
     }
-  };
-
-  if (!options.queue || !options.commonDirQueueKey) return operation();
-  const settled = await options.queue.withPriority(
-    options.commonDirQueueKey,
-    {
-      priority: 'MAINTENANCE',
-      deadlineAt: options.deadlineAt ?? Date.now() + DEFAULT_TIMEOUT_MS,
-    },
-    operation,
-  );
-  if (skipped(settled)) throw new Error('Commit-representation read expired in the object-db queue.');
-  return settled;
+  });
 }
