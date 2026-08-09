@@ -16,14 +16,14 @@ import {
   SUPERVISOR_CHECKPOINT_FORENSICS_SKILL,
   REMEMBER_SKILL,
   SCRIPT_READ_AGENT_LOG, SCRIPT_LIST_AGENTS, SCRIPT_SEND_MESSAGE, SCRIPT_GET_CONTEXT_STATS,
-  WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_BEHAVIORAL_MD,
+  WORKER_CLAUDE_MD, WORKER_CLAUDE_MD_V1, WORKER_CLAUDE_MD_V11, WORKER_BEHAVIORAL_MD,
   WORKER_CLAUDE_SETTINGS_JSON, WORKER_CLAUDE_SETTINGS_JSON_V2, WORKER_CLAUDE_SETTINGS_JSON_V3,
   WORKER_CLAUDE_SETTINGS_JSON_V4, WORKER_CLAUDE_SETTINGS_JSON_V5, WORKER_CLAUDE_SETTINGS_JSON_V6,
   WORKER_CLAUDE_SETTINGS_JSON_V7, workerGrokSettingsJson, workerAgyHooksJson, workerAgyHooksJsonV2,
   WORKER_AGY_HOOKS_JSON_V1_HASH,
   WORKER_CODEX_CONFIG_TOML, WORKER_CODEX_CONFIG_TOML_V1, WORKER_CODEX_CONFIG_TOML_V2,
   WORKER_CODEX_CONFIG_TOML_V3, WORKER_CODEX_CONFIG_TOML_V4, WORKER_CODEX_CONFIG_TOML_V5,
-  WORKER_CODEX_AGENTS_MD, WORKER_CODEX_AGENTS_MD_V1, WORKER_CODEX_BEHAVIORAL_MD,
+  WORKER_CODEX_AGENTS_MD, WORKER_CODEX_AGENTS_MD_V1, WORKER_CODEX_AGENTS_MD_V4, WORKER_CODEX_BEHAVIORAL_MD,
   WORKER_GROK_AGENTS_MD, WORKER_AGY_AGENTS_MD,
   GUARD_GIT_DISCARD_MJS,
   DASHBOARD_STATUS_SCRIPT_MJS, DASHBOARD_STATUS_SCRIPT_MJS_V3, DASHBOARD_STATUS_SCRIPT_MJS_V4, DASHBOARD_STATUS_SCRIPT_MJS_V5,
@@ -46,6 +46,7 @@ import {
   LARES_DIR_NAME, LEGACY_LARES_DIR_NAME,
   WRITE_PROPOSAL_SKILL_MD,
   READ_PLANNING_SURFACE_SKILL_MD,
+  PROVE_PRODUCTION_ENTRY_POINT_SKILL,
   PROPOSAL_TO_PLAN_SKILL_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_SCOPE_MD,
@@ -53,6 +54,7 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_DELIBERATE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_INTEGRATE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD,
   PROPOSAL_TO_PLAN_CONTRACT_ARC_MD,
   PROPOSAL_TO_PLAN_CONTRACT_FOLDER_SCHEMA_MD,
@@ -61,6 +63,7 @@ import {
   PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD,
   PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD,
   PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS,
 } from '../../shared/constants';
@@ -1221,6 +1224,10 @@ export const WORKER_CLAUDE_MD_V9_HASH = '283c36d2fa384415c3e5f61aacfa4f40a1d3776
  *  constants.ts; previousHashes[10] enables silent pristine v10 → v11 upgrade. */
 export const WORKER_CLAUDE_MD_V10_HASH = '89c1675d008f34792c9fe9ca59a4d237f2c3b7cb5cf23cd7de62b2e2b583863c';
 
+/** WP-B4: hash of the frozen worker v11 body before the structured production
+ * reachability report was added. */
+export const WORKER_CLAUDE_MD_V11_HASH = '983d37979966474a0ba886966e80fc6968133927e28a07abf8205333804d572a';
+
 /** SHA-256 hex of the v1 `.lares/workers/codex/AGENTS.md` — the Codex derivation
  *  of the FROZEN worker v8 body (WORKER_CODEX_AGENTS_MD_V1). v2 is the live
  *  WORKER_CODEX_AGENTS_MD (derived from the v9 worker body). Used in the codex
@@ -1237,6 +1244,9 @@ export const WORKER_CODEX_AGENTS_MD_V2_HASH = '60a6b1bc6df13a8025b9a0ef12ea1ab9d
  *  derivation of frozen worker v10. previousHashes[3] enables silent pristine
  *  v3 → v4 upgrade for the directional-memory edit. */
 export const WORKER_CODEX_AGENTS_MD_V3_HASH = '2666fc57e77d1d37eed3ac4a693ca52b244652a18b25a93ef92e67d64698bd47';
+
+/** WP-B4: hash of frozen Codex AGENTS.md v4, derived from worker v11. */
+export const WORKER_CODEX_AGENTS_MD_V4_HASH = '18ea93086f25c68096f20e27a9fe773dc7d07e3e84a40fe52d5ddfeac017d65e';
 
 // WP-SKILLFIX — SHA-256 hex of the v1 bundled bodies of the five proposal-to-plan
 // files hardened to v2 (fresh-agent test surfaced four doc defects: orient
@@ -1291,6 +1301,11 @@ export const WRITE_PROPOSAL_SKILL_MD_V1_HASH = 'e025a7762b1765c2cb402fd851c816d4
 export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH = '97fd1cf2f4945aeed0a0b3543a71885429ded54c08dd1ffbe79aace4b495b461';
 export const PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH = '1332922da5b48594b46f875af29d15fbb327233f173403fc3b5c73e6c9fa80ee';
 
+// WP-B4 - frozen hashes of the pre-reachability package activity v3 and
+// work-packages contract v2. Older history rows remain cumulative below.
+export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3_HASH = '504d1a3f4f7b14b480ff1f19941b8e762c80fa237c80ebe8d3ea9a29b368a32b';
+export const PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2_HASH = 'f2588c4d3e52a2d9d16d7b0f0fb376ac11594d02da7607728ef956681504ebd4';
+
 // WP-3 - frozen hash of the pristine pre-clarification human-overview v1 body.
 // The byte-exact body lives in proposal-to-plan-old-body-fixtures.ts.
 export const PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH = '7625a5fcf79ae0fd4882a26042f9311dd9817d7ecb652e43528aa1bdd12012d2';
@@ -1327,9 +1342,10 @@ const PROPOSAL_TO_PLAN_TREE: Array<{
                       3: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH } },
   { rel: 'references/activities/deliberate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_DELIBERATE_MD },
   { rel: 'references/activities/integrate.md', content: PROPOSAL_TO_PLAN_ACTIVITY_INTEGRATE_MD },
-  { rel: 'references/activities/package.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, version: 3,
+  { rel: 'references/activities/package.md', content: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, version: 4,
     previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
-                      2: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH } },
+                      2: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
+                      3: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3_HASH } },
   { rel: 'references/activities/orient.md', content: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD, version: 3,
     previousHashes: { 1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
                       2: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V2_HASH } },
@@ -1342,8 +1358,9 @@ const PROPOSAL_TO_PLAN_TREE: Array<{
     previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } },
   { rel: 'references/contracts/responsibility.md', content: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD, version: 2,
     previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD_V1_HASH } },
-  { rel: 'references/contracts/work-packages.md', content: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD, version: 2,
-    previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH } },
+  { rel: 'references/contracts/work-packages.md', content: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD, version: 3,
+    previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
+                      2: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2_HASH } },
   { rel: 'scripts/plan-identity.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS, executable: true },
   { rel: 'scripts/plan-manifest.mjs', content: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS, executable: true, version: 4,
     previousHashes: { 1: PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS_V1_HASH,
@@ -1381,6 +1398,14 @@ export function writeProposalEntry(rootPrefix: string): Record<string, ScaffoldF
 export function readPlanningSurfaceEntry(rootPrefix: string): Record<string, ScaffoldFile> {
   return {
     [`${rootPrefix}/SKILL.md`]: { content: READ_PLANNING_SURFACE_SKILL_MD, version: 1 },
+  };
+}
+
+/** Production-entry reachability gate shared by every native supervisor and
+ * worker skill root. First managed deployment: version 1 has no prior hash. */
+export function proveProductionEntryPointEntry(rootPrefix: string): Record<string, ScaffoldFile> {
+  return {
+    [`${rootPrefix}/SKILL.md`]: { content: PROVE_PRODUCTION_ENTRY_POINT_SKILL, version: 1 },
   };
 }
 
@@ -3351,6 +3376,7 @@ export class AgentSupervisor extends EventEmitter {
     ...proposalToPlanEntries('.lares/supervisor/.claude/skills/proposal-to-plan'),
     ...writeProposalEntry('.lares/supervisor/.claude/skills/write-proposal'),
     ...readPlanningSurfaceEntry('.lares/supervisor/.claude/skills/read-planning-surface'),
+    ...proveProductionEntryPointEntry('.lares/supervisor/.claude/skills/prove-the-production-entry-point'),
     [`.lares/supervisor/CLAUDE.md`]:                                              {
       content: SUPERVISOR_AGENT_MD,
       version: 22, // v22 documents Gemini's discontinuation while preserving historical reads. v21 added the planning-artifacts section.
@@ -3436,6 +3462,7 @@ export class AgentSupervisor extends EventEmitter {
     ...proposalToPlanEntries('.lares/supervisor/.agents/skills/proposal-to-plan'),
     ...writeProposalEntry('.lares/supervisor/.agents/skills/write-proposal'),
     ...readPlanningSurfaceEntry('.lares/supervisor/.agents/skills/read-planning-surface'),
+    ...proveProductionEntryPointEntry('.lares/supervisor/.agents/skills/prove-the-production-entry-point'),
     [`.lares/supervisor/.agents/skills/remember/SKILL.md`]: { content: REMEMBER_SKILL, version: 2, previousHashes: { 1: REMEMBER_SKILL_V1_HASH } }, // v2: fixes the capsule example's `detail:` path to the validator-accepted `memory/details/<id>.md` form
   };
 
@@ -3516,10 +3543,11 @@ export class AgentSupervisor extends EventEmitter {
     ...proposalToPlanEntries('.lares/workers/claude/.claude/skills/proposal-to-plan'),
     ...writeProposalEntry('.lares/workers/claude/.claude/skills/write-proposal'),
     ...readPlanningSurfaceEntry('.lares/workers/claude/.claude/skills/read-planning-surface'),
+    ...proveProductionEntryPointEntry('.lares/workers/claude/.claude/skills/prove-the-production-entry-point'),
     [`.lares/workers/claude/CLAUDE.md`]:                       {
       content: WORKER_CLAUDE_MD,
-      version: 11, // v11: removes worker-side memory-retrieval guidance — supervisor briefs carry relevant memory; workers suggest via the `remember` skill. Previously: v10 (WP-P0C planning-surface) replaces the retired every-turn PLAN-EVENT ceremony section with the worker planning-surface section (where proposals/plan folders live; a worker MAY author a proposal via capture; hardening + ARC.md stay the supervisor's job; the per-turn sentinel + read-before-edit obligations are gone — WP-P0B removed the runtime contract). Previously: v9 (memory-lessons v2, WP-G) retires the shared `behavioral.md` read/append instruction: the `## Memory: shared behavioral notes only` section becomes `## Memory & lessons` with the injection-aware resident pointer (memory injected at launch for supervisors; a worker fetches via the `recall_memory` tool or a raw read of `.lares/supervisor/memory/`), the cross-workspace discoverability line, and the `remember`-skill pointer. Previously: v2 adds the memory section; v3 (WP-G) adds the research-store pointer; v4 adds the online-research division of labor; v5 (planning-surface WP2) adds the plan-event sentinel section; v6 (GT-C D2) makes the PLAN-EVENT sentinel mandatory on every rail turn + expands the status vocab; v7 (Lares rebrand) renames `.dashboard/…` → `.lares/…`; v8 adds the "Never use git to discard uncommitted work" section (pairs with the PreToolUse guard-git-discard.mjs hook)
-      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH, 7: WORKER_CLAUDE_MD_V7_HASH, 8: WORKER_CLAUDE_MD_V8_HASH, 9: WORKER_CLAUDE_MD_V9_HASH, 10: WORKER_CLAUDE_MD_V10_HASH },
+      version: 12, // v12: requires the structured production-reachability report. v11 removed worker-side memory-retrieval guidance.
+      previousHashes: { 1: sha256Hex(WORKER_CLAUDE_MD_V1), 2: WORKER_CLAUDE_MD_V2_HASH, 3: WORKER_CLAUDE_MD_V3_HASH, 4: WORKER_CLAUDE_MD_V4_HASH, 5: WORKER_CLAUDE_MD_V5_HASH, 6: WORKER_CLAUDE_MD_V6_HASH, 7: WORKER_CLAUDE_MD_V7_HASH, 8: WORKER_CLAUDE_MD_V8_HASH, 9: WORKER_CLAUDE_MD_V9_HASH, 10: WORKER_CLAUDE_MD_V10_HASH, 11: WORKER_CLAUDE_MD_V11_HASH },
     },
     [`.lares/workers/claude/.claude/settings.json`]:           {
       content: WORKER_CLAUDE_SETTINGS_JSON,
@@ -3694,6 +3722,7 @@ export class AgentSupervisor extends EventEmitter {
         ...proposalToPlanEntries('.lares/workers/codex/.agents/skills/proposal-to-plan'),
         ...writeProposalEntry('.lares/workers/codex/.agents/skills/write-proposal'),
         ...readPlanningSurfaceEntry('.lares/workers/codex/.agents/skills/read-planning-surface'),
+        ...proveProductionEntryPointEntry('.lares/workers/codex/.agents/skills/prove-the-production-entry-point'),
         [`.lares/workers/codex/.codex/config.toml`]: {
           content: codexConfig,
           version: 6,
@@ -3718,8 +3747,8 @@ export class AgentSupervisor extends EventEmitter {
         // worker body) so a pristine v1 workspace upgrades silently.
         [`.lares/workers/codex/AGENTS.md`]: {
           content: WORKER_CODEX_AGENTS_MD,
-          version: 4, // v4: removes worker-side memory-retrieval guidance — supervisor briefs carry relevant memory; workers suggest via the `remember` skill. Previously: v3 (WP-P0C) inherits worker v9->v10 (ceremony drop + planning-surface section)
-          previousHashes: { 1: WORKER_CODEX_AGENTS_MD_V1_HASH, 2: WORKER_CODEX_AGENTS_MD_V2_HASH, 3: WORKER_CODEX_AGENTS_MD_V3_HASH },
+          version: 5, // v5: inherits the worker v11->v12 structured production-reachability report.
+          previousHashes: { 1: WORKER_CODEX_AGENTS_MD_V1_HASH, 2: WORKER_CODEX_AGENTS_MD_V2_HASH, 3: WORKER_CODEX_AGENTS_MD_V3_HASH, 4: WORKER_CODEX_AGENTS_MD_V4_HASH },
         },
         // Memory & Lessons v2 (WP-F1): the `remember` skill for the Codex WORKER
         // skill root (WP-R proved `.agents/skills/` discovery + invocation from

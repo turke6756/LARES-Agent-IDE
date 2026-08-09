@@ -56,11 +56,14 @@ import {
   SUPERVISOR_AGENT_MD_V21_HASH,
   WORKER_CLAUDE_MD_V9_HASH,
   WORKER_CLAUDE_MD_V10_HASH,
+  WORKER_CLAUDE_MD_V11_HASH,
   WORKER_CODEX_AGENTS_MD_V2_HASH,
   WORKER_CODEX_AGENTS_MD_V3_HASH,
+  WORKER_CODEX_AGENTS_MD_V4_HASH,
   proposalToPlanEntries,
   writeProposalEntry,
   readPlanningSurfaceEntry,
+  proveProductionEntryPointEntry,
   WRITE_PROPOSAL_SKILL_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V1_HASH,
@@ -70,7 +73,9 @@ import {
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3_HASH,
   PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
+  PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2_HASH,
   PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
   PROPOSAL_TO_PLAN_SKILL_MD_V2_HASH,
@@ -109,18 +114,22 @@ import {
   WORKER_CLAUDE_MD_V10,
   WRITE_PROPOSAL_SKILL_MD,
   READ_PLANNING_SURFACE_SKILL_MD,
+  PROVE_PRODUCTION_ENTRY_POINT_SKILL,
   WORKER_CODEX_AGENTS_MD_V2,
   WORKER_CODEX_AGENTS_MD_V3,
+  WORKER_CODEX_AGENTS_MD_V4,
   PROPOSAL_TO_PLAN_SKILL_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_CAPTURE_MD_V2,
   PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD,
   PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD,
+  PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3,
   PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD,
   PROPOSAL_TO_PLAN_CONTRACT_ARC_MD,
   PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD,
   PROPOSAL_TO_PLAN_CONTRACT_RESPONSIBILITY_MD,
   PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD,
+  PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2,
   PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_IDENTITY_MJS,
   PROPOSAL_TO_PLAN_SCRIPT_PLAN_MANIFEST_MJS,
@@ -129,6 +138,7 @@ import {
   WORKER_CLAUDE_MD,
   WORKER_CLAUDE_MD_V1,
   WORKER_CLAUDE_MD_V8,
+  WORKER_CLAUDE_MD_V11,
   WORKER_CODEX_AGENTS_MD,
   WORKER_CODEX_AGENTS_MD_V1,
   WORKER_GROK_AGENTS_MD,
@@ -1411,7 +1421,7 @@ test('G5. worker CLAUDE.md: pristine v1 silently upgrades to current carrying th
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v1→current upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['workers/claude/CLAUDE.md'], 11, `sidecar must record current v11; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['workers/claude/CLAUDE.md'], 12, `sidecar must record current v12; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -1577,7 +1587,7 @@ test('D2-1. worker CLAUDE.md: pristine v5 silently upgrades to current (v10); th
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v5→v6 upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['workers/claude/CLAUDE.md'], 11, `sidecar must record current v11; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['workers/claude/CLAUDE.md'], 12, `sidecar must record current v12; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -1608,7 +1618,7 @@ test('GIT-W1. worker CLAUDE.md: pristine v7 silently upgrades to v8 carrying the
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v7→v8 upgrade must NOT create a backup');
     const sidecar = readSidecar(workDir);
-    assert.equal(sidecar['workers/claude/CLAUDE.md'], 11, `sidecar must record current v11; got ${JSON.stringify(sidecar)}`);
+    assert.equal(sidecar['workers/claude/CLAUDE.md'], 12, `sidecar must record current v12; got ${JSON.stringify(sidecar)}`);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -1673,7 +1683,7 @@ test('ML-W-1. worker CLAUDE.md: pristine v8 silently upgrades to v9 (no .bak)', 
     assert.ok(!content.includes('The one durable exception is'), 'the upgraded body drops the behavioral.md instruction');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 0, 'known-hash v8→v9 upgrade must NOT create a backup');
-    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 11, 'sidecar must record current v11');
+    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 12, 'sidecar must record current v12');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -1700,7 +1710,7 @@ test('ML-W-2. worker CLAUDE.md: locally-edited v8 (unknown hash) → .bak + over
     assert.equal(fs.readFileSync(mdPath, 'utf-8'), WORKER_CLAUDE_MD, 'edited CLAUDE.md must be overwritten with v9 bundled content');
     const backups = fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.'));
     assert.equal(backups.length, 1, `expected exactly one CLAUDE.md .bak.<ts>; got: ${backups.join(', ')}`);
-    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 11, 'sidecar must record current v11');
+    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 12, 'sidecar must record current v12');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -1732,7 +1742,7 @@ test('D2-2. worker CLAUDE.md: locally-edited v5 (unknown hash) → .bak + overwr
       edited,
       'backup must hold the locally-edited content verbatim',
     );
-    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 11, 'sidecar must record current v11');
+    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 12, 'sidecar must record current v12');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3289,7 +3299,7 @@ test('CX-AGENTS-1. codex scaffold: fresh workspace writes AGENTS.md v1 + records
 
     const sidecar = readSidecar(workDir);
     assert.equal(
-      sidecar['workers/codex/AGENTS.md'], 4,
+      sidecar['workers/codex/AGENTS.md'], 5,
       `sidecar must record current AGENTS.md v4; got: ${JSON.stringify(sidecar)}`,
     );
 
@@ -3369,7 +3379,7 @@ test('CX-AGENTS-3. codex AGENTS.md: pristine v1 silently upgrades to v2 (no .bak
       'pristine v1 codex AGENTS.md must silently upgrade to the v2 bundled (derived) content');
     const baks = fs.readdirSync(path.dirname(agentsPath)).filter((n) => n.startsWith('AGENTS.md.bak'));
     assert.equal(baks.length, 0, `known-hash v1→v2 upgrade must NOT create a backup; got: ${baks.join(', ')}`);
-    assert.equal(readSidecar(workDir)['workers/codex/AGENTS.md'], 4, 'sidecar must record current v4');
+    assert.equal(readSidecar(workDir)['workers/codex/AGENTS.md'], 5, 'sidecar must record current v5');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3643,7 +3653,7 @@ test('WP-P0C-W0. precondition: frozen v9 worker CLAUDE.md hashes to the shipped 
   assert.equal(sha256Hex(WORKER_CLAUDE_MD_V9), WORKER_CLAUDE_MD_V9_HASH,
     'WORKER_CLAUDE_MD_V9 must hash to WORKER_CLAUDE_MD_V9_HASH (previousHashes[9])');
   const managed = workerClaudeFilesMap()['.lares/workers/claude/CLAUDE.md'];
-  assert.equal(managed.version, 11, 'the bundled worker CLAUDE.md must be current v11');
+  assert.equal(managed.version, 12, 'the bundled worker CLAUDE.md must be current v12');
   assert.equal(managed.previousHashes?.[9], WORKER_CLAUDE_MD_V9_HASH, 'previousHashes[9] must be WORKER_CLAUDE_MD_V9_HASH');
   assert.notEqual(sha256Hex(WORKER_CLAUDE_MD), WORKER_CLAUDE_MD_V9_HASH,
     'the live v10 body must differ from the frozen v9 hash (did the ceremony drop land?)');
@@ -3689,7 +3699,7 @@ test('WP-P0C-C1. codex AGENTS.md: pristine v2 silently upgrades to v3 (no .bak)'
       'a pristine v2 codex AGENTS.md must silently upgrade to the exact v3 bundled content');
     const baks = fs.readdirSync(path.dirname(agentsPath)).filter((n) => n.startsWith('AGENTS.md.bak.'));
     assert.equal(baks.length, 0, `known v2-hash upgrade must NOT create a backup; got: ${baks.join(', ')}`);
-    assert.equal(readSidecar(workDir)['workers/codex/AGENTS.md'], 4, 'sidecar must record current v4');
+    assert.equal(readSidecar(workDir)['workers/codex/AGENTS.md'], 5, 'sidecar must record current v5');
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3709,7 +3719,7 @@ test('MEM-DIR-W0. frozen worker v10 and Codex v3 hashes are pinned in previousHa
   assert.equal(sha256Hex(WORKER_CLAUDE_MD_V10), WORKER_CLAUDE_MD_V10_HASH,
     'WORKER_CLAUDE_MD_V10 must hash to previousHashes[10]');
   const managed = workerClaudeFilesMap()['.lares/workers/claude/CLAUDE.md'];
-  assert.equal(managed.version, 11, 'the bundled worker CLAUDE.md must be v11');
+  assert.equal(managed.version, 12, 'the bundled worker CLAUDE.md must be v12');
   assert.equal(managed.previousHashes?.[10], WORKER_CLAUDE_MD_V10_HASH,
     'previousHashes[10] must pin the frozen v10 body');
   assert.equal(sha256Hex(WORKER_CODEX_AGENTS_MD_V3), WORKER_CODEX_AGENTS_MD_V3_HASH,
@@ -3758,7 +3768,7 @@ test('MEM-DIR-W2. pristine worker v10 silently upgrades to v11 (no .bak)', () =>
 
     assert.equal(fs.readFileSync(mdPath, 'utf-8'), WORKER_CLAUDE_MD);
     assert.equal(fs.readdirSync(path.dirname(mdPath)).filter((n) => n.startsWith('CLAUDE.md.bak.')).length, 0);
-    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 11);
+    assert.equal(readSidecar(workDir)['workers/claude/CLAUDE.md'], 12);
   } finally {
     cleanup();
     rmrf(workDir);
@@ -3779,10 +3789,70 @@ test('MEM-DIR-C1. pristine Codex AGENTS.md v3 silently upgrades to v4 (no .bak)'
 
     assert.equal(fs.readFileSync(agentsPath, 'utf-8'), WORKER_CODEX_AGENTS_MD);
     assert.equal(fs.readdirSync(path.dirname(agentsPath)).filter((n) => n.startsWith('AGENTS.md.bak.')).length, 0);
-    assert.equal(readSidecar(workDir)['workers/codex/AGENTS.md'], 4);
+    assert.equal(readSidecar(workDir)['workers/codex/AGENTS.md'], 5);
   } finally {
     cleanup();
     rmrf(workDir);
+  }
+});
+
+test('WP-B4-WORKER. reporting duty is inherited by every provider body and old managed bodies are pinned', () => {
+  assert.equal(sha256Hex(WORKER_CLAUDE_MD_V11), WORKER_CLAUDE_MD_V11_HASH);
+  assert.equal(sha256Hex(WORKER_CODEX_AGENTS_MD_V4), WORKER_CODEX_AGENTS_MD_V4_HASH);
+  const claudeManaged = workerClaudeFilesMap()['.lares/workers/claude/CLAUDE.md'];
+  assert.equal(claudeManaged.version, 12);
+  assert.equal(claudeManaged.previousHashes?.[11], WORKER_CLAUDE_MD_V11_HASH);
+  for (const body of [WORKER_CLAUDE_MD, WORKER_CODEX_AGENTS_MD, WORKER_GROK_AGENTS_MD, WORKER_AGY_AGENTS_MD]) {
+    for (const phrase of [
+      '## Production reachability report',
+      'every production entry seam, naming its symbol and path',
+      'every resource production creates',
+      "each declared obligation's revert-refutation status",
+      'every check you did not perform',
+    ]) assert.ok(body.includes(phrase), `derived worker body missing ${phrase}`);
+  }
+});
+
+test('WP-B4-WORKER-MIG. pristine worker v11 and Codex v4 silently upgrade without backups', () => {
+  for (const entry of [
+    { provider: 'claude', rel: '.lares/workers/claude/CLAUDE.md', sidecar: 'workers/claude/CLAUDE.md', body: WORKER_CLAUDE_MD_V11, version: 11, live: WORKER_CLAUDE_MD },
+    { provider: 'codex', rel: '.lares/workers/codex/AGENTS.md', sidecar: 'workers/codex/AGENTS.md', body: WORKER_CODEX_AGENTS_MD_V4, version: 4, live: WORKER_CODEX_AGENTS_MD },
+  ] as const) {
+    const workDir = mktmp(`wp-b4-${entry.provider}`);
+    const { supervisor, cleanup } = makeSupervisor();
+    try {
+      const target = path.join(workDir, ...entry.rel.split('/'));
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, entry.body, 'utf8');
+      fs.mkdirSync(path.dirname(sidecarPath(workDir)), { recursive: true });
+      fs.writeFileSync(sidecarPath(workDir), JSON.stringify({ [entry.sidecar]: entry.version }, null, 2) + '\n', 'utf8');
+      supervisor.ensureWorkerScaffold(workDir, entry.provider, 'windows');
+      assert.equal(fs.readFileSync(target, 'utf8'), entry.live);
+      assert.equal(fs.readdirSync(path.dirname(target)).filter((name) => name.startsWith(`${path.basename(target)}.bak.`)).length, 0);
+      assert.equal(readSidecar(workDir)[entry.sidecar], entry.version + 1);
+    } finally {
+      cleanup();
+      rmrf(workDir);
+    }
+  }
+});
+
+test('WP-B4-SKILL. prove-production-entry-point is managed in all four native skill roots', () => {
+  const roots = [
+    '.lares/supervisor/.claude/skills/prove-the-production-entry-point',
+    '.lares/supervisor/.agents/skills/prove-the-production-entry-point',
+    '.lares/workers/claude/.claude/skills/prove-the-production-entry-point',
+    '.lares/workers/codex/.agents/skills/prove-the-production-entry-point',
+  ];
+  for (const root of roots) {
+    const entry = proveProductionEntryPointEntry(root)[`${root}/SKILL.md`];
+    assert.deepEqual(entry, { content: PROVE_PRODUCTION_ENTRY_POINT_SKILL, version: 1 });
+  }
+  assert.equal(supFilesMap()[`${roots[0]}/SKILL.md`].content, PROVE_PRODUCTION_ENTRY_POINT_SKILL);
+  assert.equal(supCodexFilesMap()[`${roots[1]}/SKILL.md`].content, PROVE_PRODUCTION_ENTRY_POINT_SKILL);
+  assert.equal(workerClaudeFilesMap()[`${roots[2]}/SKILL.md`].content, PROVE_PRODUCTION_ENTRY_POINT_SKILL);
+  for (const phrase of ['`prove_reachability` command', '`FAIL` verdict or missing evidence', 'every unperformed check']) {
+    assert.ok(PROVE_PRODUCTION_ENTRY_POINT_SKILL.includes(phrase), `managed skill missing gate duty ${phrase}`);
   }
 });
 
@@ -3836,9 +3906,10 @@ const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; prev
     2: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V2_HASH,
     3: PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD_V3_HASH,
   } }],
-  ['references/activities/package.md', { version: 3, previousHashes: {
+  ['references/activities/package.md', { version: 4, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1_HASH,
     2: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
+    3: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3_HASH,
   } }],
   ['references/activities/orient.md', { version: 3, previousHashes: {
     1: PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD_V1_HASH,
@@ -3850,8 +3921,9 @@ const PROPOSAL_TO_PLAN_VERSIONED_FILES = new Map<string, { version: number; prev
   ['references/contracts/human-overview.md', { version: 2, previousHashes: {
     1: PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD_V1_HASH,
   } }],
-  ['references/contracts/work-packages.md', { version: 2, previousHashes: {
+  ['references/contracts/work-packages.md', { version: 3, previousHashes: {
     1: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1_HASH,
+    2: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2_HASH,
   } }],
   ['references/contracts/manifest-lock.md', { version: 2, previousHashes: { 1: PROPOSAL_TO_PLAN_CONTRACT_MANIFEST_LOCK_MD_V1_HASH } }],
   ['scripts/plan-manifest.mjs', { version: 4, previousHashes: {
@@ -4133,11 +4205,23 @@ test('WP-2-PRECONDITION. frozen pre-Outcome bodies pin both new migration-histor
     PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2_HASH,
     'live package.md v3 must differ from frozen v2',
   );
+  assert.equal(
+    sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2),
+    PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2_HASH,
+    'frozen work-packages.md v2 must hash to previousHashes[2]',
+  );
+  assert.equal(
+    sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3),
+    PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3_HASH,
+    'frozen package.md v3 must hash to previousHashes[3]',
+  );
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD), PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2_HASH);
+  assert.notEqual(sha256Hex(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD), PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3_HASH);
 });
 
 test('WP-2-CONTENT. package authoring requires a bounded, semantically checked Outcome', () => {
   for (const phrase of [
-    'Files · Dep · Do · Accept · Non-goals · Verify · Outcome',
+    'Files · Dep · Do · Accept · Non-goals · Verify · Entry · Outcome',
     "Re-read each package's `Do`, `Accept`, and `Non-goals`",
     'at least one acceptance condition must observably prove it',
     'Do not declare\n  dispatch readiness if the semantic Outcome check fails.',
@@ -4157,22 +4241,53 @@ test('WP-2-CONTENT. package authoring requires a bounded, semantically checked O
   }
 });
 
-test('WP-2-MIG. pristine work-packages v1 and package v1/v2 silently upgrade to current', () => {
+test('WP-B4-CONTRACT. package activity and work-package contract carry the shipped v2 reachability shape', () => {
+  for (const phrase of [
+    'PLAN-WORK-PACKAGES:v2',
+    'Verify · Entry · Outcome',
+    'entry_seam_links',
+    'production_constructs',
+    'Entry: none — <reviewed one-line rationale>',
+  ]) assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD.includes(phrase), `package.md missing ${phrase}`);
+
+  for (const phrase of [
+    '# Contract reference — PLAN-WORK-PACKAGES:v2',
+    '"schema_version": 2',
+    '"reachability": {',
+    '"entry_seam_links": [',
+    '"production_constructs": []',
+    'ipc | preload | route | ui-caller | job | other',
+    'normalized reachability',
+    'v1 remains parseable as a legacy shape',
+  ]) assert.ok(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD.includes(phrase), `work-packages.md missing ${phrase}`);
+});
+
+test('WP-2-MIG. pristine historical work-packages and package bodies silently upgrade to current', () => {
   const cases = [
     {
       name: 'work-packages-v1', rel: 'references/contracts/work-packages.md',
       body: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V1, diskVersion: 1,
-      live: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD, currentVersion: 2,
+      live: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD, currentVersion: 3,
+    },
+    {
+      name: 'work-packages-v2', rel: 'references/contracts/work-packages.md',
+      body: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2, diskVersion: 2,
+      live: PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD, currentVersion: 3,
     },
     {
       name: 'package-v1', rel: 'references/activities/package.md',
       body: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V1, diskVersion: 1,
-      live: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, currentVersion: 3,
+      live: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, currentVersion: 4,
     },
     {
       name: 'package-v2', rel: 'references/activities/package.md',
       body: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V2, diskVersion: 2,
-      live: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, currentVersion: 3,
+      live: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, currentVersion: 4,
+    },
+    {
+      name: 'package-v3', rel: 'references/activities/package.md',
+      body: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3, diskVersion: 3,
+      live: PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD, currentVersion: 4,
     },
   ] as const;
 
@@ -4306,7 +4421,7 @@ Tier-3 decision remains allowed; routine phase-boundary permission checks are no
   assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('**plan SKU**'));
   assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('`## Status` line'));
   assert.ok(PROPOSAL_TO_PLAN_ACTIVITY_PROMOTE_MD.includes('re-read and verify the expected'));
-  assert.ok(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD.includes('PLAN-WORK-PACKAGES:v1'));
+  assert.ok(PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD.includes('PLAN-WORK-PACKAGES:v2'));
   assert.ok(PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD.includes('PLAN-TAB-OVERVIEWS:v1'));
 });
 

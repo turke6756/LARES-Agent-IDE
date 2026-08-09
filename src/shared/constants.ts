@@ -1405,8 +1405,36 @@ const WORKER_CLAUDE_MD_V11_MEMORY_NEW = [
   '`remember` skill to draft it for your supervisor — don\'t hand-write memory or',
   'lesson files.',
 ].join('\n');
-export const WORKER_CLAUDE_MD = WORKER_CLAUDE_MD_V10
+export const WORKER_CLAUDE_MD_V11 = WORKER_CLAUDE_MD_V10
   .split(WORKER_CLAUDE_MD_V11_MEMORY_OLD).join(WORKER_CLAUDE_MD_V11_MEMORY_NEW);
+
+// ── WP-B4 (production reachability): WORKER_CLAUDE_MD v11 → v12 ───────────
+// Freeze-then-derive: v11 is the byte-exact former live body. Insert the
+// structured reachability-report duty immediately before the shared-worktree
+// discard guard. The insertion contains none of the provider-specific transform
+// tokens, so every derived AGENTS.md body inherits it byte-identically.
+const WORKER_CLAUDE_MD_V12_REACHABILITY_ANCHOR = '## Never use git to discard uncommitted work';
+const WORKER_CLAUDE_MD_V12_REACHABILITY_SECTION = `## Production reachability report
+
+When a work package adds or changes independently reachable behavior (a service,
+IPC handler, preload binding, route, UI caller, job, or production-created token,
+handle, client, or session), your final message must include a structured
+reachability report with:
+
+- every production entry seam, naming its symbol and path;
+- every resource production creates (state explicitly when there are none);
+- the entering test for each seam and production-created resource;
+- each declared obligation's revert-refutation status: \`passed\` or
+  \`not run — <reason>\`; and
+- every check you did not perform.
+
+If you cannot reach the production seam within your authorized file scope, stop
+and say so instead of reporting the package complete.
+`;
+export const WORKER_CLAUDE_MD = WORKER_CLAUDE_MD_V11.replace(
+  WORKER_CLAUDE_MD_V12_REACHABILITY_ANCHOR,
+  `${WORKER_CLAUDE_MD_V12_REACHABILITY_SECTION}\n${WORKER_CLAUDE_MD_V12_REACHABILITY_ANCHOR}`,
+);
 
 /** Seed content for the shared worker behavioral memory, written write-if-absent
  *  to <workspace>/.lares/workers/claude/behavioral.md on first Claude worker
@@ -1566,6 +1594,15 @@ export const WORKER_CODEX_AGENTS_MD_V2 = WORKER_CLAUDE_MD_V9
  *  Codex derivation of the FROZEN worker v10 body. previousHashes[3] for the
  *  codex AGENTS.md scaffold entry's v3 → v4 bump. */
 export const WORKER_CODEX_AGENTS_MD_V3 = WORKER_CLAUDE_MD_V10
+  .split('.lares/workers/claude/').join('.lares/workers/codex/')
+  .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
+  .join('an interactive approval prompt or `(y/n)` confirmation, ')
+  .split('`WORKER_CLAUDE_MD` constant').join('`WORKER_CODEX_AGENTS_MD` constant');
+
+/** WP-B4: frozen v4 Codex AGENTS.md, derived from the frozen worker v11 body.
+ *  previousHashes[4] recognizes the exact body shipped before the structured
+ *  production-reachability reporting duty. */
+export const WORKER_CODEX_AGENTS_MD_V4 = WORKER_CLAUDE_MD_V11
   .split('.lares/workers/claude/').join('.lares/workers/codex/')
   .split('`AskUserQuestion`,\nplan-mode approval prompts, `(y/n)` confirmations, ')
   .join('an interactive approval prompt or `(y/n)` confirmation, ')
@@ -3782,15 +3819,45 @@ the row is healthy and unambiguous.
   remediation and is irreversible.
 `;
 
-/** remember/SKILL.md — the ONE user-facing memory/lesson write entry (Memory &
- *  Lessons v2 WP-F1, proposal §5). Provisioned by SUPERVISOR_FILES,
- *  SUPERVISOR_FILES_CODEX, WORKER_FILES_CLAUDE, and the Codex worker map to all
- *  four lane/provider skill roots (WP-R verdict). Ships as a managed v2 scaffold
- *  entry whose v1 hash preserves silent upgrades. The body triages INSIDE the skill —
- *  worthiness → memory-vs-lesson → capsule/lesson authoring → a named way to die →
- *  validate — and routes to publish_lesson (lesson) or propose_graduation
- *  (graduation). Because this path lives under `.agents/`/`.claude/skills`, an
- *  agent NEVER hand-writes memory or lesson files. */
+/** Managed production-entry reachability gate, deployed byte-identically to the
+ * four native supervisor/worker skill roots. */
+export const PROVE_PRODUCTION_ENTRY_POINT_SKILL = `---
+name: prove-the-production-entry-point
+description: >-
+  You're finishing or gating a work package that adds a service, IPC handler, route, job, or any unit of behavior with its own test file, and those tests pass — and you're about to call it complete. Also fires when a renderer/unit test supplies a token, handle, or client that production would itself have to create.
+---
+A package can be **complete, test-green, and gate-passed while production cannot reach it at all.** This is invisible at completion time, because every signal a package normally emits is green: the code exists, the tests pass, the gate reads real code and real tests. Nothing in that set asks *"can the app get here?"*
+
+It has happened twice in one subsystem (Lares save-card).
+
+**1. Mint (2026-08-05).** \`CommitCandidateService.mintCandidateToken\` was fully built and unit-tested by \`candidate-service.mint.test.ts\`. Production's \`buildCandidate\` always returned \`token: null\` — the mint step was never wired into a route, and \`mintCandidateToken\` was dead code. Renderer tests **mocked tokens in**, so the renderer suite proved a flow that could not occur. The live failure was a user-visible "did not produce a committable candidate" on a byte-verified 15-file package. The root-cause review's own words: *"no test drives the whole production chain through real route registration, real token minting, and real coordinator consumption. Unit suites validate each island while mocks conceal the dead bridge."*
+
+**2. Save sweep (2026-08-07, WP-6 \`e52ad5fb\`).** Added \`save-sweep-service.ts\` (316 lines) and \`save-sweep-service.test.ts\` (512 lines, 12 tests). Every test opened with \`new SaveSweepService({ ... })\` — direct construction with injected dependencies. The commit touched no \`ipcMain.handle\`, no preload binding, no \`src/main/index.ts\` registration. It passed its tests **and an initial supervisor gate.** It was dead code. The next package (WP-7) stopped because it could not find the seam; WP-6b \`b4617499\` then added \`ipc-handlers.ts\`, \`index.ts\`, and \`preload/index.ts\`.
+
+**What separates a live package from a dead one is a single property: does any test obtain the unit the way production obtains it?** In both incidents, every test constructed the unit directly. *Direct construction can never fail from a missing registration* — which is exactly why it stays green while the feature is inert.
+
+## When you finish or gate such a package
+
+- **Name the production entry point explicitly** and say it in your summary — IPC channel, preload binding, HTTP route, UI caller, job registration. Ask: *which line of shipping code calls this?* If the only honest answer is "the test does," it is dead.
+- **Write one test that enters through that seam, not through the constructor.** WP-6b's fix is the shape to copy: load the real \`registerIpcHandlers\` with a fake \`ipcMain\` that captures registrations, assert the channel *was registered*, then invoke the captured handler:
+  \`assert.ok(handler, 'the production registerIpcHandlers path must register savecard:sweep')\`
+  That one line fails on precisely the defect twelve direct-construction tests could not see.
+- **Distrust mocks at the bridge you are building.** A mock of the seam under construction silently converts "unreachable" into "passing." If a test hands the code a token, handle, session, or client that production would have to mint or register, that test is asserting your bug away.
+- **Run the app-owned \`prove_reachability\` command** for the package's declared v2 reachability obligations. Inspect every entry-seam link and production construct independently; a baseline that does not pass, an inapplicable/stale mutation, a protected-test mutation, or a mutated run without the declared failure marker is not proof.
+- **Gating: a \`FAIL\` verdict or missing evidence outranks green tests, a real code read, and the worker's summary.** Do not call the package complete until every declared obligation has current passing evidence. The command records evidence for the candidate tree; the future completion executor is what makes that evidence mechanically completion-blocking.
+- **Know the weak variant.** Asserting the bridge as *source text* — this repo's \`save-card-surface.test.ts\` asserts the literal string \`'sweep: (req) => ipcRenderer.invoke(SAVE_SWEEP_CHANNEL, req)'\` — catches deletion but only proves the line exists, not that it works. Better than nothing; not a reachability test.
+- **Worker report (required):** final messages name every entry seam (\`symbol\` + \`path\`), every production-created resource, the entering test for each obligation, each obligation's revert-refutation status (\`passed\` or \`not run — reason\`), and every unperformed check.
+- **If you are the worker and the seam is out of your file scope, stop and say so** rather than shipping a service with no caller. WP-7 stopping is what surfaced incident 2; that stop was correct behavior, not a failure.
+
+## Corroboration and its limits
+
+An independent audit of this workspace's planning surface (\`.lares/research/inbox/planning-surface-audit-report.md\`) reached the same conclusion from different evidence: finding **F1**, its top-ranked silent failure, and *"make production reachability a mandatory package and gate field"* is its #1 recommendation of nine.
+
+Where this lesson's evidence is better than the audit's: the audit saw only incident 2 (WP-6/WP-6b) and scored it from git plus gate transcripts. The mint incident is first-hand here, and it is the stronger case — there the mocks did not merely fail to catch the gap, they **actively simulated the missing bridge**, so the renderer suite was evidence *for* a flow that did not exist. A reachability rule that only inspects whether a registration exists would have caught incident 2; catching incident 1 also requires distrusting mocks at the seam.
+`;
+
+/** remember/SKILL.md — the user-facing memory/lesson write entry, managed in
+ * every native supervisor/worker skill root. */
 export const REMEMBER_SKILL = `---
 name: remember
 description: >-
@@ -6187,7 +6254,7 @@ is ready for **\`package\`** (decompose + baseline tag). \`orient\` re-derives a
 pickup.
 `;
 
-export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD = `# Activity playbook — \`package\`
+export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3 = `# Activity playbook — \`package\`
 
 **Purpose.** The **LAST** step of the journey: decompose the **hardened** plan into
 **worker-sized, bundle-contract-shaped work packages** — after a defensible implementation plan
@@ -6271,6 +6338,21 @@ With packages and \`OVERVIEW.md\` validated and the baseline tag in place, prese
 and stop. The plan is **dispatch-ready**, but implementation is a separate explicit human **trigger**
 (never auto-launched by the skill). \`orient\` reports readiness on pickup.
 `;
+
+const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V4_ENTRY_ANCHOR =
+  '- Re-read each package\'s `Do`, `Accept`, and `Non-goals`.';
+const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V4_ENTRY_RULE = `- Add an \`Entry\` section to every prose package. For \`behavior\`, mirror every v2
+  \`entry_seam_links\` and \`production_constructs\` obligation: name the production symbol/path,
+  its entering test, and its mutation reference. For a package that adds or changes no independently
+  reachable behavior, write \`Entry: none — <reviewed one-line rationale>\`; a refactor that changes
+  an existing seam is behavior, not \`none\`.`;
+export const PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD = PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V3
+  .split('PLAN-WORK-PACKAGES:v1').join('PLAN-WORK-PACKAGES:v2')
+  .replace('Verify · Outcome', 'Verify · Entry · Outcome')
+  .replace(
+    PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V4_ENTRY_ANCHOR,
+    `${PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V4_ENTRY_RULE}\n${PROPOSAL_TO_PLAN_ACTIVITY_PACKAGE_MD_V4_ENTRY_ANCHOR}`,
+  );
 
 export const PROPOSAL_TO_PLAN_ACTIVITY_ORIENT_MD = `# Activity playbook — \`orient\`
 
@@ -6610,7 +6692,7 @@ Rung derivation is **not** in the helper (that is the P1 reader / P2L ledger's c
 lock protects manifest integrity only.
 `;
 
-export const PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD = `# Contract reference — PLAN-WORK-PACKAGES:v1
+export const PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD_V2 = `# Contract reference — PLAN-WORK-PACKAGES:v1
 
 The responsible supervisor writes exactly one regular, non-symlink Markdown file under
 \`supplements/\` with frontmatter \`kind: work-packages\` and the plan's exact
@@ -6683,6 +6765,126 @@ is enforced by the semantic self-check and review gate.
 This block is additive machine metadata. It does not replace bundle prose, the ARC ledger,
 PLAN-INTENT/PLAN-INTEGRATION sentinels, or the rung ladder. A prose-only legacy supplement is
 invalid until its responsible supervisor adds a reviewed v1 block.
+`;
+
+export const PROPOSAL_TO_PLAN_CONTRACT_WORK_PACKAGES_MD = `# Contract reference — PLAN-WORK-PACKAGES:v2
+
+The responsible supervisor writes exactly one regular, non-symlink Markdown file under
+\`supplements/\` with frontmatter \`kind: work-packages\` and the plan's exact
+\`plan_artifact_id\`. The existing prose remains in the bundle-contract shape: every package has
+\`Files\`, \`Dep\`, \`Do\`, \`Accept\`, \`Non-goals\`, \`Verify\`, and \`Entry\` sections, and opens
+with exactly one:
+
+\`**Outcome:** <one plain sentence: what the user can newly see or do when this package lands; for a
+non-visible prerequisite, what user-facing capability or safety it unlocks and why it must land
+first. No file paths or identifiers.>\`
+
+The complete Outcome line must be at most 200 characters. Re-read \`Do\`, \`Accept\`, and
+\`Non-goals\`: the Outcome must promise no behavior outside them, and at least one acceptance
+condition must observably prove it.
+
+The prose \`Entry\` section mirrors the machine reachability contract. For \`behavior\`, list every
+production entry seam, every resource production constructs, the entering test for each obligation,
+and each mutation reference. Otherwise write \`Entry: none — <reviewed one-line rationale>\`.
+
+Immediately before the prose package sections, emit exactly one hidden machine block:
+
+\`\`\`markdown
+<!--PLAN-WORK-PACKAGES:v2
+{
+  "schema_version": 2,
+  "plan_artifact_id": "plan_e0001372",
+  "packages": [
+    {
+      "id": "WP-1",
+      "order": 10,
+      "title": "WP schema and parser",
+      "initial_state": "ready",
+      "acceptance_conditions": [
+        "Invalid input leaves package, layout, path, assignment, and lifecycle rows unchanged."
+      ],
+      "paths": [
+        { "path": "src/main/plans/plan-work-package-ingest.ts", "intent_kind": "edit" },
+        { "path": "reachability-mutations/ingest-entry.patch", "intent_kind": "create" }
+      ],
+      "depends_on": [],
+      "reachability": {
+        "kind": "behavior",
+        "entry_seam_links": [
+          {
+            "seam_kind": "route",
+            "path": "src/main/plans/plan-work-package-ingest.ts",
+            "symbol": "parsePlanWorkPackageDocument",
+            "entering_test": "src/main/plans/plan-work-package-ingest.test.ts",
+            "mutation": "reachability-mutations/ingest-entry.patch",
+            "verification": {
+              "target": "plan-work-package-ingest-entry",
+              "expect_failure": "REACHABILITY:plan-work-package-ingest"
+            }
+          }
+        ],
+        "production_constructs": []
+      }
+    }
+  ]
+}
+-->
+\`\`\`
+
+For a package with no independently reachable behavior, use only:
+
+\`\`\`json
+"reachability": {
+  "kind": "none",
+  "rationale": "Internal documentation-only change; adds or changes no independently reachable behavior."
+}
+\`\`\`
+
+## Validation
+
+- Bound both file and block to 1 MiB. Parse strict JSON: comments, trailing commas, duplicate keys,
+  unknown top-level/package/reachability keys, and strings containing \`-->\` are invalid.
+- \`schema_version\` and the block sentinel are both \`2\`; block, frontmatter, and \`plan.json\`
+  artifact IDs match exactly; \`packages\` is non-empty. v1 remains parseable as a legacy shape and
+  does not carry reachability, but new authoring uses v2.
+- IDs match \`[A-Za-z0-9][A-Za-z0-9._-]{0,63}\` and are unique case-insensitively. Derive DB IDs as
+  \`wp:<plan_artifact_id>:<lowercase logical id>\`; retain authored casing for display.
+- \`order\` is a unique non-negative integer. Gaps are allowed; display order is
+  \`(order, lowercase id)\`. Titles are trimmed, non-empty, and at most 300 characters.
+- \`initial_state\` is exactly \`ready\` or \`blocked\`. Disk cannot declare runtime lifecycle,
+  assignment, revision, or completion state.
+- \`acceptance_conditions\` is a non-empty array of non-empty strings, stored joined by \`\\n\` in
+  authored order.
+- \`paths\` may be empty. Each entry has \`path\` and optional \`intent_kind\` in
+  \`create | edit | delete | verify\`. Paths are normalized workspace-relative POSIX paths; reject
+  absolute, drive, UNC, backslash, empty/\`.\`, NUL, and outward-traversal paths.
+- \`depends_on\` references projected logical IDs only. Reject missing/self references, cycles, or a
+  dependency whose \`order\` is not lower than its dependent.
+- Every v2 package has exactly one \`reachability\` object. \`kind: none\` permits only a trimmed,
+  non-empty \`rationale\` of at most 300 characters. The rationale is author-asserted and reviewed;
+  ingest cannot prove that a package has no behavior.
+- \`kind: behavior\` permits only \`entry_seam_links\` and \`production_constructs\` besides \`kind\`.
+  \`entry_seam_links\` is non-empty; \`production_constructs\` is required and may be empty.
+- Each entry-seam link has exactly \`seam_kind\`, \`path\`, \`symbol\`, \`entering_test\`, \`mutation\`,
+  and \`verification\`. \`seam_kind\` is \`ipc | preload | route | ui-caller | job | other\`.
+- Each production construct has exactly \`name\`, \`producer_path\`, \`producer_symbol\`,
+  \`consumer_path\`, \`entering_test\`, \`mutation\`, and \`verification\`.
+- Reachability paths use the same normalized-plan-path rules. Symbols, names, rationale, and
+  \`verification.target\` / \`verification.expect_failure\` are trimmed, non-empty strings of at most
+  300 characters. The full block also rejects \`-->\` in every nested string.
+- Package content digests use canonical JSON over ID, title, initial state, acceptance conditions,
+  normalized paths, dependencies, and normalized reachability, excluding \`order\`. The projection
+  digest includes ordered package records and \`order\`.
+- Require exactly one matching prose \`## <id> - <title>\` or \`## <id> — <title>\` heading for each
+  projected package and no extra prose WP headings. ARC duplicate/unknown-ID checks are advisory.
+
+Ingest distinguishes a legitimate legacy omission (no Outcome label) from a malformed Outcome, but
+it cannot tell a legitimate legacy omission from a new-authoring omission. New-authoring compliance
+is enforced by the semantic self-check and review gate.
+
+This block is additive machine metadata. It does not replace bundle prose, the ARC ledger,
+PLAN-INTENT/PLAN-INTEGRATION sentinels, or the rung ladder. A prose-only legacy supplement is
+invalid until its responsible supervisor adds a reviewed machine block.
 `;
 
 export const PROPOSAL_TO_PLAN_CONTRACT_HUMAN_OVERVIEW_MD = `# Contract reference — PLAN-TAB-OVERVIEWS:v1
