@@ -49,6 +49,7 @@ experiments/
 # were resurrecting the folder after the .lares rename).
 /.dashboard/*
 !/.dashboard/research/
+!/.dashboard/plans/
 .dashboard/.scaffold-versions.json
 .dashboard/workers/
 .dashboard/scripts/
@@ -76,6 +77,13 @@ experiments/
 /.dashboard/analytics/
 /.dashboard/*/plan-surface-eval-handoff.md
 /.dashboard/*/.claude/settings.local.json
+
+# Plan manifests and every other durable plan-folder artifact are versioned.
+# Ignore only the lock and write-temp siblings created by the manifest CAS path.
+/.lares/plans/*/plan.json.lock*
+/.lares/plans/*/plan.json.wtmp-*
+/.dashboard/plans/*/plan.json.lock*
+/.dashboard/plans/*/plan.json.wtmp-*
 
 # >>> agentdashboard-research-store >>>
 # WP-G — research store: inbox/ holds raw, untrusted, web-derived artifacts and
