@@ -420,9 +420,7 @@ export async function createCheckpointEngine(): Promise<CheckpointEngineHandle |
       // WP-G1.7 seam upgrade: dangling-open close runs through the LIVE coordinator.
       closeOpenTurns: (workspaceId: string) => coordinator.reconcileOpenTurns(workspaceId),
     });
-    if (process.env.LARES_INTENT_PACKAGING === '1') {
-      await reconcilePlanningActivityWorktrees({ gitExe });
-    }
+    await reconcilePlanningActivityWorktrees({ gitExe });
   };
 
   // WP-G3.3 — retention cycle. Each workspace resolves its git capability through the

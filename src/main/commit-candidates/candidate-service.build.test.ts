@@ -99,7 +99,6 @@ function component(entryIds: string[], over: Partial<ConflictComponent> = {}): C
       contributingAgentCount: 1,
       mergedGroupCount: 1,
       perPathContributors: {},
-      requiresOverlapAck: false,
     },
     componentTopologyDigest: over.componentTopologyDigest ?? `ctd-${componentSeq}`,
     ...over,

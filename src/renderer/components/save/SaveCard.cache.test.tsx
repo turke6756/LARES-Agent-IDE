@@ -24,7 +24,8 @@ vi.mock('../../stores/dashboard-store', () => ({
 }));
 
 const emptyInventory = (): SaveCardInventoryResponse => ({
-  bundles: [],
+  intentUnits: [], unwitnessed: [], legacyTaskIdentityUnavailable: [],
+  legacyFinalizations: [], planningActivities: [],
   quotaWeakening: null,
 });
 

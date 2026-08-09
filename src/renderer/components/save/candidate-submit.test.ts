@@ -10,9 +10,9 @@ const selection = {
   finalizationIds: ['finalization-1'],
 };
 
-const overlapAtom: ReviewChallengeAtom = {
-  kind: 'overlap', atomId: 'overlap-1', digest: 'atom-digest-1', reasonVersion: 1,
-  memberPathBytesBase64: ['c3JjL2EudHM='], contributors: [], ownershipGroupKeys: ['owner-1'],
+const unattributedAtom: ReviewChallengeAtom = {
+  kind: 'unattributed', atomId: 'unattributed-1', digest: 'atom-digest-1',
+  pathBytesBase64: 'c3JjL2EudHM=', memberEffectDigest: 'effect-entry-1',
 };
 
 function preview(over: Partial<SaveCardPreviewResponse> = {}): SaveCardPreviewResponse {
@@ -29,7 +29,7 @@ function preview(over: Partial<SaveCardPreviewResponse> = {}): SaveCardPreviewRe
       eligibility: { eligible: true }, token: null,
     },
     laresTrailers: ['Lares-Plan: plan-1'], defaultMessageBody: 'Save work',
-    requiresOverlapAck: false, unacknowledgedUnattributedEntryIds: [],
+    unacknowledgedUnattributedEntryIds: [],
     componentTopologyDigest: 'operational-topology-only',
     selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [] },
     selectionDriftDisplayPaths: {},
@@ -54,7 +54,7 @@ function draft(over: Partial<CandidatePreviewDraft> = {}): CandidatePreviewDraft
     durableFinalizationIntent: response.durableFinalizationIntent!,
     acknowledgedChallengeAtoms: [],
     previewedCandidateId: 'candidate-1', componentTopologyDigest: 'old-operational-digest',
-    checkedUnattributedEntryIds: [], overlapAcknowledged: false,
+    checkedUnattributedEntryIds: [],
     messageBody: 'Editable body', userTrailers: 'Reviewed-by: Human', canSave: true,
     reservedTrailer: null, acknowledgedUnattributedEntryIds: [], ...over,
   };
@@ -95,7 +95,7 @@ describe('candidate submit sweep transaction', () => {
     const deps = api();
     await createCandidateSubmitter(deps).submit({
       workspaceId: 'ws-1', selection,
-      draft: draft({ acknowledgedChallengeAtoms: [overlapAtom] }),
+      draft: draft({ acknowledgedChallengeAtoms: [unattributedAtom] }),
     });
 
     expect(deps.preview).not.toHaveBeenCalled();
@@ -107,7 +107,7 @@ describe('candidate submit sweep transaction', () => {
         message: 'Editable body\n\nReviewed-by: Human',
       }],
       reviewedManifestDigests: ['review-digest-1'],
-      acknowledgedChallengeAtoms: [overlapAtom],
+      acknowledgedChallengeAtoms: [unattributedAtom],
     });
   });
 
@@ -173,8 +173,7 @@ describe('candidate submit sweep transaction', () => {
   it('requires the review pane when the server returns challenge atoms', async () => {
     const deps = api();
     deps.preview.mockResolvedValue(preview({
-      requiresOverlapAck: true,
-      reviewedManifest: { ...preview().reviewedManifest!, challengeAtoms: [overlapAtom] },
+      reviewedManifest: { ...preview().reviewedManifest!, challengeAtoms: [unattributedAtom] },
     }));
     await expect(createCandidateSubmitter(deps).submit({ workspaceId: 'ws-1', selection }))
       .resolves.toMatchObject({ kind: 'refused', refusal: { code: 'acknowledgement-missing' } });

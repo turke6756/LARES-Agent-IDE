@@ -88,8 +88,6 @@ export interface PackageDispatchDeps {
   insertAttempt?: typeof insertPlanDispatchAttempt;
   markFailed?: typeof markPlanDispatchAttemptFailed;
   confirmAttempt?: typeof confirmPlanDispatchAttempt;
-  /** Staged architecture flag. Production enables with LARES_INTENT_PACKAGING=1. */
-  intentPackaging?: boolean;
   deliver: (input: {
     targetAgentId: string;
     promptText: string;
@@ -153,7 +151,6 @@ export interface PlanPackageDispatchRouteDeps {
   reconcile?: typeof reconcilePackageDispatches;
   newId?: () => string;
   now?: () => number;
-  intentPackaging?: boolean;
   getActiveActivity?: typeof getActivePlanningActivityWorktree;
   deliver: PackageDispatchDeps['deliver'];
 }
@@ -230,12 +227,8 @@ export async function dispatchPlanPackage(
   const insertAttempt = deps.insertAttempt ?? insertPlanDispatchAttempt;
   const markFailed = deps.markFailed ?? markPlanDispatchAttemptFailed;
   const confirmAttempt = deps.confirmAttempt ?? confirmPlanDispatchAttempt;
-  const intentPackaging = deps.intentPackaging
-    ?? process.env.LARES_INTENT_PACKAGING === '1';
-  const activity = intentPackaging
-    ? (deps.getActiveActivity ?? getActivePlanningActivityWorktree)(input.planId)
-    : null;
-  if (intentPackaging && (!activity || activity.executionRunId !== activeRun.id)) {
+  const activity = (deps.getActiveActivity ?? getActivePlanningActivityWorktree)(input.planId);
+  if (!activity || activity.executionRunId !== activeRun.id) {
     return { ok: false, attempt: null, disposition: null, failure: 'planning-activity-unavailable' };
   }
   if (activity) {
@@ -255,13 +248,13 @@ export async function dispatchPlanPackage(
     targetAgentId: input.targetAgentId,
     requestedPlanItemId: input.planItemId,
     createdAt: input.createdAt,
-    intent: intentPackaging ? {
+    intent: {
       id: `svi_${randomUUID()}`,
       workspaceId: pkg.workspaceId,
       title: pkg.title,
       briefDigest: normalizedBriefDigest(input.promptText),
       createdById: input.ownerAgentId,
-    } : undefined,
+    },
   });
   const activityDispatch = activity
     ? withPlanningActivityBinding(resolved.dispatch, {
@@ -271,7 +264,7 @@ export async function dispatchPlanPackage(
         objectDatabaseKey: activity.objectDatabaseKey,
       })
     : resolved.dispatch;
-  const dispatch = intentPackaging && attempt.intentId
+  const dispatch = attempt.intentId
     ? withResolvedIntentStamp(activityDispatch, {
         intentId: attempt.intentId,
         kind: 'task',
@@ -369,7 +362,6 @@ export function registerPlanPackageDispatchIpc(
       promptText: request.promptText,
       createdAt: now(),
     }, {
-      intentPackaging: deps.intentPackaging,
       getActiveActivity: deps.getActiveActivity,
       deliver: deps.deliver,
     });

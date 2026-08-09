@@ -33,7 +33,6 @@ async function main(): Promise<void> {
   }
   const gitExe = internal.execPath;
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'lares-coordinator-validation-production-'));
-  const previousFlag = process.env.LARES_INTENT_PACKAGING;
   const git = (args: string[]): string => execFileSync(gitExe, args, { cwd: repo, encoding: 'utf8' });
   try {
     git(['init', '-q']);
@@ -50,7 +49,6 @@ async function main(): Promise<void> {
     fs.writeFileSync(path.join(repo, 'dependent.cjs'), 'module.exports = 2;\n');
     git(['config', 'lares.candidateValidation.enabled', 'true']);
     git(['config', '--add', 'lares.candidateValidation.command', 'node main.cjs']);
-    process.env.LARES_INTENT_PACKAGING = '1';
 
     const makeSnapshot = (paths: string[], tokenId: string): CandidateTokenSnapshot => {
       const members: CandidateMember[] = paths.map((relative, index) => {
@@ -141,8 +139,6 @@ async function main(): Promise<void> {
     console.log('ok - production-default coordinator validates the exact tree before CAS');
     console.log('\ncommit-coordinator validation production: 1 passed');
   } finally {
-    if (previousFlag === undefined) delete process.env.LARES_INTENT_PACKAGING;
-    else process.env.LARES_INTENT_PACKAGING = previousFlag;
     fs.rmSync(repo, { recursive: true, force: true });
   }
 }

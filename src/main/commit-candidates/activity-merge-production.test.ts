@@ -26,8 +26,6 @@ import { SAVECARD_ACTIVITY_MERGE_RESOLVE_CHANNEL } from '../../shared/types';
     }, children: [], paths: [],
   } as unknown as NodeModule;
   delete require.cache[ipcHandlersPath];
-  const previousFlag = process.env.LARES_INTENT_PACKAGING;
-  process.env.LARES_INTENT_PACKAGING = '1';
   try {
     const bridge = require('../ipc-handlers') as typeof import('../ipc-handlers');
     let entered = false;
@@ -52,8 +50,6 @@ import { SAVECARD_ACTIVITY_MERGE_RESOLVE_CHANNEL } from '../../shared/types';
     });
     console.log('activity merge production registration: passed');
   } finally {
-    if (previousFlag === undefined) delete process.env.LARES_INTENT_PACKAGING;
-    else process.env.LARES_INTENT_PACKAGING = previousFlag;
     if (priorElectron) require.cache[electronPath] = priorElectron; else delete require.cache[electronPath];
     if (priorHandlers) require.cache[ipcHandlersPath] = priorHandlers; else delete require.cache[ipcHandlersPath];
     if (priorPreload) require.cache[preloadPath] = priorPreload; else delete require.cache[preloadPath];

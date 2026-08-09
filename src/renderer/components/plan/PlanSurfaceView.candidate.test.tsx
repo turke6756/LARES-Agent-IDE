@@ -92,7 +92,6 @@ function crossPlanComponent(): ConflictComponent {
       contributingAgentCount: 2,
       mergedGroupCount: 2,
       perPathContributors: {},
-      requiresOverlapAck: false,
     },
     componentTopologyDigest: 'topo-c1',
   };
@@ -210,7 +209,7 @@ describe('SC-WP-3I plan-lens candidate identity', () => {
       { selectedComponentIds: [], selectedUnattributedEntryIds: ['e1'], finalizationIds: ['fin-1'] },
       ctx,
     ) as CommitCandidate;
-    expect(carved.eligibility).toEqual({ eligible: false, reason: 'component-subset-not-allowed' });
+    expect(carved.eligibility).toEqual({ eligible: false, reason: 'unattributed-not-acknowledged' });
   });
 });
 
@@ -241,7 +240,6 @@ function previewResponse(): SaveCardPreviewResponse {
     // Server-derived, read-only trailer previews (from the immutable snapshot).
     laresTrailers: ['Lares-Turns: 2', 'Lares-Plan: plan-A', 'Lares-Plan: plan-B', 'Lares-Finalization: pkg-1@3'],
     defaultMessageBody: 'Save 2 files',
-    requiresOverlapAck: false,
     unacknowledgedUnattributedEntryIds: [],
     componentTopologyDigest: 'topo-1',
     selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [] },

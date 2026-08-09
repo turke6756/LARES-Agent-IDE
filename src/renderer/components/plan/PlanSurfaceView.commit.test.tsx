@@ -53,7 +53,6 @@ const preview: SaveCardPreviewResponse = {
   },
   laresTrailers: ['Lares-Plan: plan-1'],
   defaultMessageBody: 'Save finalized plan work',
-  requiresOverlapAck: false,
   unacknowledgedUnattributedEntryIds: [],
   componentTopologyDigest: 'topo-1',
   selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [] },

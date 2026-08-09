@@ -5,7 +5,6 @@ import type { SaveIntent } from '../database';
 import { projectIntentUnits } from './intent-assembler';
 import type { ComponentAssembly } from './component-assembler';
 import type { ProjectedWitness } from './witness-projection';
-import { projectWorkBundles } from './work-bundle';
 
 interface TestCase { name: string; run(): void; }
 const tests: TestCase[] = [];
@@ -33,7 +32,7 @@ const inventory: DirtyInventory = {
 function component(id: string, entryIds: string[]): ConflictComponent {
   return {
     componentId: id, dirtyEntryIds: entryIds, associations: [], componentTopologyDigest: `${id}-digest`,
-    overlap: { componentId: id, contributingAgentCount: 1, mergedGroupCount: 1, perPathContributors: {}, requiresOverlapAck: false },
+    overlap: { componentId: id, contributingAgentCount: 1, mergedGroupCount: 1, perPathContributors: {} },
   };
 }
 const components = [component('ca', ['a']), component('cb', ['b']), component('cs', ['shared', 'legacy'])];
@@ -108,21 +107,6 @@ test('named membership is byte addressed and becomes stale on inventory digest c
   assert.equal(stale.intentUnits[0].intent.id, 'manual');
   assert.deepEqual(stale.intentUnits[0].memberEntryIds, []);
   assert.deepEqual(stale.staleNamedSaveSetIds, ['manual']);
-});
-
-test('parity fixture agrees with legacy bundles on the same single-intent evidence', () => {
-  const parityInventory = { ...inventory, entries: entries.slice(0, 2), unattributedEntryIds: [] };
-  const parityComponents = [component('cab', ['a', 'b'])];
-  const projected = projectIntentUnits({
-    inventory: parityInventory, witnesses: [witness('a', 'intent-one'), witness('b', 'intent-one')],
-    intents: [intent('intent-one')], namedMembers: [], topology: { components: parityComponents } as ComponentAssembly,
-  });
-  const bundles = projectWorkBundles({
-    inventory: parityInventory, components: parityComponents, captureHealthByComponentId: {},
-    unattributedCaptureHealth: { turns: [], captureOutage: false, pathsWithoutFinalizationEdge: [] },
-    protectionByEntryId: {},
-  });
-  assert.deepEqual(projected.intentUnits[0].memberEntryIds, bundles[0].members.map((member) => member.entry.entryId));
 });
 
 let passed = 0;

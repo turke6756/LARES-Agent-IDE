@@ -20,7 +20,7 @@ import type {
   BlameToIntentResult,
   PlanReviewProjection,
   PlanReviewProjectionRequest,
-  SaveCardBundle,
+  SaveIntentUnitDto,
   Workspace,
   ObservedOverviewSourceToken,
   DeleteProposalRequest,
@@ -99,7 +99,6 @@ import { projectMissionBoardEvidence } from './mission-board-evidence';
 import { projectDurableStampedTrail, projectLiveStampedActivity } from './stamped-evidence-projection';
 import { probeWorkspaceGit } from '../git/git-runtime';
 import { computeBundleCaptureHealth } from '../commit-candidates/capture-health';
-import { projectWorkBundles } from '../commit-candidates/work-bundle';
 import { runGit } from '../git-checkpoints/git-command';
 import { observeOverviewSource, parsePlanHumanOverview,
   type OverviewSourceObservation } from './plan-human-overview';
@@ -388,7 +387,7 @@ export async function finalizePlanItemDone(
 //   • the lens only FILTERS / ANNOTATES whole components — it forwards whole
 //     component ids (defaulting to the plan's own components when the request omits
 //     them) and never carves a sub-candidate, and `buildCandidate` itself rejects a
-//     smuggled component subset (`component-subset-not-allowed`), so a component that
+//     smuggled topology subset, so a component that
 //     connects to OTHER plans can never be split by this lens.
 // Read-only: nothing here touches the worktree, index, or refs.
 
@@ -686,19 +685,38 @@ async function resolvePlanReviewProjectionInput(
       repoRoot: capability.repoRoot!, turns, dirtyEntries, runGit,
     })] as const;
   }));
-  const unattributedEntries = context.inventory.unattributedEntryIds
-    .map((entryId) => entriesById.get(entryId))
-    .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
-  const unattributedCaptureHealth = await computeBundleCaptureHealth({
-    repoRoot: capability.repoRoot, turns: [], dirtyEntries: unattributedEntries, runGit,
+  const captureHealthByComponentId = Object.fromEntries(captureEntries);
+  const intentUnits = (context.intentUnits ?? []).map((unit): SaveIntentUnitDto => {
+    const memberIds = new Set(unit.memberEntryIds);
+    const componentIds = context.components.filter((component) =>
+      component.dirtyEntryIds.some((entryId) => memberIds.has(entryId)))
+      .map((component) => component.componentId);
+    return ({
+    intentId: unit.intentId,
+    kind: unit.kind,
+    title: unit.title,
+    state: 'open',
+    plan: unit.planId ? { id: unit.planId, title: unit.planId } : null,
+    planItem: unit.planItemId ? { id: unit.planItemId, title: unit.planItemId } : null,
+    members: unit.memberEntryIds.map((entryId) => ({
+      entry: entriesById.get(entryId)!,
+      protection: context.protectionByEntryId?.[entryId] ?? 'unprotected',
+    })),
+    contributors: [],
+    topologyEvidence: {
+      componentIds,
+      pathsWithMultipleTurns: [],
+      captureHealth: {
+        turns: componentIds.flatMap((id) => captureHealthByComponentId[id]?.turns ?? []),
+        captureOutage: componentIds.some((id) => captureHealthByComponentId[id]?.captureOutage),
+        pathsWithoutFinalizationEdge: [...new Set(componentIds.flatMap(
+          (id) => captureHealthByComponentId[id]?.pathsWithoutFinalizationEdge ?? []))],
+      },
+    },
+    concurrencyCases: [],
+    saveability: { saveable: true },
+    });
   });
-  const scBundles = projectWorkBundles({
-    inventory: context.inventory,
-    components: context.components,
-    captureHealthByComponentId: Object.fromEntries(captureEntries),
-    unattributedCaptureHealth,
-    protectionByEntryId: context.protectionByEntryId ?? {},
-  }) as SaveCardBundle[];
   const workspacePrefix = context.repository.workspaces
     .find((entry) => entry.workspaceId === request.workspaceId)?.workspacePrefix;
   if (workspacePrefix === undefined) throw new Error('workspace is outside the candidate repository');
@@ -711,7 +729,9 @@ async function resolvePlanReviewProjectionInput(
     executionRun,
     evidence,
     scObject,
-    scBundles,
+    intentUnits,
+    topologyComponents: context.components,
+    captureHealthByComponentId,
   };
 }
 

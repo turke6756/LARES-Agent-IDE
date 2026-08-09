@@ -100,7 +100,6 @@ test('transitively fuses A-B and B-C witness links into one component', () => {
   assert.equal(result.components.length, 1);
   assert.deepEqual(result.components[0].dirtyEntryIds, ['A', 'B', 'C']);
   assert.equal(result.components[0].overlap.contributingAgentCount, 3);
-  assert.equal(result.components[0].overlap.requiresOverlapAck, true);
   assert.deepEqual(result.components[0].associations, [{
     planId: null,
     planItemId: null,
@@ -254,10 +253,9 @@ test('emits exact stamped associations and owner-plan overlap groups', () => {
     },
   ]);
   assert.equal(component.overlap.mergedGroupCount, 2);
-  assert.equal(component.overlap.requiresOverlapAck, true);
 });
 
-test('binds owner identity into topology digests and the overlap challenge', () => {
+test('binds owner identity into topology digests without creating a generic challenge', () => {
   const inventory = draft('A', 'B');
   const sharedOwner = assembleConflictComponents(inventory, [
     witness('A', 'turn-1', 'agent-1', 'plan-1', 'item-1', 'owner-1'),
@@ -268,29 +266,14 @@ test('binds owner identity into topology digests and the overlap challenge', () 
     witness('B', 'turn-2', 'agent-1', 'plan-1', 'item-1', 'owner-2'),
   ]);
 
-  assert.equal(sharedOwner.components[0].overlap.requiresOverlapAck, false);
-  assert.equal(splitOwners.components[0].overlap.requiresOverlapAck, true);
   assert.notEqual(
     sharedOwner.components[0].componentTopologyDigest,
     splitOwners.components[0].componentTopologyDigest,
   );
   assert.notEqual(sharedOwner.inventory.topologyDigest, splitOwners.inventory.topologyDigest);
-  assert.equal(sharedOwner.selectedTopology.requiresOverlapAck, false);
-  assert.deepEqual(sharedOwner.overlapChallengeAtoms, []);
-  assert.equal(splitOwners.selectedTopology.requiresOverlapAck, true);
+  assert.deepEqual(sharedOwner.reviewChallengeAtoms, []);
   assert.equal(splitOwners.ownershipGroupKeys.length, 2);
-  assert.equal(splitOwners.overlapChallengeAtoms.length, 1);
-  const [overlapAtom] = splitOwners.overlapChallengeAtoms;
-  assert.equal(overlapAtom.kind, 'overlap');
-  if (overlapAtom.kind !== 'overlap') throw new Error('expected overlap challenge atom');
-  assert.deepEqual(
-    overlapAtom.ownershipGroupKeys,
-    splitOwners.ownershipGroupKeys,
-  );
-  assert.deepEqual(
-    overlapAtom.contributors,
-    splitOwners.selectedTopology.contributors,
-  );
+  assert.deepEqual(splitOwners.reviewChallengeAtoms, []);
 });
 
 let failures = 0;

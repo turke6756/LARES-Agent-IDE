@@ -19,7 +19,7 @@ export interface ComponentAssembly {
   components: ConflictComponent[];
   selectedTopology: ReviewedAttributionTopology;
   ownershipGroupKeys: string[];
-  overlapChallengeAtoms: ReviewChallengeAtom[];
+  reviewChallengeAtoms: ReviewChallengeAtom[];
 }
 
 interface TopologyContributor {
@@ -212,7 +212,6 @@ function overlapFor(
     contributingAgentCount: agentIds.size,
     mergedGroupCount,
     perPathContributors,
-    requiresOverlapAck: mergedGroupCount >= 2,
   };
 }
 
@@ -268,26 +267,6 @@ function componentEdgesFor(entries: readonly TopologyEntry[]): ReviewedAttributi
   return edges.sort((left, right) =>
     compareStrings(left.leftPathBytesBase64, right.leftPathBytesBase64)
     || compareStrings(left.rightPathBytesBase64, right.rightPathBytesBase64));
-}
-
-function overlapChallengeAtomFor(
-  entries: readonly TopologyEntry[],
-  ownershipGroupKeys: readonly string[],
-): ReviewChallengeAtom {
-  const memberPathBytesBase64 = sortedUnique(entries.map((entry) => entry.pathBytesBase64));
-  const contributors = reviewedContributorsFor(entries);
-  const atomBody = {
-    reasonVersion: 1 as const,
-    memberPathBytesBase64,
-    contributors,
-    ownershipGroupKeys: [...ownershipGroupKeys],
-  };
-  return {
-    kind: 'overlap',
-    atomId: `overlap:${sha256(canonicalize(memberPathBytesBase64))}`,
-    digest: sha256(canonicalize(atomBody)),
-    ...atomBody,
-  };
 }
 
 /**
@@ -383,23 +362,13 @@ export function assembleConflictComponents(
   const ownershipGroupKeys = sortedUnique(components.flatMap(
     (component) => ownershipGroupKeysByComponentId.get(component.componentId)!,
   ));
-  const overlapChallengeAtoms = components
-    .filter((component) => component.overlap.requiresOverlapAck)
-    .map((component) => {
-      const topology = topologyEntriesByComponentId.get(component.componentId)!;
-      return overlapChallengeAtomFor(
-        topology,
-        ownershipGroupKeysByComponentId.get(component.componentId)!,
-      );
-    })
-    .sort((left, right) => compareStrings(left.atomId, right.atomId));
+  const reviewChallengeAtoms: ReviewChallengeAtom[] = [];
   const selectedTopology: ReviewedAttributionTopology = {
     componentPathSets: componentTopologyEntries.map((componentEntries) =>
       sortedUnique(componentEntries.map((entry) => entry.pathBytesBase64))),
     contributors: componentTopologyEntries.flatMap(reviewedContributorsFor),
     ownershipGroupKeys,
     componentEdges: componentTopologyEntries.flatMap(componentEdgesFor),
-    requiresOverlapAck: overlapChallengeAtoms.length > 0,
     selectedUnattributedPathBytesBase64,
   };
 
@@ -413,6 +382,6 @@ export function assembleConflictComponents(
     components,
     selectedTopology,
     ownershipGroupKeys,
-    overlapChallengeAtoms,
+    reviewChallengeAtoms,
   };
 }

@@ -18,6 +18,7 @@ import {
   PLANNING_WORKTREE_MARKER,
   type PlanningGitRunner,
 } from './planning-worktree-service';
+import { recordIntentArchitectureEvent } from './intent-architecture-telemetry';
 
 const OPTS: RunGitOptions = { allowNonzero: true, timeoutMs: 30_000, maxBytes: 1 << 20 };
 
@@ -173,5 +174,9 @@ export async function reconcilePlanningActivityWorktrees(
     }
     results.push({ executionRunId: row.executionRunId, disposition: 'finished', failureCode: null });
   }
+  const recovered = results.filter((result) =>
+    result.disposition === 'removed' || result.disposition === 'recreated'
+    || result.disposition === 'restored' || result.disposition === 'retried').length;
+  if (recovered > 0) recordIntentArchitectureEvent('recovered', recovered);
   return results;
 }

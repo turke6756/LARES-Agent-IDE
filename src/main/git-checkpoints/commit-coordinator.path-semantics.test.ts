@@ -191,7 +191,6 @@ async function preview(root: string, inputs: MemberInput[], tokenId = 'token-pat
         selectedComponentIds: [...candidate.componentIds],
         selectedUnattributedEntryIds: [],
         finalizationIds: ['fin-paths'],
-        acknowledgeTopologyDigest: 'topology-paths',
         acknowledgeUnattributedEntryIds: [],
       },
       componentTopologyDigest: 'topology-paths',
@@ -263,6 +262,7 @@ async function actualRepresentation(input: ReadMemberRepresentationInput): Promi
 function harness(pre: Preview, tokens: CoordinatorTokenStore = new TokenStore(pre.snapshot)) {
   const attempts = new AttemptStore();
   const coordinator = new CommitCoordinator({
+    contractVersion: pre.snapshot.candidate.contractVersion,
     composeLocks: new ComposeLockRegistry(),
     queue: new CheckpointQueue(),
     tokens,
@@ -272,6 +272,10 @@ function harness(pre: Preview, tokens: CoordinatorTokenStore = new TokenStore(pr
     reassemble: async () => live(pre),
     readMemberRepresentation: actualRepresentation,
     locateRepository: () => ({ repoRoot: pre.root, gitExe: EXE }),
+    resolveCandidateCommitPolicy: async () => ({
+      validation: { enabled: false, commands: [], timeoutMs: 0 },
+      signing: { enabled: false, signingKey: null },
+    }),
     newAttemptId: () => 'path-attempt',
   });
   return { coordinator, attempts };

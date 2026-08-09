@@ -127,7 +127,6 @@ export interface ImplementPlanDeps {
   now?: () => number;
   /** Test seam for the one shared post-refresh readiness interpretation. */
   refreshAndGetReadiness?: typeof refreshAndGetPlanReadiness;
-  intentPackaging?: boolean;
   appUserDataPath?: string;
   provisionActivity?: typeof provisionPlanningActivity;
 }
@@ -329,13 +328,9 @@ export async function implementPlan(
   const getReadiness = deps.refreshAndGetReadiness ?? refreshAndGetPlanReadiness;
   const resolveRepoContext = deps.resolveRepoContext ?? defaultResolveRepoContext;
   const probeBaseline = deps.probeBaseline ?? ((ctx) => probePlanBaseline(ctx));
-  const createBaselineRef =
-    deps.createBaselineRef ??
-    ((ctx, ref, oid) => forceCreatePlanBaselineRef({ ...ctx, ref, oid }));
   const insertRun = deps.insertRun ?? insertPlanExecutionRunActivating;
   const newRunId = deps.newRunId ?? uuidv4;
   const now = deps.now ?? Date.now;
-  const intentPackaging = deps.intentPackaging ?? process.env.LARES_INTENT_PACKAGING === '1';
 
   const failures: ImplementFailure[] = [];
   let tabsMissingOverview: PlanTabKey[] = [];
@@ -378,7 +373,7 @@ export async function implementPlan(
 
   // ── pin the baseline: create ref BEFORE the run row (head only) ───────────────
   const runId = newRunId();
-  if (intentPackaging) {
+  {
     if (probe.kind === 'unborn') {
       failures.push('worktree-requires-initial-commit');
       return fail();
@@ -433,45 +428,9 @@ export async function implementPlan(
     return { ok: true, run: activatedRun, failures: [], tabsMissingOverview: [] };
   }
 
-  let baselineKind: PlanBaselineKind;
-  let baselineHeadOid: string | null = null;
-  let baselineRef: string | null = null;
-  if (probe.kind === 'head') {
-    baselineKind = 'head';
-    baselineHeadOid = probe.headOid;
-    baselineRef = planBaselineRef(plan.id, runId);
-    const created = await createBaselineRef(ctx, baselineRef, probe.headOid);
-    if (!created.ok) {
-      failures.push('baseline-ref-failed');
-      return fail();
-    }
-  } else {
-    // Unborn HEAD: explicit marker, no OID, no ref.
-    baselineKind = 'unborn';
-  }
-
   // ── activate: insert run row + flip run_state ready→executing (one txn) ───────
   // A throw here leaves the (already-created) head ref an ORPHAN for startup
   // reconciliation — never an executing plan without a run row.
-  let run: PlanExecutionRun;
-  try {
-    run = insertRun({
-      id: runId,
-      planId: plan.id,
-      repositoryKey: ctx.repositoryKey,
-      baselineKind,
-      baselineHeadOid,
-      baselineRef,
-      triggerSource: IMPLEMENT_TRIGGER_SOURCE,
-      appUserId: input.appUserId,
-      triggeredAt: now(),
-    });
-  } catch {
-    failures.push('run-persist-failed');
-    return fail();
-  }
-
-  return { ok: true, run, failures: [], tabsMissingOverview: [] };
 }
 
 // ── IPC wiring: renderer-only, human-gesture Implement channel ─────────────────

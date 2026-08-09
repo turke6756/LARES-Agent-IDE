@@ -8,8 +8,6 @@ const refusalVectors: SaveRefusal[] = [
   { stage: 'boundary-capture', code: 'boundary-capture-failed', message: 'Pin stage rejected a foreign candidate.' },
   { stage: 'freeze', code: 'freeze-boundary-unavailable', message: 'Re-pin the token.' },
   { stage: 'preview-verify', code: 'preview-ineligible', message: 'Candidate pin moved.' },
-  { stage: 'mint', code: 'overlap-ack-missing', message: "Review another agent's foreign token." },
-  { stage: 'mint', code: 'overlap-ack-stale', message: 'The foreign candidate changed.' },
   { stage: 'mint', code: 'unattributed-ack-incomplete', message: 'Mint token missing.' },
   { stage: 'mint', code: 'unattributed-ack-stale', message: 'Pinned candidate changed.' },
   { stage: 'mint', code: 'candidate-ack-stale', message: 'Candidate pin changed.' },
@@ -30,18 +28,16 @@ describe('save refusal copy', () => {
     }
   });
 
-  it('describes overlap truthfully as multi-owner or unattributed work', () => {
-    const overlapVectors = refusalVectors.filter((refusal) => [
-      'overlap-ack-missing',
-      'overlap-ack-stale',
+  it('describes unattributed acknowledgement refusals truthfully', () => {
+    const acknowledgementVectors = refusalVectors.filter((refusal) => [
       'unattributed-ack-incomplete',
       'unattributed-ack-stale',
       'acknowledgement-stale',
     ].includes(refusal.code));
 
-    for (const refusal of overlapVectors) {
+    for (const refusal of acknowledgementVectors) {
       const copy = renderSaveRefusal(refusal);
-      expect(copy).toMatch(/multi-owner|unattributed work/i);
+      expect(copy).toMatch(/unattributed work/i);
       expect(copy).not.toMatch(/another agent's|foreign/i);
     }
   });

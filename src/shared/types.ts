@@ -406,7 +406,7 @@ export interface PlanListItem extends Plan {
   snippet: string | null;
 }
 
-// Planning-surface mechanics WP-D6 â€” SQLite-only execution-ledger projection.
+// Planning-surface mechanics WP-D6 — SQLite-only execution-ledger projection.
 export const PLAN_LEDGER_PROJECTION_CHANNEL = 'plan:ledgerProjection' as const;
 
 export type PlanLedgerBindingState = 'bound' | 'legacy-unbound' | 'quarantined';
@@ -2146,18 +2146,6 @@ export interface SaveCardInventoryRequest {
 export interface SaveCardAdoptBaselineRequest { workspaceId: string; }
 export interface SaveCardAdoptBaselineResponse { intentId: string; title: string; memberCount: number; }
 
-/** Human identity attached by the main-process Save-card DB adapter. */
-export interface SaveCardBundleIdentity {
-  groupingKey: string;
-  source: 'supervisor' | 'agent' | 'mixed';
-  agentId: string | null;
-  name: string;
-  roleDescription: string;
-  startedAt: number | null;
-  endedAt: number | null;
-  workerUnits: SaveCardWorkerUnit[];
-}
-
 /** A contributing agent shown inside its supervisor-unit package. */
 export interface SaveCardWorkerUnit {
   agentId: string | null;
@@ -2182,25 +2170,9 @@ export type SaveCardPackageSaveability =
       refusal: import('./commit-candidates').SaveRefusal;
     };
 
-/** One renderer-safe WorkBundle DTO element returned by the read-only service. */
-export interface SaveCardBundle {
-  bundleId: string;
-  kind: 'component' | 'unattributed';
-  label: string;
-  labels: string[];
-  repositoryKey: string;
-  workspaces: Array<{ workspaceId: string; workspacePrefix: string }>;
-  component: import('./commit-candidates').ConflictComponent | null;
-  members: Array<{
-    entry: import('./commit-candidates').DirtyEntry;
-    protection: import('./commit-candidates').ProtectionRung;
-  }>;
-  captureHealth: import('./commit-candidates').BundleCaptureHealth;
-  weakestProtection: import('./commit-candidates').ProtectionRung | null;
-  identity: SaveCardBundleIdentity | null;
-  /** Present on production Save inventory DTOs. Optional for older main-only
-   *  projections that reuse this renderer-safe shape outside the Save pane. */
-  saveability?: SaveCardPackageSaveability;
+export interface SaveCardMemberDto {
+  entry: import('./commit-candidates').DirtyEntry;
+  protection: import('./commit-candidates').ProtectionRung;
 }
 
 /** Intent-first Save-card projection. Topology is disclosure evidence only. */
@@ -2220,7 +2192,7 @@ export interface SaveIntentUnitDto {
   state: SaveIntentState;
   plan: { id: string; title: string } | null;
   planItem: { id: string; title: string } | null;
-  members: SaveCardBundle['members'];
+  members: SaveCardMemberDto[];
   contributors: SaveCardWorkerUnit[];
   topologyEvidence: {
     componentIds: string[];
@@ -2254,18 +2226,28 @@ export interface SaveCardPlanningActivityDto {
   failureCode: string | null;
 }
 
+/** Legacy v1 package boundaries remain visible after the intent cutover, but
+ * are deliberately read-only: component selection identity is not reconstructed. */
+export interface SaveCardLegacyFinalizationDto {
+  finalizationId: string;
+  packageId: string;
+  packageRevision: number;
+  finalizationKind: 'plan-package' | 'fleet-adhoc';
+  boundaryStatus: string;
+  finalizedAt: number;
+}
+
 /**
- * Read-only Save-card inventory response. Carries the renderer-safe WorkBundle
- * DTOs plus the SC-WP-2L retention quota-weakening warning (null unless the pin
+ * Read-only Save-card inventory response. Carries renderer-safe intent units
+ * plus the SC-WP-2L retention quota-weakening warning (null unless the pin
  * quota is forcing the release of a still-dirty recovery edge).
  */
 export interface SaveCardInventoryResponse {
-  bundles: SaveCardBundle[];
-  /** Staged beside bundles while intentPackaging is enabled. */
-  intentUnits?: SaveIntentUnitDto[];
-  unwitnessed?: SaveCardBundle['members'];
-  legacyTaskIdentityUnavailable?: SaveCardBundle['members'];
-  planningActivities?: SaveCardPlanningActivityDto[];
+  intentUnits: SaveIntentUnitDto[];
+  unwitnessed: SaveCardMemberDto[];
+  legacyTaskIdentityUnavailable: SaveCardMemberDto[];
+  legacyFinalizations: SaveCardLegacyFinalizationDto[];
+  planningActivities: SaveCardPlanningActivityDto[];
   quotaWeakening: import('./commit-candidates').SaveCardQuotaWeakening | null;
 }
 
@@ -2343,8 +2325,11 @@ export const SAVECARD_ATTRIBUTION_RESOLUTION_CHANNEL = 'savecard:resolveAttribut
  *  `SelectionPreview`, never a committable candidate). */
 export interface SaveCardPreviewRequest {
   workspaceId: string;
-  selectedComponentIds: string[];
-  selectedUnattributedEntryIds: string[];
+  selectedComponentIds?: string[];
+  selectedUnattributedEntryIds?: string[];
+  selectedIntentIds?: string[];
+  selectedNamedSaveSetIds?: string[];
+  resolutionIds?: string[];
   finalizationIds: string[];
   /** Optional prior main-issued review identity used by a fresh carry check. */
   reviewedManifestDigest?: string;
@@ -2427,7 +2412,6 @@ export interface SaveCardPreviewResponse {
   defaultMessageBody: string;
   /** True when any selected component fused ≥2 owners/plans and needs an overlap
    *  acknowledgement before a one-click save (renderer-side ack gate). */
-  requiresOverlapAck: boolean;
   /** Selected unattributed entry ids that each need an individual acknowledgement
    *  before a one-click save (renderer-side ack gate). */
   unacknowledgedUnattributedEntryIds: string[];

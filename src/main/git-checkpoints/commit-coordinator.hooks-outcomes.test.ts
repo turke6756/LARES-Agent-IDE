@@ -164,7 +164,6 @@ async function preview(root: string, tokenId = 'token-1', candidateId = 'candida
         selectedComponentIds: ['component-hooks'],
         selectedUnattributedEntryIds: [],
         finalizationIds: ['fin-1'],
-        acknowledgeTopologyDigest: 'topology-hooks',
         acknowledgeUnattributedEntryIds: [],
       },
       componentTopologyDigest: 'topology-hooks',
@@ -268,6 +267,7 @@ function harness(pre: Preview, options: HarnessOptions = {}) {
     runGit(cwd, args, { ...opts, gitExe: EXE });
   const delegatedRunGit = options.runGit ?? baseRunGit;
   const coordinator = new CommitCoordinator({
+    contractVersion: pre.snapshot.candidate.contractVersion,
     composeLocks: new ComposeLockRegistry(),
     queue: new CheckpointQueue(),
     tokens,
@@ -280,6 +280,10 @@ function harness(pre: Preview, options: HarnessOptions = {}) {
     reassemble: async (snapshot) => live(snapshot),
     readMemberRepresentation: actualRepresentation,
     locateRepository: () => ({ repoRoot: pre.root, gitExe: EXE }),
+    resolveCandidateCommitPolicy: async () => ({
+      validation: { enabled: false, commands: [], timeoutMs: 0 },
+      signing: { enabled: false, signingKey: null },
+    }),
     newAttemptId: options.newAttemptId ?? (() => `hooks-attempt-${++attemptSequence}`),
   });
   return { coordinator, tokens, attempts, commands, baseRunGit };

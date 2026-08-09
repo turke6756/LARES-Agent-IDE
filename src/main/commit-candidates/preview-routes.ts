@@ -32,6 +32,7 @@ import type { GitCapability, SaveCardMintRequestV2, SaveCardPreviewRequest, Save
 import type { PlanCandidatePreviewRequest } from '../../shared/types';
 import type { DirtyEntry, WitnessedCommitProvenance } from '../../shared/commit-candidates';
 import { BUNDLE_CONTRACT_VERSION } from '../../shared/constants';
+import { recordIntentArchitectureEvent } from '../git-checkpoints/intent-architecture-telemetry';
 import {
   getWorkspaces as dbGetWorkspaces,
   getTurnRecord as dbGetTurnRecord,
@@ -141,6 +142,10 @@ export interface PreviewRoutesDeps {
    *  unlike the path-scoped `readCommitPathLinks` the service uses internally). */
   listRepoCommitPathLinks?: (repositoryKey: string) => readonly CandidateLedgerLink[];
   readActiveFinalizations?: (repositoryKey: string) => readonly PackageFinalization[];
+  readActivePlanningWorktrees?: import('./candidate-service').CandidateServiceDeps['readActivePlanningWorktrees'];
+  listSaveIntents?: import('./candidate-service').CandidateServiceDeps['listSaveIntents'];
+  listNamedSaveSetMembers?: import('./candidate-service').CandidateServiceDeps['listNamedSaveSetMembers'];
+  getPlan?: import('./candidate-service').CandidateServiceDeps['getPlan'];
   getPackageFinalization?: (id: string) => PackageFinalization | null;
   getPlanWorkPackage?: (id: string) => PlanWorkPackage | null;
   listPlanWorkPackagePaths?: (id: string) => PlanWorkPackagePath[];
@@ -260,6 +265,11 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     readWitnessedProvenance,
     readCommitPathLinks,
     readActiveFinalizations: deps.readActiveFinalizations ?? dbListActivePackageFinalizationsForRepository,
+    readActivePlanningWorktrees: deps.readActivePlanningWorktrees,
+    listSaveIntents: deps.listSaveIntents,
+    listNamedSaveSetMembers: deps.listNamedSaveSetMembers,
+    getPlan: deps.getPlan,
+    getPlanItem: deps.getPlanWorkPackage,
     tokenStore: { composeLocks },
   });
   const assembleInventory = deps.assembleInventory
@@ -445,9 +455,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   ): Promise<CandidateBuildContext> {
     const finalizations = [...new Set(finalizationIds)]
       .map((id) => getPackageFinalization(id)
-        ?? (process.env.LARES_INTENT_PACKAGING === '1'
-          ? (() => { const row = dbGetSaveIntentFinalization(id); return row ? adaptIntentFinalization(row) : null; })()
-          : null))
+        ?? (() => { const row = dbGetSaveIntentFinalization(id); return row ? adaptIntentFinalization(row) : null; })())
       .filter((f): f is PackageFinalization => f !== null);
     const effectiveMembers = finalizationIds.length === 0
       ? selectionMembers(scope, selectedComponentIds, selectedUnattributedEntryIds)
@@ -471,41 +479,30 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
   const saveCardPreviewRoutes: SaveCardPreviewRoutes = {
     async resolvePreviewContext(req: SaveCardPreviewRequest): Promise<CandidateBuildContext> {
       const scope = await assembleScope(req.workspaceId);
+      const selectedIds = new Set([
+        ...(req.selectedIntentIds ?? []),
+        ...(req.selectedNamedSaveSetIds ?? []),
+      ]);
+      const selectedUnits = (scope.context.intentUnits ?? []).filter((unit) => selectedIds.has(unit.intentId));
+      const selectedMemberIds = new Set(selectedUnits.flatMap((unit) => unit.memberEntryIds));
       return buildContext(
         scope,
-        req.selectedComponentIds,
-        req.selectedUnattributedEntryIds,
+        selectedUnits.length > 0
+          ? scope.context.components.filter((component) =>
+              component.dirtyEntryIds.some((entryId) => selectedMemberIds.has(entryId)))
+            .map((component) => component.componentId)
+          : req.selectedComponentIds ?? [],
+        selectedUnits.length > 0
+          ? scope.context.inventory.unattributedEntryIds.filter((entryId) => selectedMemberIds.has(entryId))
+          : req.selectedUnattributedEntryIds ?? [],
         req.finalizationIds,
       );
     },
   };
   const saveCardMintRoutes = {
-    async mintCandidate(req: SaveCardMintRequestV2 | import('../../shared/types').LegacySaveCardMintRequest) {
+    async mintCandidate(req: SaveCardMintRequestV2) {
       const scope = await assembleScope(req.workspaceId);
-      if (process.env.LARES_INTENT_PACKAGING !== '1') {
-        if (!('selectedComponentIds' in req)) throw new Error('intent packaging is disabled');
-        const context = await buildContext(
-          scope,
-          req.selectedComponentIds,
-          req.selectedUnattributedEntryIds,
-          req.finalizationIds,
-        );
-        const candidate = service.mintCandidateToken({
-          selectedComponentIds: req.selectedComponentIds,
-          selectedUnattributedEntryIds: req.selectedUnattributedEntryIds,
-          finalizationIds: req.finalizationIds,
-          acknowledgeUnattributedEntryIds: req.acknowledgeUnattributedEntryIds,
-          ...(req.reviewedManifestDigest !== undefined
-            ? { reviewedManifestDigest: req.reviewedManifestDigest }
-            : {}),
-          ...(req.acknowledgedChallengeAtoms !== undefined
-            ? { acknowledgedChallengeAtoms: req.acknowledgedChallengeAtoms }
-            : {}),
-        }, context);
-        return { candidate, context };
-      }
-      if (!('selectedIntentIds' in req)) throw new Error('intent packaging requires a v2 mint request');
-      const v2Request = req as SaveCardMintRequestV2;
+      const v2Request = req;
       const selectedIds = new Set([...v2Request.selectedIntentIds, ...v2Request.selectedNamedSaveSetIds]);
       const selectedUnits = (scope.context.intentUnits ?? []).filter((unit) => selectedIds.has(unit.intentId));
       if (selectedUnits.length !== selectedIds.size) throw new Error('selected save intent is stale or unknown');
@@ -1037,9 +1034,6 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
     async persistAttributionResolution(
       request: SaveCardAttributionResolutionRequest,
     ): Promise<SaveCardAttributionResolutionResponse> {
-      if (process.env.LARES_INTENT_PACKAGING !== '1') {
-        throw new Error('intent-first candidate packaging is disabled');
-      }
       const scope = await assembleScope(request.workspaceId);
       const atom = reviewChallengeAtomsForInventory(scope.context.inventory).find((candidate) =>
         isCrossIntentAtom(candidate)
@@ -1061,6 +1055,7 @@ export function createPreviewRoutes(deps: PreviewRoutesDeps): {
           ? atom.earlierIntentId : null,
         restoreTurnId: null, consumedByCandidateId: null,
       });
+      recordIntentArchitectureEvent('resolved');
       return { resolutionId: row.id, evidenceDigest: row.evidenceDigest, resolution: row.resolution };
     },
   };

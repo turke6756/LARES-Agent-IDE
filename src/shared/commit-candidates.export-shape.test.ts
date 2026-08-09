@@ -97,7 +97,6 @@ type ExportShapes = [
       agentIds: string[];
       planIds: (string | null)[];
     }>;
-    requiresOverlapAck: boolean;
   }>>,
   Assert<Equal<CommitCandidate, {
     candidateId: string;
@@ -146,10 +145,9 @@ type ExportShapes = [
         eligible: false;
         reason:
           'byte-mismatch' | 'package-not-finalized' | 'checkpoint-unavailable'
-          | 'component-subset-not-allowed'
           | 'finalization-conflict' | 'extraneous-finalization'
           | 'intent-revision-stale' | 'resolution-required' | 'resolution-stale'
-          | 'unattributed-not-acknowledged' | 'overlap-not-acknowledged'
+          | 'unattributed-not-acknowledged'
           | 'compose-in-flight' | 'unsupported-git-state';
       }>>,
   Assert<Equal<FinalizationMemberDisposition,

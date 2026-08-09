@@ -93,7 +93,6 @@ function manifest(): ReviewedSemanticManifest {
       contributors: [contributor],
       ownershipGroupKeys: ['["owner-1","plan-1","item-1"]'],
       componentEdges: [],
-      requiresOverlapAck: false,
       selectedUnattributedPathBytesBase64: [],
     },
     closureObligations: [],

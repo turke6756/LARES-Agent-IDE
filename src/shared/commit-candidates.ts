@@ -119,7 +119,6 @@ export interface BundleOverlap {
     agentIds: string[];
     planIds: (string | null)[];
   }>;
-  requiresOverlapAck: boolean;
 }
 
 export interface CommitCandidate {
@@ -239,7 +238,6 @@ export interface ReviewedAttributionTopology {
   contributors: AttributionContributor[];
   ownershipGroupKeys: string[];
   componentEdges: AttributionComponentEdge[];
-  requiresOverlapAck: boolean;
   selectedUnattributedPathBytesBase64: string[];
 }
 
@@ -277,17 +275,6 @@ export type ReviewChallengeAtom =
       digest: string;
       pathBytesBase64: string;
       memberEffectDigest: string;
-    }
-  | {
-      /** Read-only v1 adapter. New manifests never emit this topology atom. */
-      kind: string;
-      atomId: string;
-      digest: string;
-      reasonVersion: 1;
-      pathBytesBase64?: undefined;
-      memberPathBytesBase64: string[];
-      contributors: AttributionContributor[];
-      ownershipGroupKeys: string[];
     }
   | CrossIntentChallengeAtom;
 
@@ -467,14 +454,7 @@ export function normalizeReviewedSemanticManifest<T extends AnyReviewedSemanticM
         sortedStrings(manifest.attributionTopology.selectedUnattributedPathBytesBase64),
     },
     closureObligations: sortedByJcs(manifest.closureObligations),
-    challengeAtoms: sortedByJcs(manifest.challengeAtoms.map((atom) => 'memberPathBytesBase64' in atom
-      ? {
-          ...atom,
-          memberPathBytesBase64: sortedStrings(atom.memberPathBytesBase64),
-          contributors: sortedByJcs(atom.contributors),
-          ownershipGroupKeys: [...atom.ownershipGroupKeys].sort(),
-        }
-      : { ...atom })),
+    challengeAtoms: sortedByJcs(manifest.challengeAtoms.map((atom) => ({ ...atom }))),
     ...('saveIntents' in manifest ? {
       saveIntents: sortedByJcs(manifest.saveIntents),
       attributionResolutions: sortedByJcs(manifest.attributionResolutions.map((resolution) => ({
@@ -508,10 +488,9 @@ export type CommitEligibility =
       eligible: false;
       reason:
         'byte-mismatch' | 'package-not-finalized' | 'checkpoint-unavailable'
-        | 'component-subset-not-allowed'
         | 'finalization-conflict' | 'extraneous-finalization'
         | 'intent-revision-stale' | 'resolution-required' | 'resolution-stale'
-        | 'unattributed-not-acknowledged' | 'overlap-not-acknowledged'
+        | 'unattributed-not-acknowledged'
         | 'compose-in-flight' | 'unsupported-git-state';
     };
 

@@ -76,7 +76,6 @@ function response(over: Partial<SaveCardPreviewResponse> = {}): SaveCardPreviewR
     isCandidate: true,
     laresTrailers: ['Lares-Turns: 2', 'Lares-Plan: plan-A'],
     defaultMessageBody: 'Save 1 file',
-    requiresOverlapAck: false,
     unacknowledgedUnattributedEntryIds: [],
     componentTopologyDigest: 'topo-1',
     selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [] },
@@ -260,11 +259,7 @@ describe('CandidatePreview', () => {
     expect((q('candidate-preview-save') as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('gates one-click save behind the overlap and unattributed acknowledgements', async () => {
-    const overlapAtom: ReviewChallengeAtom = {
-      kind: 'overlap', atomId: 'overlap-1', digest: 'overlap-digest', reasonVersion: 1,
-      memberPathBytesBase64: ['b64-e1'], contributors: [], ownershipGroupKeys: ['owner-1'],
-    };
+  it('gates one-click save behind unattributed acknowledgement', async () => {
     const unattributedAtom: ReviewChallengeAtom = {
       kind: 'unattributed', atomId: 'unattributed-1', digest: 'unattributed-digest',
       pathBytesBase64: 'b64-eu', memberEffectDigest: 'effect-eu',
@@ -273,20 +268,14 @@ describe('CandidatePreview', () => {
       candidate: candidate({ eligible: true }, [
         member('e1', 'verified-match'), member('eu', 'verified-match'),
       ]),
-      requiresOverlapAck: true,
       unacknowledgedUnattributedEntryIds: ['eu'],
       reviewedManifest: {
-        ...response().reviewedManifest!, challengeAtoms: [overlapAtom, unattributedAtom],
+        ...response().reviewedManifest!, challengeAtoms: [unattributedAtom],
       },
     }));
     await render();
 
     const save = () => q('candidate-preview-save') as HTMLButtonElement;
-    expect(save().disabled).toBe(true);
-
-    const overlap = q('candidate-preview-overlap-ack')!.querySelector('input') as HTMLInputElement;
-    await act(async () => { overlap.click(); });
-    // Still blocked: the unattributed entry is not yet acknowledged.
     expect(save().disabled).toBe(true);
 
     const unattr = q('candidate-preview-unattributed-ack')!.querySelector('input') as HTMLInputElement;
@@ -359,11 +348,7 @@ describe('CandidatePreview', () => {
     expect((rows[1].querySelector('input') as HTMLInputElement).checked).toBe(true);
   });
 
-  it('retains only acknowledgements whose atom id and digest are unchanged', async () => {
-    const overlapAtom: ReviewChallengeAtom = {
-      kind: 'overlap', atomId: 'overlap-1', digest: 'overlap-digest', reasonVersion: 1,
-      memberPathBytesBase64: ['b64-e1'], contributors: [], ownershipGroupKeys: ['owner-1'],
-    };
+  it('drops an acknowledgement when its atom digest changes', async () => {
     const unattributedAtom: ReviewChallengeAtom = {
       kind: 'unattributed', atomId: 'unattributed-1', digest: 'unattributed-old',
       pathBytesBase64: 'b64-eu', memberEffectDigest: 'effect-eu',
@@ -372,28 +357,26 @@ describe('CandidatePreview', () => {
       member('e1', 'verified-match'), member('eu', 'verified-match'),
     ]);
     const first = response({
-      candidate: candidateWithUnattributed, requiresOverlapAck: true,
+      candidate: candidateWithUnattributed,
       unacknowledgedUnattributedEntryIds: ['eu'],
-      reviewedManifest: { ...response().reviewedManifest!, challengeAtoms: [overlapAtom, unattributedAtom] },
+      reviewedManifest: { ...response().reviewedManifest!, challengeAtoms: [unattributedAtom] },
     });
     await render({ authoritativeResponse: first });
     await act(async () => {
-      (q('candidate-preview-overlap-ack')!.querySelector('input') as HTMLInputElement).click();
       (q('candidate-preview-unattributed-ack')!.querySelector('input') as HTMLInputElement).click();
     });
 
     const changedUnattributed = { ...unattributedAtom, digest: 'unattributed-new' };
     const second = response({
-      candidate: candidateWithUnattributed, requiresOverlapAck: true,
+      candidate: candidateWithUnattributed,
       unacknowledgedUnattributedEntryIds: ['eu'],
       reviewedManifest: {
         ...response().reviewedManifest!, reviewedManifestDigest: 'review-2',
-        challengeAtoms: [overlapAtom, changedUnattributed],
+        challengeAtoms: [changedUnattributed],
       },
     });
     await render({ authoritativeResponse: second });
 
-    expect((q('candidate-preview-overlap-ack')!.querySelector('input') as HTMLInputElement).checked).toBe(true);
     expect((q('candidate-preview-unattributed-ack')!.querySelector('input') as HTMLInputElement).checked).toBe(false);
   });
 
@@ -405,7 +388,10 @@ describe('CandidatePreview', () => {
 
   it('fires onCommit only when eligible and acknowledged', async () => {
     const onCommit = vi.fn();
-    useSaveCardStore.getState().cacheInventory('ws-1', { bundles: [], quotaWeakening: null });
+    useSaveCardStore.getState().cacheInventory('ws-1', {
+      intentUnits: [], unwitnessed: [], legacyTaskIdentityUnavailable: [],
+      legacyFinalizations: [], planningActivities: [], quotaWeakening: null,
+    });
     preview.mockResolvedValue(response());
     await render({ onCommit });
 

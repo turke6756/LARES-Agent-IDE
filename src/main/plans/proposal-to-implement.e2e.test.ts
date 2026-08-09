@@ -256,7 +256,7 @@ test('one reconciliation migrates an exact v3-era workspace and provisions the p
   ], 4);
 });
 
-test('post-split promotion fixture reaches exactly one Implement run through real reconciliation', async () => {
+test('post-split promotion fixture refuses Implement on an unborn repository without inventing a run', async () => {
   const db = require('../database') as typeof import('../database');
   const { ProposalsWatcher } = require('../proposals-watcher') as typeof import('../proposals-watcher');
   const { PlanFolderWatcher } = require('./plan-folder-watcher') as typeof import('./plan-folder-watcher');
@@ -429,18 +429,12 @@ test('post-split promotion fixture reaches exactly one Implement run through rea
     newRunId: () => 'run-wp-z-fixture',
     now: () => 1_775_649_700_000,
   });
-  assert.equal(implemented.ok, true, JSON.stringify(implemented));
-  assert.equal(db.getPlan(planId)?.runState, 'executing');
-  assert.equal(db.getActivePlanExecutionRun(planId)?.id, 'run-wp-z-fixture');
-  const second = await implementPlan({ planId, appUserId: 'workspace-owner' }, {
-    refreshAndGetReadiness: readiness,
-    resolveRepoContext: async () => ({ repoRoot: workspaceRoot, repositoryKey: 'fixture-repo' }),
-    probeBaseline: async () => ({ ok: true, kind: 'unborn' }),
-    newRunId: () => 'run-wp-z-duplicate',
-  });
-  assert.equal(second.ok, false);
+  assert.equal(implemented.ok, false, JSON.stringify(implemented));
+  assert.deepEqual(implemented.failures, ['worktree-requires-initial-commit']);
+  assert.equal(db.getPlan(planId)?.runState, 'ready');
+  assert.equal(db.getActivePlanExecutionRun(planId), null);
   assert.equal((db.getDb().prepare('SELECT COUNT(*) AS n FROM plan_execution_runs WHERE plan_id = ?')
-    .get(planId) as { n: number }).n, 1, 'Implement creates exactly one active execution run');
+    .get(planId) as { n: number }).n, 0, 'refused Implement creates no execution run');
 });
 
 (async () => {

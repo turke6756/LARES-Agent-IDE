@@ -13,7 +13,7 @@ import type {
   DirtyEntry,
   SelectionPreview,
 } from '../../shared/commit-candidates';
-import type { SaveCardBundle } from '../../shared/types';
+import type { SaveIntentUnitDto } from '../../shared/types';
 import type { MissionBoardPlanEvidence } from './mission-board-evidence';
 import { projectPlanReview, readPlanReviewBaselineDiff } from './plan-review-projection';
 
@@ -71,11 +71,11 @@ const cleanHealth: BundleCaptureHealth = {
   turns: [], captureOutage: false, pathsWithoutFinalizationEdge: [],
 };
 
-function componentBundle(
+function intentEvidence(
   componentId: string,
   entries: DirtyEntry[],
   captureHealth: BundleCaptureHealth = cleanHealth,
-): SaveCardBundle {
+): { unit: SaveIntentUnitDto; component: ConflictComponent; health: BundleCaptureHealth } {
   const component: ConflictComponent = {
     componentId,
     dirtyEntryIds: entries.map((value) => value.entryId),
@@ -88,23 +88,17 @@ function componentBundle(
       contributingAgentCount: 2,
       mergedGroupCount: 1,
       perPathContributors: {},
-      requiresOverlapAck: true,
     },
     componentTopologyDigest: 'topology-1',
   };
-  return {
-    bundleId: componentId,
-    kind: 'component',
-    label: 'cross-plan',
-    labels: ['Plan plan-a', 'Plan plan-b'],
-    repositoryKey: 'repo-1',
-    workspaces: [{ workspaceId: 'ws-1', workspacePrefix: 'pkg' }],
-    component,
+  return { component, health: captureHealth, unit: {
+    intentId: 'intent-plan-a', kind: 'task', title: 'Plan task', state: 'open',
+    plan: { id: 'plan-a', title: 'Plan A' }, planItem: { id: 'pkg-a', title: 'Package A' },
     members: entries.map((value) => ({ entry: value, protection: 'checkpoint-protected' })),
-    captureHealth,
-    weakestProtection: 'checkpoint-protected',
-    identity: null,
-  };
+    contributors: [],
+    topologyEvidence: { componentIds: [componentId], pathsWithMultipleTurns: [], captureHealth },
+    concurrencyCases: [], saveability: { saveable: true },
+  } };
 }
 
 function run(baselineKind: PlanExecutionRun['baselineKind'] = 'head'): PlanExecutionRun {
@@ -169,12 +163,14 @@ test('embeds the unchanged SC candidate, renders baseline diff + honest annotati
     captureOutage: true,
     pathsWithoutFinalizationEdge: ['e2'],
   };
-  const bundle = componentBundle('c-cross', entries, captureHealth);
+  const intent = intentEvidence('c-cross', entries, captureHealth);
   const scObject = candidate(entries);
   const calls: string[][] = [];
   const projection = await projectPlanReview({
     workspaceId: 'ws-1', planId: 'plan-a', repoRoot: 'C:/repo', workspacePrefix: 'pkg',
-    executionRun: run(), evidence: evidence(), scObject, scBundles: [bundle],
+    executionRun: run(), evidence: evidence(), scObject,
+    intentUnits: [intent.unit], topologyComponents: [intent.component],
+    captureHealthByComponentId: { 'c-cross': intent.health },
   }, { runGit: gitFake(calls) });
 
   assert.strictEqual(projection.scObject, scObject, 'the SC object is embedded verbatim');
@@ -213,14 +209,14 @@ test('an unborn run diffs from the empty tree and preserves a SelectionPreview w
       checkpointMode: null, coveringFinalizationIds: [], packageVerification: 'package-not-finalized' }],
     eligibility: { eligible: false, reason: 'package-not-finalized' },
   };
-  const bundle = componentBundle('c-cross', [value]);
+  const intent = intentEvidence('c-cross', [value]);
   // Keep this fixture single-plan so it describes a valid whole component.
-  bundle.component!.associations = [bundle.component!.associations[0]];
-  bundle.component!.overlap.contributingAgentCount = 1;
+  intent.component.associations = [intent.component.associations[0]];
+  intent.component.overlap.contributingAgentCount = 1;
   const calls: string[][] = [];
   const diff = await readPlanReviewBaselineDiff({
     repoRoot: 'C:/repo', workspacePrefix: 'pkg', executionRun: run('unborn'),
-    evidence: evidence(), scBundles: [bundle],
+    evidence: evidence(), intentUnits: [intent.unit],
   }, { runGit: gitFake(calls) });
   assert.deepEqual(diff.baseline, { kind: 'unborn' });
   assert.deepEqual(calls[0], ['hash-object', '-t', 'tree', '--stdin']);
@@ -228,7 +224,9 @@ test('an unborn run diffs from the empty tree and preserves a SelectionPreview w
 
   const projection = await projectPlanReview({
     workspaceId: 'ws-1', planId: 'plan-a', repoRoot: 'C:/repo', workspacePrefix: 'pkg',
-    executionRun: run('unborn'), evidence: evidence(), scObject: preview, scBundles: [bundle],
+    executionRun: run('unborn'), evidence: evidence(), scObject: preview,
+    intentUnits: [intent.unit], topologyComponents: [intent.component],
+    captureHealthByComponentId: { 'c-cross': intent.health },
   }, { runGit: gitFake([]) });
   assert.strictEqual(projection.scObject, preview);
   assert.equal('candidateId' in projection.scObject, false);
@@ -241,7 +239,11 @@ test('rejects a carved sub-candidate instead of splitting a cross-plan component
   await assert.rejects(() => projectPlanReview({
     workspaceId: 'ws-1', planId: 'plan-a', repoRoot: 'C:/repo', workspacePrefix: 'pkg',
     executionRun: run(), evidence: evidence(), scObject: carved,
-    scBundles: [componentBundle('c-cross', entries)],
+    ...(() => {
+      const intent = intentEvidence('c-cross', entries);
+      return { intentUnits: [intent.unit], topologyComponents: [intent.component],
+        captureHealthByComponentId: { 'c-cross': intent.health } };
+    })(),
   }, { runGit: gitFake([]) }), /cannot split SC component 'c-cross'.*missing e2/);
 });
 

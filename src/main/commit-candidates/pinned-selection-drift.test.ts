@@ -68,7 +68,7 @@ assert.deepEqual(missing.drift.missing, [pinned[0].path.pathBytesBase64]);
 
 const attributedComponent: ConflictComponent = {
   componentId: 'component-1', dirtyEntryIds: ['one'], associations: [],
-  overlap: { componentId: 'component-1', contributingAgentCount: 1, mergedGroupCount: 1, perPathContributors: {}, requiresOverlapAck: false },
+  overlap: { componentId: 'component-1', contributingAgentCount: 1, mergedGroupCount: 1, perPathContributors: {} },
   componentTopologyDigest: 'component-topology',
 };
 const reAttributed = resolvePinnedSelectionDrift({

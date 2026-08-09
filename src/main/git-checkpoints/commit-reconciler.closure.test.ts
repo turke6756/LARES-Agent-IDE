@@ -110,7 +110,7 @@ function snapshot(selected: CandidateMember[], row: PackageFinalization): Candid
     repositoryKey: 'repo-1',
     normalizedRequest: {
       selectedComponentIds: ['component-1'], selectedUnattributedEntryIds: [], finalizationIds: [row.id],
-      acknowledgeTopologyDigest: 'topology-1', acknowledgeUnattributedEntryIds: [],
+      acknowledgeUnattributedEntryIds: [],
     },
     componentTopologyDigest: 'topology-1',
     pinnedHeadOid: PARENT,

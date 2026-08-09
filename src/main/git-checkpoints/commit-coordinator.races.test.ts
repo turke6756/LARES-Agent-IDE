@@ -145,7 +145,6 @@ async function preview(root: string, tokenId = 'token-1'): Promise<Preview> {
         selectedComponentIds: ['component-1'],
         selectedUnattributedEntryIds: [],
         finalizationIds: ['fin-1'],
-        acknowledgeTopologyDigest: 'topology-race',
         acknowledgeUnattributedEntryIds: [],
       },
       componentTopologyDigest: 'topology-race',
@@ -250,6 +249,7 @@ function harness(pre: Preview, options: HarnessOptions = {}) {
   const attempts = new AttemptStore();
   let attemptSequence = 0;
   const coordinator = new CommitCoordinator({
+    contractVersion: pre.snapshot.candidate.contractVersion,
     composeLocks,
     queue,
     tokens,
@@ -259,6 +259,10 @@ function harness(pre: Preview, options: HarnessOptions = {}) {
     reassemble: options.reassemble ?? (async (snapshot) => live(snapshot)),
     readMemberRepresentation: options.readMemberRepresentation ?? actualRepresentation,
     locateRepository: () => ({ repoRoot: pre.root, gitExe: EXE }),
+    resolveCandidateCommitPolicy: async () => ({
+      validation: { enabled: false, commands: [], timeoutMs: 0 },
+      signing: { enabled: false, signingKey: null },
+    }),
     newAttemptId: () => `race-attempt-${++attemptSequence}`,
   });
   return { coordinator, tokens, composeLocks, queue, attempts };

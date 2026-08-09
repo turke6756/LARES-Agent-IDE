@@ -65,7 +65,7 @@ const savePreview: SaveCardPreviewResponse = {
     token: null,
   },
   laresTrailers: ['Lares-Plan: plan-1'], defaultMessageBody: 'Save WP-P6D',
-  requiresOverlapAck: false, unacknowledgedUnattributedEntryIds: [], componentTopologyDigest: 'topo-1',
+  unacknowledgedUnattributedEntryIds: [], componentTopologyDigest: 'topo-1',
   selectionDrift: { added: [], missing: [], reAttributed: [], byteMoved: [] },
   selectionDriftDisplayPaths: {},
   pinnedSelection: { selectedComponentIds: ['component-1'], selectedUnattributedEntryIds: [], frozenMemberCount: 1 },
@@ -150,7 +150,7 @@ describe('WP-P6D board done + commit integration', () => {
     (window.api.commitCoordinator.mint as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...savePreview,
       refusal: { stage: 'mint', code: 'acknowledgement-stale', message: 'Mint stage refused.' },
-      candidate: { ...savePreview.candidate, eligibility: { eligible: false, reason: 'overlap-not-acknowledged' } },
+      candidate: { ...savePreview.candidate, eligibility: { eligible: false, reason: 'unattributed-not-acknowledged' } },
     });
     await click('[data-testid="commit-package-WP-P6D"]');
     await click('[data-testid="candidate-preview-save"]');

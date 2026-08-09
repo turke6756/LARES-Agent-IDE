@@ -109,7 +109,6 @@ function component(componentId: string, entryIds: string[], over: Partial<Confli
       contributingAgentCount: 1,
       mergedGroupCount: 1,
       perPathContributors: {},
-      requiresOverlapAck: false,
     },
     componentTopologyDigest: `topo-${componentId}`,
     ...over,
@@ -256,7 +255,6 @@ test('finalization-backed, verified selection yields an eligible CommitCandidate
     'Lares-Turns: 2', 'Lares-Plan: plan-A', 'Lares-Finalization: pkg-1@3',
   ]);
   assert.equal(response.defaultMessageBody, 'Save pkg-1 (2 turns)');
-  assert.equal(response.requiresOverlapAck, false);
   assert.deepEqual(response.unacknowledgedUnattributedEntryIds, []);
   assert.equal(response.refusal, null);
 });
@@ -342,7 +340,7 @@ test('overlap component + selected unattributed entry surface the acknowledgemen
   const overlapComponent = component('c1', ['e1'], {
     overlap: {
       componentId: 'c1', contributingAgentCount: 2, mergedGroupCount: 2,
-      perPathContributors: {}, requiresOverlapAck: true,
+      perPathContributors: {},
     },
   });
   const context = baseContext({
@@ -358,7 +356,6 @@ test('overlap component + selected unattributed entry surface the acknowledgemen
     finalizationIds: [],
   })) as SaveCardPreviewResponse;
 
-  assert.equal(response.requiresOverlapAck, true);
   assert.deepEqual(response.unacknowledgedUnattributedEntryIds, ['eu']);
 });
 

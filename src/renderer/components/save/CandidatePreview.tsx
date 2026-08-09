@@ -25,6 +25,9 @@ import { renderSaveRefusal } from './save-refusal-copy';
 export interface CandidatePreviewSelection {
   selectedComponentIds: string[];
   selectedUnattributedEntryIds: string[];
+  selectedIntentIds?: string[];
+  selectedNamedSaveSetIds?: string[];
+  resolutionIds?: string[];
   finalizationIds: string[];
 }
 
@@ -75,7 +78,6 @@ export interface CandidatePreviewDraft {
   previewedCandidateId: string | null;
   componentTopologyDigest: string;
   checkedUnattributedEntryIds: string[];
-  overlapAcknowledged: boolean;
   messageBody: string;
   userTrailers: string;
   canSave: boolean;
@@ -106,13 +108,11 @@ const REASON_LABEL: Record<Extract<CommitEligibility, { eligible: false }>['reas
   'package-not-finalized': 'This work is not finalized yet — preview only, nothing to commit.',
   'checkpoint-unavailable': 'A final checkpoint for this package is unavailable.',
   'finalization-conflict': 'Two finalizations disagree on this work — cannot save.',
-  'component-subset-not-allowed': 'A whole work component must be saved together — not a subset.',
   'extraneous-finalization': 'A requested finalization covers none of this selection.',
   'intent-revision-stale': 'This save intent changed since review — preview it again.',
   'resolution-required': 'Resolve every cross-intent lost-update risk before saving.',
   'resolution-stale': 'A cross-intent resolution is stale — review the current evidence.',
   'unattributed-not-acknowledged': 'Acknowledge the unattributed changes to continue.',
-  'overlap-not-acknowledged': 'Acknowledge the overlapping work to continue.',
   'compose-in-flight': 'Another save is in flight for this repository — try again shortly.',
   'unsupported-git-state': 'This selection includes git state Lares cannot safely commit.',
 };
@@ -266,10 +266,6 @@ export default function CandidatePreview({
     const eligible = response.candidate.eligibility.eligible === true;
     const reservedTrailer = firstReservedTrailerLine(userTrailers);
     const currentAtoms = challengeAtoms(response);
-    const currentOverlapAtoms = currentAtoms.filter((atom) => atom.kind === 'overlap');
-    const overlapSatisfied = !response.requiresOverlapAck
-      || (currentOverlapAtoms.length > 0
-        && currentOverlapAtoms.every((atom) => isAcknowledged(acknowledgedAtoms, atom)));
     const currentCrossAtoms = crossIntentAtoms(response);
     const selectedCrossResolutions = currentCrossAtoms.flatMap((atom) => {
       const resolution = atom.resolution ?? crossResolutions[crossIntentKey(atom)];
@@ -296,10 +292,9 @@ export default function CandidatePreview({
         : null,
       componentTopologyDigest: response.componentTopologyDigest,
       checkedUnattributedEntryIds,
-      overlapAcknowledged: overlapSatisfied,
       messageBody,
       userTrailers,
-      canSave: response.isCandidate && eligible && overlapSatisfied && unattributedSatisfied
+      canSave: response.isCandidate && eligible && unattributedSatisfied
         && crossIntentSatisfied
         && Boolean(response.reviewedManifest?.reviewedManifestDigest)
         && Boolean(response.durableFinalizationIntent?.length) && !reservedTrailer,
@@ -344,9 +339,6 @@ export default function CandidatePreview({
   const eligible = candidate.eligibility.eligible === true;
   const reservedTrailer = firstReservedTrailerLine(userTrailers);
   const currentAtoms = challengeAtoms(response);
-  const overlapAtoms = currentAtoms.filter((atom) => atom.kind === 'overlap');
-  const overlapSatisfied = !response.requiresOverlapAck
-    || (overlapAtoms.length > 0 && overlapAtoms.every((atom) => isAcknowledged(acknowledgedAtoms, atom)));
   const currentCrossAtoms = crossIntentAtoms(response);
   const selectedCrossResolutions = currentCrossAtoms.flatMap((atom) => {
     const resolution = atom.resolution ?? crossResolutions[crossIntentKey(atom)];
@@ -359,7 +351,7 @@ export default function CandidatePreview({
     .every((atom) => isAcknowledged(acknowledgedAtoms, atom))
     && response.unacknowledgedUnattributedEntryIds.every((id) =>
       isAcknowledged(acknowledgedAtoms, unattributedAtomForEntry(response, id)));
-  const acksSatisfied = overlapSatisfied && unattributedSatisfied && crossIntentSatisfied;
+  const acksSatisfied = unattributedSatisfied && crossIntentSatisfied;
   // One-click save is allowed ONLY for a finalization-backed candidate that the
   // server declared eligible, with every acknowledgement satisfied and no reserved
   // user trailer. Mismatch / degraded / unfinalized work is previewable, never
@@ -484,16 +476,6 @@ export default function CandidatePreview({
           </fieldset>
         );
       })}
-      {response.requiresOverlapAck && (
-        <label className="sc-preview-ack" data-testid="candidate-preview-overlap-ack">
-          <input
-            type="checkbox"
-            checked={overlapSatisfied}
-            onChange={(e) => setAtomsAcknowledged(overlapAtoms, e.target.checked)}
-          />
-          <span>This package fuses work from multiple agents or plans — I acknowledge the overlap.</span>
-        </label>
-      )}
       {unattributedRows.length > 1 && (
         <label className="sc-preview-ack" data-testid="candidate-preview-unattributed-ack-all">
           <input
@@ -606,7 +588,6 @@ export default function CandidatePreview({
                     : null,
                   componentTopologyDigest: response.componentTopologyDigest,
                   checkedUnattributedEntryIds,
-                  overlapAcknowledged: overlapSatisfied,
                   messageBody,
                   userTrailers,
                   canSave,

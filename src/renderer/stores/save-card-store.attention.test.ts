@@ -33,7 +33,8 @@ function notice(edges = 1, workspaceId = 'ws-1'): SaveCardCheckpointExpiryNotice
 }
 
 function inventory(): SaveCardInventoryResponse {
-  return { bundles: [], quotaWeakening: null };
+  return { intentUnits: [], unwitnessed: [], legacyTaskIdentityUnavailable: [],
+    legacyFinalizations: [], planningActivities: [], quotaWeakening: null };
 }
 
 beforeEach(() => {

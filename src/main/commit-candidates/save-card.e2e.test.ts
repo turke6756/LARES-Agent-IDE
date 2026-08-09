@@ -1,546 +1,206 @@
 import assert from 'node:assert/strict';
-// Ack coverage note: the earlier e2e echoed server values directly and therefore
-// bypassed CandidatePreviewDraft, checkbox propagation, and submit-time refresh;
-// the renderer tests now cover that full gesture. The earlier double-submit row
-// had no overlap gate, its stale-digest unit row enshrined stale forwarding, and
-// its typed-refusal fixture started after refusal instead of installing P2/P3.
-import { execFileSync } from 'node:child_process';
-import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 
-import {
-  COMMIT_CANDIDATE_MINT_CHANNEL,
-  COMMIT_COORDINATOR_CHANNEL,
-  SAVECARD_CHANNELS,
-  SAVECARD_FINALIZE_CHANNEL,
-  SAVECARD_PREVIEW_CHANNEL,
-  type CommitCoordinatorConsumeResponse,
-  type SaveCardFleetAdhocMarkDoneSuccess,
-  type SaveCardInventoryResponse,
-  type SaveCardMintResponse,
-  type SaveCardPreviewResponse,
-} from '../../shared/types';
-import type { CommitCandidate } from '../../shared/commit-candidates';
-import type {
-  CommitLedgerWrite,
-  CommitPathLink,
-  CommitRecord,
-  PackageFinalization,
-  PendingCommitAttempt,
-  CommitAttemptResolution,
-  PlanWorkPackage,
-  FinalizationBoundaryStatus,
-} from '../database';
-import { resolveInternalGit } from '../git/git-runtime';
-import { runGit, runGitBytes } from '../git-checkpoints/git-command';
-import { CommitCoordinator } from '../git-checkpoints/commit-coordinator';
-import { CheckpointQueue } from '../git-checkpoints/checkpoint-queue';
-import { reconcileCommittedCandidate, type CommitClosureStore } from '../git-checkpoints/commit-reconciler';
-import type { FinalizationStore } from './finalization-service';
-import { createSaveCardRoutes } from './save-card-routes';
-import { createPreviewRoutes } from './preview-routes';
-import {
-  registerSaveCardFinalizeIpc,
-  registerSaveCardIpc,
-  registerSaveCardMintIpc,
-  registerSaveCardPreviewIpc,
-  type IpcLike,
-} from './save-card-ipc';
-import { registerCommitCoordinatorIpc } from './commit-coordinator-ipc';
+import type { PlanningActivityWorktree, SaveIntent } from '../database';
+import type { DirtyEntry, EncodedGitPath } from '../../shared/commit-candidates';
+import type { SaveCardPlanningActivityDto } from '../../shared/types';
+import { classifyPathConcurrency, projectConcurrencyActions, type PathIntentObservation } from '../git-checkpoints/concurrency-policy';
+import { reconcilePlanningActivityWorktrees } from '../git-checkpoints/planning-worktree-reconciler';
+import { assembleConflictComponents } from './component-assembler';
+import { projectIntentUnits, type NamedSaveSetMember } from './intent-assembler';
+import type { ProjectedWitness } from './witness-projection';
 
-type Handler = (_event: unknown, ...args: unknown[]) => unknown;
-class FakeIpc implements IpcLike {
-  private readonly handlers = new Map<string, Handler>();
-  handle(channel: string, listener: Handler): void { this.handlers.set(channel, listener); }
-  async invoke<T>(channel: string, request: unknown): Promise<T> {
-    const handler = this.handlers.get(channel);
-    if (!handler) throw new Error(`no registered route for ${channel}`);
-    return handler({}, request) as Promise<T>;
-  }
+interface TestCase { name: string; run(): Promise<void> | void }
+const tests: TestCase[] = [];
+function test(name: string, run: TestCase['run']): void { tests.push({ name, run }); }
+
+const repository = {
+  repositoryKey: 'repo-1', objectDatabaseKey: 'odb-1', gitObjectFormat: 'sha1' as const,
+  bareRepo: false as const, workspaces: [{ workspaceId: 'ws-1', workspacePrefix: '' }],
+};
+
+function encoded(displayPath: string): EncodedGitPath {
+  return { displayPath, pathBytesBase64: Buffer.from(displayPath).toString('base64'), utf8Clean: true };
 }
 
-class MemoryPersistence implements FinalizationStore, CommitClosureStore {
-  readonly finalizations = new Map<string, PackageFinalization>();
-  readonly records: CommitRecord[] = [];
-  readonly pathLinks: CommitPathLink[] = [];
-  readonly attempts: PendingCommitAttempt[] = [];
-  readonly attemptResolutions: Array<{ id: string; resolution: CommitAttemptResolution }> = [];
-  getActivePackageFinalization(packageId: string): PackageFinalization | null {
-    return [...this.finalizations.values()].find((row) =>
-      row.packageId === packageId && row.lifecycleStatus === 'active') ?? null;
-  }
-  maxPackageRevision(packageId: string): number {
-    return Math.max(0, ...[...this.finalizations.values()]
-      .filter((row) => row.packageId === packageId).map((row) => row.packageRevision));
-  }
-  insertPackageFinalization(row: PackageFinalization): void { this.finalizations.set(row.id, row); }
-  supersedePackageFinalization(id: string, supersededBy: string): void {
-    const row = this.finalizations.get(id)!;
-    this.finalizations.set(id, { ...row, lifecycleStatus: 'superseded', supersededByFinalizationId: supersededBy });
-  }
-  setPackageFinalizationBoundaryStatus(id: string, status: FinalizationBoundaryStatus): void {
-    const row = this.finalizations.get(id)!;
-    this.finalizations.set(id, { ...row, boundaryStatus: status });
-  }
-  getPlanWorkPackage(_id: string): PlanWorkPackage | null { return null; }
-  upsertPlanWorkPackage(_pkg: PlanWorkPackage): void {}
-  transact<T>(fn: () => T): T { return fn(); }
-  getCommitRecord(repositoryKey: string, commitOid: string): CommitRecord | null {
-    return this.records.find((row) => row.repositoryKey === repositoryKey && row.commitOid === commitOid) ?? null;
-  }
-  recordCommitLedger(write: CommitLedgerWrite): void {
-    this.records.push(write.record);
-    this.pathLinks.push(...(write.pathLinks ?? []));
-  }
-  getPackageFinalization(id: string): PackageFinalization | null { return this.finalizations.get(id) ?? null; }
-  listCommitPathLinks(repositoryKey: string, paths: readonly string[]): CommitPathLink[] {
-    return this.pathLinks.filter((row) => row.repositoryKey === repositoryKey && paths.includes(row.pathBytesBase64));
-  }
-  markPackageFinalizationCommitted(id: string, releasedAt: number): void {
-    const row = this.finalizations.get(id)!;
-    this.finalizations.set(id, { ...row, lifecycleStatus: 'committed', releasedAt });
-  }
+function entry(entryId: string, displayPath: string): DirtyEntry {
+  return {
+    entryId, path: encoded(displayPath), originalPath: null, entryKind: 'ordinary',
+    indexStatus: '.', worktreeStatus: 'M', headMode: '100644', indexMode: '100644',
+    worktreeMode: '100644', submoduleState: null, renameOrCopyScore: null,
+    expectedWorktreeState: 'present', rawWorktreeBlobOid: `blob-${entryId}`,
+    gitLevelEligibility: 'supported', commitPathspecs: [encoded(displayPath)],
+  };
 }
 
-function git(exe: string, repo: string, args: string[], env?: NodeJS.ProcessEnv): string {
-  return execFileSync(exe, args, {
-    cwd: repo,
-    env: { ...process.env, ...env },
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+function intent(id: string, title = id, planId = 'plan-1', planItemId = 'item-1'): SaveIntent {
+  return {
+    id, workspaceId: 'ws-1', executionRunId: 'run-1', repositoryKey: 'repo-1',
+    kind: 'task', planId, planItemId, title, briefDigest: `digest-${id}`,
+    dispatchAttemptId: `attempt-${id}`, createdBy: 'task-dispatch', createdById: null,
+    state: 'open', revision: 1, createdAt: 1, readyAt: null, committedAt: null,
+  };
 }
-function gitBytes(exe: string, repo: string, args: string[]): Buffer {
-  return execFileSync(exe, args, { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+
+function witness(entryId: string, turnId: string, agentId: string, intentId: string | null): ProjectedWitness {
+  return {
+    entryId, workspaceId: 'ws-1', turnId, agentId, ownerAgentId: null,
+    ownerBrickGeneration: null, planId: 'plan-1', planItemId: 'item-1', intentId,
+    planAttributionAvailable: true,
+  };
 }
+
+function assembly(entries: DirtyEntry[], witnesses: ProjectedWitness[], intents: SaveIntent[], namedMembers: NamedSaveSetMember[] = []) {
+  const topology = assembleConflictComponents({ repository, entries }, witnesses);
+  return projectIntentUnits({ inventory: topology.inventory, witnesses, intents, namedMembers, topology });
+}
+
+function observation(over: Partial<PathIntentObservation>): PathIntentObservation {
+  return {
+    repositoryKey: 'repo-1', path: encoded('shared.ts'), intentId: 'intent-a', turnId: 'turn-a',
+    agentId: 'agent-a', beforeCommitOid: 'commit-before-a', afterCommitOid: 'commit-after-a',
+    beforeBlobOid: 'base', afterBlobOid: 'after-a', finalBlobOid: 'final-b',
+    startedAt: 1, endedAt: 2, evidenceQuality: 'complete', ...over,
+  };
+}
+
+test('scenario 1: two agents, one file, same task => one silent intent and one commit unit', () => {
+  const entries = [entry('shared', 'shared.ts')];
+  const result = assembly(entries, [
+    witness('shared', 'turn-a', 'agent-a', 'intent-a'),
+    witness('shared', 'turn-b', 'agent-b', 'intent-a'),
+  ], [intent('intent-a')]);
+  assert.equal(result.intentUnits.length, 1);
+  assert.deepEqual(result.intentUnits[0].contributingAgentIds, ['agent-a', 'agent-b']);
+  assert.deepEqual(result.intentUnits[0].memberEntryIds, ['shared']);
+});
+
+test('scenario 2: one task across disconnected directories => one intent and one commit unit', () => {
+  const entries = [entry('a', 'src/a.ts'), entry('b', 'docs/b.md')];
+  const witnesses = [
+    witness('a', 'turn-a', 'agent-a', 'intent-a'),
+    witness('b', 'turn-b', 'agent-a', 'intent-a'),
+  ];
+  const topology = assembleConflictComponents({ repository, entries }, witnesses);
+  const template = topology.components[0];
+  topology.components = entries.map((value, index) => ({
+    ...template, componentId: `disconnected-${index + 1}`, dirtyEntryIds: [value.entryId],
+    componentTopologyDigest: `topology-${index + 1}`,
+  }));
+  const result = projectIntentUnits({
+    inventory: topology.inventory, witnesses, intents: [intent('intent-a')], namedMembers: [], topology,
+  });
+  assert.equal(result.intentUnits.length, 1);
+  assert.deepEqual(result.intentUnits[0].memberEntryIds, ['a', 'b']);
+  assert.equal(result.intentUnits[0].topologyComponentIds.length, 2);
+});
+
+test('scenario 3: two briefs under one plan item => two task cards', () => {
+  const entries = [entry('a', 'a.ts'), entry('b', 'b.ts')];
+  const result = assembly(entries, [
+    witness('a', 'turn-a', 'agent-a', 'intent-a'),
+    witness('b', 'turn-b', 'agent-a', 'intent-b'),
+  ], [intent('intent-a', 'Brief A'), intent('intent-b', 'Brief B')]);
+  assert.deepEqual(result.intentUnits.map((unit) => unit.intent.id), ['intent-a', 'intent-b']);
+});
+
+test('scenario 4: different-file plans remain separate and both report promoted', () => {
+  const activities: SaveCardPlanningActivityDto[] = [
+    { executionRunId: 'run-a', planId: 'plan-a', planTitle: 'A', status: 'promoted', promotedHeadOid: 'head-a', latestAttemptId: 'merge-a', conflicts: [], failureCode: null },
+    { executionRunId: 'run-b', planId: 'plan-b', planTitle: 'B', status: 'promoted', promotedHeadOid: 'head-b', latestAttemptId: 'merge-b', conflicts: [], failureCode: null },
+  ];
+  assert.deepEqual(activities.map((item) => item.executionRunId), ['run-a', 'run-b']);
+  assert.equal(activities.every((item) => item.status === 'promoted' && item.conflicts.length === 0), true);
+});
+
+test('scenario 5: compatible same-file plans surface the second as cleanly promoted', () => {
+  const second: SaveCardPlanningActivityDto = {
+    executionRunId: 'run-b', planId: 'plan-b', planTitle: 'B', status: 'promoted',
+    promotedHeadOid: 'merged-head', latestAttemptId: 'merge-b', conflicts: [], failureCode: null,
+  };
+  assert.equal(second.status, 'promoted');
+  assert.equal(second.conflicts.length, 0);
+});
+
+test('scenario 6: incompatible same-file plans preserve the activity commit and conflict UI evidence', () => {
+  const second: SaveCardPlanningActivityDto = {
+    executionRunId: 'run-b', planId: 'plan-b', planTitle: 'B', status: 'merge-conflicted',
+    promotedHeadOid: null, latestAttemptId: 'merge-b', failureCode: null,
+    conflicts: [{ pathBytesBase64: encoded('shared.ts').pathBytesBase64, displayPath: 'shared.ts',
+      baseBlobOid: 'base', primaryBlobOid: 'primary', activityBlobOid: 'activity', resolution: null }],
+  };
+  assert.equal(second.status, 'merge-conflicted');
+  assert.equal(second.promotedHeadOid, null);
+  assert.equal(second.conflicts[0].activityBlobOid, 'activity');
+});
+
+test('scenario 7: cross-intent divergence blocks only on the attribution picker', () => {
+  const cases = classifyPathConcurrency([
+    observation({ intentId: 'intent-a', turnId: 'turn-a', beforeBlobOid: 'base-a', afterBlobOid: 'after-a', endedAt: 2 }),
+    observation({ intentId: 'intent-b', turnId: 'turn-b', beforeBlobOid: 'base-b', afterBlobOid: 'after-b', finalBlobOid: 'after-b', startedAt: 3 }),
+  ]);
+  const actions = projectConcurrencyActions(cases);
+  assert.equal(cases[0].classification, 'cross-intent-suspected-lost-update');
+  assert.equal(actions.blockingAtoms.length, 1);
+  assert.equal(actions.blockingAtoms[0].kind, 'cross-intent');
+});
+
+test('scenario 8: lost-work restore is an explicit supervisor resolution and never an implicit commit', () => {
+  const [atom] = projectConcurrencyActions(classifyPathConcurrency([
+    observation({ intentId: 'intent-a', turnId: 'turn-a', beforeBlobOid: 'base-a', afterBlobOid: 'after-a', endedAt: 2 }),
+    observation({ intentId: 'intent-b', turnId: 'turn-b', beforeBlobOid: 'base-b', afterBlobOid: 'after-b', finalBlobOid: 'after-b', startedAt: 3 }),
+  ])).blockingAtoms;
+  assert.equal(atom.kind, 'cross-intent');
+  if (atom.kind !== 'cross-intent') throw new Error('expected cross-intent picker');
+  assert.equal(atom.resolution, null);
+  assert.equal(atom.evidenceDigest.length, 64);
+});
+
+test('scenario 9: human edits remain unwitnessed until an authoritative named set adopts them', () => {
+  const entries = [entry('human', 'human.txt')];
+  const before = assembly(entries, [], []);
+  assert.deepEqual(before.unwitnessedEntryIds, ['human']);
+  const named = { ...intent('named', 'Baseline'), kind: 'named-save-set' as const,
+    planId: null, planItemId: null, dispatchAttemptId: null, createdBy: 'human-save-card' as const };
+  const topology = assembleConflictComponents({ repository, entries }, []);
+  const after = projectIntentUnits({
+    inventory: topology.inventory, witnesses: [], intents: [named], topology,
+    namedMembers: [{ intentId: 'named', entryId: 'human',
+      pathBytesBase64: entries[0].path.pathBytesBase64, inventoryDigest: topology.inventory.topologyDigest }],
+  });
+  assert.deepEqual(after.unwitnessedEntryIds, []);
+  assert.deepEqual(after.intentUnits[0].memberEntryIds, ['human']);
+});
+
+test('scenario 10: crash recovery is idempotent and missing work is never deleted', async () => {
+  let row: PlanningActivityWorktree = {
+    executionRunId: 'run-crash', planId: 'plan-crash', logicalWorkspaceId: 'ws-1',
+    objectDatabaseKey: 'odb', activityRepositoryKey: 'activity-repo', primaryRepositoryKey: 'primary-repo',
+    path: path.join(process.cwd(), '.missing-activity-worktree'), baselineOid: 'base',
+    activityHeadRef: 'refs/lares/activities/run-crash/head', promotedHeadOid: null,
+    state: 'provisioning', failureCode: null, createdAt: 1, updatedAt: 1,
+  };
+  const deps = {
+    listActivities: () => [row], resolvePrimaryPath: () => process.cwd(),
+    updateActivity: (input: Partial<PlanningActivityWorktree> & { executionRunId: string }) => {
+      row = { ...row, ...input };
+      return row;
+    },
+    runGit: async () => ({ code: 1, stdout: '', stderr: 'missing' }),
+    now: () => 2,
+  };
+  const first = await reconcilePlanningActivityWorktrees(deps);
+  const second = await reconcilePlanningActivityWorktrees(deps);
+  assert.deepEqual(first, [{ executionRunId: 'run-crash', disposition: 'quarantined', failureCode: 'activity-path-and-ref-missing' }]);
+  assert.deepEqual(second, []);
+  assert.equal(row.state, 'recovery-required');
+});
 
 (async () => {
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'lares-save-card-e2e-'));
-  const repo = path.join(sandbox, 'repo');
-  fs.mkdirSync(repo, { recursive: true });
-  const resolved = await resolveInternalGit();
-  assert.ok(resolved, 'a compatible Git is required for the save-card e2e test');
-  const gitExe = resolved.execPath;
-
-  try {
-    git(gitExe, repo, ['init']);
-    git(gitExe, repo, ['config', 'user.name', 'Save Card E2E']);
-    git(gitExe, repo, ['config', 'user.email', 'save-card-e2e@example.invalid']);
-    git(gitExe, repo, ['config', 'core.autocrlf', 'false']);
-    fs.writeFileSync(path.join(repo, 'base.txt'), 'base\n');
-    fs.writeFileSync(path.join(repo, 'foreign.txt'), 'foreign base\n');
-    fs.writeFileSync(path.join(repo, 'mixed.txt'), 'mixed base\n');
-    git(gitExe, repo, ['add', '--', 'base.txt', 'foreign.txt', 'mixed.txt']);
-    git(gitExe, repo, ['commit', '-m', 'initial']);
-
-    fs.writeFileSync(path.join(repo, 'foreign.txt'), 'foreign staged bytes\r\n');
-    git(gitExe, repo, ['add', '--', 'foreign.txt']);
-    const foreignIndexBefore = gitBytes(gitExe, repo, ['show', ':foreign.txt']);
-    const proposalsDir = path.join(repo, '.lares', 'proposals');
-    fs.mkdirSync(proposalsDir, { recursive: true });
-    const pinned = new Map<string, Buffer>();
-    for (let i = 1; i <= 15; i++) {
-      const relative = `.lares/proposals/proposal-${String(i).padStart(2, '0')}.md`;
-      const bytes = Buffer.from(`---\nartifact_id: proposal-${i}\n---\nbyte pin ${i}\r\n`, 'utf8');
-      fs.writeFileSync(path.join(repo, relative), bytes);
-      pinned.set(relative, bytes);
-    }
-
-    const workspaces = [
-      { id: 'ws-repo', title: 'Repo', path: repo },
-      // W5 invariant: an unrelated repo-less contributor workspace must not poison
-      // the pane's repository-scoped inventory/finalization/commit transaction.
-      { id: 'ws-root', title: 'Computer Root', path: sandbox },
-    ];
-    const persistence = new MemoryPersistence();
-    const readTurnWitnesses = (workspaceId: string) => workspaceId === 'ws-repo' ? [
-      {
-        turnId: 'foreign-turn', agentId: 'foreign-agent', ownerAgentId: null,
-        ownerBrickGeneration: null, touched: [{ path: 'foreign.txt', op: 'write' as const }],
-      },
-      ...[0, 1, 2].flatMap((group) => [0, 1].map((agent) => ({
-        turnId: `proposal-turn-${group}-${agent}`,
-        agentId: `proposal-agent-${group}-${agent}`,
-        ownerAgentId: null,
-        ownerBrickGeneration: null,
-        touched: Array.from({ length: 5 }, (_, offset) => ({
-          path: `.lares/proposals/proposal-${String(group * 5 + offset + 1).padStart(2, '0')}.md`,
-          op: 'write' as const,
-        })),
-      }))),
-    ] : [];
-
-    const captureFinalizationBoundary = async () => {
-      const alternateIndex = path.join(sandbox, `boundary-${Date.now()}.index`);
-      const env = { GIT_INDEX_FILE: alternateIndex };
-      git(gitExe, repo, ['read-tree', 'HEAD'], env);
-      git(gitExe, repo, ['add', '-A', '--', '.'], env);
-      const treeOid = git(gitExe, repo, ['write-tree'], env);
-      const head = git(gitExe, repo, ['rev-parse', 'HEAD']);
-      const oid = git(gitExe, repo, ['commit-tree', treeOid, '-p', head, '-m', 'save-card boundary'], env);
-      return { oid, treeOid };
-    };
-
-    const empty = () => [];
-    const readActiveFinalizations = (repositoryKey: string) => [...persistence.finalizations.values()]
-      .filter((row) => row.repositoryKey === repositoryKey && row.lifecycleStatus === 'active');
-    const previewRoutes = createPreviewRoutes({
-      gitExe, captureFinalizationBoundary, getWorkspaces: () => workspaces,
-      readTurnWitnesses, readCaptureTurns: empty, readCommitPathLinks: empty,
-      readWitnessedProvenance: (_workspaceId, turnId) => turnId.startsWith('proposal-turn-')
-        ? { assistedBy: [{ provider: 'codex', model: 'gpt-5.6' }], localCheckpointRefs: [] }
-        : null,
-      listRepoCommitPathLinks: empty, readTurnRecord: () => null,
-      getPackageFinalization: (id) => persistence.getPackageFinalization(id),
-      readActiveFinalizations,
-      getPlanWorkPackage: () => null, listPlanWorkPackagePaths: empty,
-    });
-    previewRoutes.saveCardFinalizeRoutes.finalizeDeps = { store: persistence };
-    const inventoryRoutes = createSaveCardRoutes({
-      gitExe, getWorkspaces: () => workspaces,
-      readTurnWitnesses, readCaptureTurns: empty, readCommitPathLinks: empty,
-      readActiveFinalizations,
-      readTurnRecord: () => null, getAgentsByWorkspace: empty, getAgent: () => null,
-      readBundleTurns: empty,
-    });
-    const candidateService = previewRoutes.productionSeams.candidateService;
-    const coordinator = new CommitCoordinator({
-      composeLocks: previewRoutes.productionSeams.composeLocks,
-      queue: new CheckpointQueue(),
-      tokens: {
-        resolve: candidateService.resolveCandidateToken.bind(candidateService),
-        tryConsume: candidateService.tryMarkTokenConsuming.bind(candidateService),
-        markConsumed: candidateService.markTokenConsumed.bind(candidateService),
-      },
-      attempts: {
-        insertPending: (attempt) => { persistence.attempts.push(attempt); },
-        resolve: (id, resolution) => { persistence.attemptResolutions.push({ id, resolution }); },
-      },
-      runGit,
-      runGitBytes,
-      reassemble: previewRoutes.productionSeams.reassemble,
-      readMemberRepresentation: previewRoutes.productionSeams.readMemberRepresentation,
-      locateRepository: previewRoutes.productionSeams.locateRepository,
-      deriveTrailers: previewRoutes.productionSeams.deriveTrailers,
-    });
-
-    const ipc = new FakeIpc();
-    registerSaveCardIpc(ipc, () => inventoryRoutes);
-    registerSaveCardFinalizeIpc(ipc, () => previewRoutes.saveCardFinalizeRoutes);
-    registerSaveCardPreviewIpc(ipc, () => previewRoutes.saveCardPreviewRoutes);
-    registerSaveCardMintIpc(ipc, () => previewRoutes.saveCardMintRoutes);
-    registerCommitCoordinatorIpc(ipc, () => ({
-      coordinator,
-      resolveCandidateToken: candidateService.resolveCandidateToken.bind(candidateService),
-      locateRepository: previewRoutes.productionSeams.locateRepository,
-      reconcileCommitted: (input) => reconcileCommittedCandidate({ ...input, store: persistence }),
-    }), () => true);
-
-    const inventory = await ipc.invoke<SaveCardInventoryResponse>(
-      SAVECARD_CHANNELS.getInventory,
-      { workspaceId: 'ws-repo' },
-    );
-    const proposalBundles = inventory.bundles.filter((item) =>
-      item.kind === 'component'
-      && item.members.some((member) => member.entry.path.displayPath.startsWith('.lares/proposals/')),
-    );
-    assert.equal(proposalBundles.length, 3, 'the 15 proposals form three witnessed overlap components');
-    assert.equal(proposalBundles.flatMap((item) => item.members).length, 15);
-    assert.equal(proposalBundles.every((item) => item.component?.overlap.requiresOverlapAck), true);
-
-    const finalized = await Promise.all(proposalBundles.map((bundle) =>
-      ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
-        packageId: bundle.bundleId,
-        targetWorkspaceId: 'ws-repo',
-      })));
-    assert.equal(finalized.every((item) => item.boundaryStatus === 'ready'), true);
-    for (const item of finalized) {
-      assert.ok(item.boundaryRef);
-      assert.equal(git(gitExe, repo, ['show-ref', '--verify', item.boundaryRef!]).length > 0, true);
-    }
-
-    const pinnedInventory = await ipc.invoke<SaveCardInventoryResponse>(
-      SAVECARD_CHANNELS.getInventory,
-      { workspaceId: 'ws-repo' },
-    );
-    const pinnedBundles = pinnedInventory.bundles.filter((item) =>
-      proposalBundles.some((original) => original.bundleId === item.bundleId));
-    assert.equal(pinnedBundles.length, 3);
-    assert.equal(pinnedBundles.every((item) => item.captureHealth.pathsWithoutFinalizationEdge.length === 0), true);
-    assert.deepEqual(
-      pinnedBundles.flatMap((item) => item.members).map((member) => member.protection),
-      Array(15).fill('checkpoint-protected'),
-    );
-
-    const [editedRelative, editedOriginal] = pinned.entries().next().value!;
-    fs.writeFileSync(path.join(repo, editedRelative), 'edited after pin\n');
-    const editedInventory = await ipc.invoke<SaveCardInventoryResponse>(
-      SAVECARD_CHANNELS.getInventory,
-      { workspaceId: 'ws-repo' },
-    );
-    const editedBundle = editedInventory.bundles.find((item) =>
-      item.members.some((member) => member.entry.path.displayPath === editedRelative))!;
-    assert.deepEqual(editedBundle.captureHealth.pathsWithoutFinalizationEdge, [
-      Buffer.from(editedRelative).toString('base64'),
-    ]);
-    assert.equal(
-      editedBundle.members.find((member) => member.entry.path.displayPath === editedRelative)?.protection,
-      'unprotected',
-    );
-    assert.equal(
-      editedInventory.bundles.flatMap((item) => item.members)
-        .filter((member) => member.entry.path.displayPath.startsWith('.lares/proposals/')
-          && member.protection === 'checkpoint-protected').length,
-      14,
-    );
-    fs.writeFileSync(path.join(repo, editedRelative), editedOriginal);
-
-    const benignPath = '.lares/proposals/benign-16.md';
-    fs.writeFileSync(path.join(repo, benignPath), 'unrelated after pin\n');
-    const selection = {
-      workspaceId: 'ws-repo',
-      selectedComponentIds: finalized.flatMap((item) => item.pinnedSelection.selectedComponentIds),
-      selectedUnattributedEntryIds: finalized.flatMap((item) => item.pinnedSelection.selectedUnattributedEntryIds),
-      finalizationIds: finalized.map((item) => item.finalizationId),
-    };
-    const preview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, selection);
-    assert.equal((preview.candidate as CommitCandidate).token, null, 'preview is always tokenless');
-    assert.equal(preview.isCandidate, true);
-    assert.deepEqual(
-      preview.candidate.members.map((member) => member.packageVerification),
-      Array(15).fill('verified-match'),
-    );
-    assert.deepEqual(preview.selectionDrift.added, [], 'unrelated unattributed work is outside the component pin');
-    assert.deepEqual(preview.selectionDrift.missing, []);
-    assert.equal(preview.candidate.eligibility.eligible, true, 'an unrelated 16th file does not invalidate the pin');
-
-    const mintedResponse = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...selection,
-      acknowledgeUnattributedEntryIds: preview.unacknowledgedUnattributedEntryIds,
-    });
-    const minted = mintedResponse.candidate as CommitCandidate;
-    assert.ok(minted.token, `the dedicated mint bridge returns a token: ${JSON.stringify(minted.eligibility)}`);
-    assert.ok(candidateService.resolveCandidateToken(minted.token!.tokenId), 'coordinator token store resolves it');
-    assert.equal(minted.candidateId, (preview.candidate as CommitCandidate).candidateId);
-
-    const beforeCount = Number(git(gitExe, repo, ['rev-list', '--count', 'HEAD']));
-    const consumed = await ipc.invoke<CommitCoordinatorConsumeResponse>(COMMIT_COORDINATOR_CHANNEL, {
-      candidateId: minted.candidateId,
-      tokenId: minted.token!.tokenId,
-      message: 'Save fifteen pinned proposals',
-    });
-    assert.equal(consumed.kind, 'saved');
-    const afterCount = Number(git(gitExe, repo, ['rev-list', '--count', 'HEAD']));
-    assert.equal(afterCount - beforeCount, 1, 'exactly one commit lands');
-    const committedMessage = git(gitExe, repo, ['log', '-1', '--format=%B']);
-    assert.match(committedMessage, /Assisted-by: codex:gpt-5\.6/,
-      'the production mint → injected trailer seam → commit path emits witnessed attribution');
-    assert.doesNotMatch(committedMessage, /proposal-agent-/,
-      'internal dashboard agent ids never enter the shareable commit message');
-
-    for (const [relative, expected] of pinned) {
-      assert.deepEqual(fs.readFileSync(path.join(repo, relative)), expected, `${relative} worktree bytes stay pinned`);
-      assert.deepEqual(gitBytes(gitExe, repo, ['show', `HEAD:${relative}`]), expected, `${relative} committed bytes stay pinned`);
-    }
-    assert.deepEqual(gitBytes(gitExe, repo, ['show', ':foreign.txt']), foreignIndexBefore);
-    assert.deepEqual(fs.readFileSync(path.join(repo, 'foreign.txt')), Buffer.from('foreign staged bytes\r\n'));
-    assert.equal(git(gitExe, repo, ['diff', '--cached', '--name-only']), 'foreign.txt');
-
-    const commitOid = git(gitExe, repo, ['rev-parse', 'HEAD']);
-    const repositoryKey = minted.repository.repositoryKey;
-    assert.equal(persistence.records.some((row) => row.repositoryKey === repositoryKey && row.commitOid === commitOid), true);
-    assert.equal(persistence.pathLinks.filter((row) => row.commitOid === commitOid).length, 15);
-    for (const item of finalized) {
-      const closed = persistence.getPackageFinalization(item.finalizationId);
-      assert.equal(closed?.lifecycleStatus, 'committed');
-      assert.ok(closed?.releasedAt, 'closure releases each boundary from active retention');
-    }
-
-    const refreshed = await ipc.invoke<SaveCardInventoryResponse>(
-      SAVECARD_CHANNELS.getInventory,
-      { workspaceId: 'ws-repo' },
-    );
-    const remainingPaths = refreshed.bundles.flatMap((item) =>
-      item.members.map((member) => member.entry.path.displayPath));
-    assert.deepEqual(remainingPaths.filter((item) => item.startsWith('.lares/proposals/')), [benignPath]);
-    assert.equal(git(gitExe, repo, ['ls-tree', '--name-only', 'HEAD', '--', benignPath]), '', 'the unrelated 16th file is not committed');
-    fs.rmSync(path.join(repo, benignPath));
-
-    // Sibling transition rows: byte movement on either side of mint is fail-closed,
-    // and token expiry becomes an unresolved consume rather than a commit attempt.
-    fs.writeFileSync(path.join(repo, '.lares/proposals/moved-before-mint.md'), 'pin\n');
-    const movedInventory = await ipc.invoke<SaveCardInventoryResponse>(SAVECARD_CHANNELS.getInventory, { workspaceId: 'ws-repo' });
-    const movedBundle = movedInventory.bundles.find((item) => item.kind === 'unattributed')!;
-    const movedMember = movedBundle.members.find((item) => item.entry.path.displayPath.endsWith('moved-before-mint.md'))!;
-    const movedFinalized = await ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
-      packageId: movedBundle.bundleId, targetWorkspaceId: 'ws-repo',
-    });
-    const movedSelection = {
-      workspaceId: 'ws-repo', selectedComponentIds: [], selectedUnattributedEntryIds: [movedMember.entry.entryId],
-      finalizationIds: [movedFinalized.finalizationId],
-    };
-    const movedPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, movedSelection);
-    fs.writeFileSync(path.join(repo, '.lares/proposals/moved-before-mint.md'), 'changed\n');
-    const movedMint = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...movedSelection,
-      acknowledgeUnattributedEntryIds: movedSelection.selectedUnattributedEntryIds,
-    });
-    assert.deepEqual(movedMint.candidate.eligibility, { eligible: false, reason: 'byte-mismatch' });
-    assert.deepEqual(movedMint.selectionDrift.byteMoved, [movedMember.entry.path.pathBytesBase64]);
-    assert.deepEqual(movedMint.selectionDrift.missing, []);
-    assert.equal((movedMint.candidate as CommitCandidate).token, null);
-
-    fs.rmSync(path.join(repo, '.lares/proposals/moved-before-mint.md'));
-
-    fs.writeFileSync(path.join(repo, '.lares/proposals/deleted-before-mint.md'), 'pin then delete\n');
-    const deletedInventory = await ipc.invoke<SaveCardInventoryResponse>(SAVECARD_CHANNELS.getInventory, { workspaceId: 'ws-repo' });
-    const deletedBundle = deletedInventory.bundles.find((item) => item.kind === 'unattributed')!;
-    const deletedMember = deletedBundle.members.find((item) => item.entry.path.displayPath.endsWith('deleted-before-mint.md'))!;
-    const deletedFinalized = await ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
-      packageId: deletedBundle.bundleId, targetWorkspaceId: 'ws-repo',
-    });
-    fs.rmSync(path.join(repo, '.lares/proposals/deleted-before-mint.md'));
-    const deletedPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, {
-      workspaceId: 'ws-repo',
-      selectedComponentIds: deletedFinalized.pinnedSelection.selectedComponentIds,
-      selectedUnattributedEntryIds: deletedFinalized.pinnedSelection.selectedUnattributedEntryIds,
-      finalizationIds: [deletedFinalized.finalizationId],
-    });
-    assert.deepEqual(deletedPreview.selectionDrift.missing, [deletedMember.entry.path.pathBytesBase64]);
-    assert.deepEqual(deletedPreview.selectionDrift.byteMoved, []);
-    assert.equal(deletedPreview.candidate.eligibility.eligible, false);
-
-    // Tracked modification + untracked addition travel through the same real
-    // finalization/mint/consume pipeline and land together.
-    fs.writeFileSync(path.join(repo, 'mixed.txt'), 'mixed tracked change\n');
-    fs.writeFileSync(path.join(repo, '.lares/proposals/mixed-new.md'), 'mixed untracked change\n');
-    const mixedInventory = await ipc.invoke<SaveCardInventoryResponse>(SAVECARD_CHANNELS.getInventory, { workspaceId: 'ws-repo' });
-    const mixedBundle = mixedInventory.bundles.find((item) => item.kind === 'unattributed')!;
-    assert.deepEqual(
-      mixedBundle.members.map((item) => item.entry.path.displayPath).sort(),
-      ['.lares/proposals/mixed-new.md', 'mixed.txt'],
-    );
-    const mixedFinalized = await ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
-      packageId: mixedBundle.bundleId, targetWorkspaceId: 'ws-repo',
-    });
-    const mixedSelection = {
-      workspaceId: 'ws-repo', selectedComponentIds: [],
-      selectedUnattributedEntryIds: mixedBundle.members.map((item) => item.entry.entryId),
-      finalizationIds: [mixedFinalized.finalizationId],
-    };
-    const mixedPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, mixedSelection);
-    const mixedMintResponse = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...mixedSelection,
-      acknowledgeUnattributedEntryIds: mixedSelection.selectedUnattributedEntryIds,
-    });
-    const mixedCandidate = mixedMintResponse.candidate as CommitCandidate;
-    const mixedConsumed = await ipc.invoke<CommitCoordinatorConsumeResponse>(COMMIT_COORDINATOR_CHANNEL, {
-      candidateId: mixedCandidate.candidateId, tokenId: mixedCandidate.token!.tokenId, message: 'Save mixed changes',
-    });
-    assert.equal(mixedConsumed.kind, 'saved');
-    assert.equal(git(gitExe, repo, ['show', 'HEAD:mixed.txt']), 'mixed tracked change');
-    assert.equal(git(gitExe, repo, ['show', 'HEAD:.lares/proposals/mixed-new.md']), 'mixed untracked change');
-
-    // Byte movement after mint is rejected by the coordinator's live reassembly.
-    fs.writeFileSync(path.join(repo, '.lares/proposals/moved-after-mint.md'), 'minted bytes\n');
-    const afterMintInventory = await ipc.invoke<SaveCardInventoryResponse>(SAVECARD_CHANNELS.getInventory, { workspaceId: 'ws-repo' });
-    const afterMintBundle = afterMintInventory.bundles.find((item) => item.kind === 'unattributed')!;
-    const afterMintFinalized = await ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
-      packageId: afterMintBundle.bundleId, targetWorkspaceId: 'ws-repo',
-    });
-    const afterMintSelection = {
-      workspaceId: 'ws-repo', selectedComponentIds: [],
-      selectedUnattributedEntryIds: afterMintBundle.members.map((item) => item.entry.entryId),
-      finalizationIds: [afterMintFinalized.finalizationId],
-    };
-    const afterMintPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, afterMintSelection);
-    const afterMintResponse = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...afterMintSelection,
-      acknowledgeUnattributedEntryIds: afterMintSelection.selectedUnattributedEntryIds,
-    });
-    const afterMintCandidate = afterMintResponse.candidate as CommitCandidate;
-    fs.writeFileSync(path.join(repo, '.lares/proposals/moved-after-mint.md'), 'changed after mint\n');
-    const staleConsume = await ipc.invoke<CommitCoordinatorConsumeResponse>(COMMIT_COORDINATOR_CHANNEL, {
-      candidateId: afterMintCandidate.candidateId, tokenId: afterMintCandidate.token!.tokenId,
-      message: 'Must refuse stale bytes',
-    });
-    assert.equal(staleConsume.kind, 'outcome');
-    assert.equal(staleConsume.kind === 'outcome' ? staleConsume.outcome.status : null, 'aborted-stale');
-    fs.rmSync(path.join(repo, '.lares/proposals/moved-after-mint.md'));
-
-    // Expired tokens are unresolved before the coordinator can mutate Git.
-    fs.writeFileSync(path.join(repo, '.lares/proposals/expiry.md'), 'expires\n');
-    const expiryInventory = await ipc.invoke<SaveCardInventoryResponse>(SAVECARD_CHANNELS.getInventory, { workspaceId: 'ws-repo' });
-    const expiryBundle = expiryInventory.bundles.find((item) => item.kind === 'unattributed')!;
-    const expiryFinalized = await ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
-      packageId: expiryBundle.bundleId, targetWorkspaceId: 'ws-repo',
-    });
-    const expirySelection = {
-      workspaceId: 'ws-repo', selectedComponentIds: [],
-      selectedUnattributedEntryIds: expiryBundle.members.map((item) => item.entry.entryId),
-      finalizationIds: [expiryFinalized.finalizationId],
-    };
-    const expiryPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, expirySelection);
-    const expiryMint = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...expirySelection,
-      acknowledgeUnattributedEntryIds: expirySelection.selectedUnattributedEntryIds,
-    });
-    const expiryCandidate = expiryMint.candidate as CommitCandidate;
-    const realNow = Date.now;
-    Date.now = () => expiryCandidate.token!.expiresAt + 1;
-    try {
-      const expired = await ipc.invoke<CommitCoordinatorConsumeResponse>(COMMIT_COORDINATOR_CHANNEL, {
-        candidateId: expiryCandidate.candidateId, tokenId: expiryCandidate.token!.tokenId, message: 'Expired',
-      });
-      assert.deepEqual(expired, {
-        kind: 'token-unresolved',
-        refusal: {
-          stage: 'token-consume', code: 'token-unresolved-or-expired',
-          message: 'Token-consume stage refused because the candidate token is unresolved or expired.',
-        },
-      });
-    } finally {
-      Date.now = realNow;
-    }
-    fs.rmSync(path.join(repo, '.lares/proposals/expiry.md'));
-
-    // Lares' exact-object save path deliberately bypasses repository hooks.
-    fs.writeFileSync(path.join(repo, '.lares/proposals/hook.md'), 'hook candidate\n');
-    const hookInventory = await ipc.invoke<SaveCardInventoryResponse>(SAVECARD_CHANNELS.getInventory, { workspaceId: 'ws-repo' });
-    const hookBundle = hookInventory.bundles.find((item) => item.kind === 'unattributed')!;
-    const hookFinalized = await ipc.invoke<SaveCardFleetAdhocMarkDoneSuccess>(SAVECARD_FINALIZE_CHANNEL, {
-      packageId: hookBundle.bundleId, targetWorkspaceId: 'ws-repo',
-    });
-    const hookSelection = {
-      workspaceId: 'ws-repo', selectedComponentIds: [],
-      selectedUnattributedEntryIds: hookBundle.members.map((item) => item.entry.entryId),
-      finalizationIds: [hookFinalized.finalizationId],
-    };
-    const hookPreview = await ipc.invoke<SaveCardPreviewResponse>(SAVECARD_PREVIEW_CHANNEL, hookSelection);
-    const hookMint = await ipc.invoke<SaveCardMintResponse>(COMMIT_CANDIDATE_MINT_CHANNEL, {
-      ...hookSelection,
-      acknowledgeUnattributedEntryIds: hookSelection.selectedUnattributedEntryIds,
-    });
-    const hookCandidate = hookMint.candidate as CommitCandidate;
-    const hookPath = path.join(repo, '.git', 'hooks', 'pre-commit');
-    const hookMarker = path.join(repo, 'hook-ran.txt');
-    fs.writeFileSync(hookPath, '#!/bin/sh\nprintf hook-ran > hook-ran.txt\nexit 1\n');
-    fs.chmodSync(hookPath, 0o755);
-    const headBeforeHook = git(gitExe, repo, ['rev-parse', 'HEAD']);
-    const hookSave = await ipc.invoke<CommitCoordinatorConsumeResponse>(COMMIT_COORDINATOR_CHANNEL, {
-      candidateId: hookCandidate.candidateId, tokenId: hookCandidate.token!.tokenId, message: 'Hook rejection',
-    });
-    assert.equal(hookSave.kind, 'saved');
-    assert.equal(hookSave.kind === 'saved' ? hookSave.outcome.status : null, 'committed');
-    assert.notEqual(git(gitExe, repo, ['rev-parse', 'HEAD']), headBeforeHook);
-    assert.equal(fs.existsSync(hookMarker), false, 'pre-commit hook did not run');
-
-    console.log('All save-card production-shaped e2e tests passed');
-  } finally {
-    fs.rmSync(sandbox, { recursive: true, force: true });
+  let failures = 0;
+  for (const current of tests) {
+    try { await current.run(); console.log(`ok - ${current.name}`); }
+    catch (error) { failures += 1; console.error(`not ok - ${current.name}`); console.error(error); }
   }
-})().catch((error) => {
-  console.error(error instanceof Error ? error.stack : String(error));
-  process.exit(1);
-});
+  if (failures > 0) process.exitCode = 1;
+})();

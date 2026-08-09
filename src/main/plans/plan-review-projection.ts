@@ -6,12 +6,13 @@ import type { PlanExecutionRun } from '../database';
 import type { RunGitLike } from '../git-checkpoints/checkpoint-service';
 import { runGit as realRunGit } from '../git-checkpoints/git-command';
 import type { CommitCandidate, SelectionPreview } from '../../shared/commit-candidates';
+import type { BundleCaptureHealth, ConflictComponent } from '../../shared/commit-candidates';
 import type {
   PlanReviewBaselineDiff,
   PlanReviewCaptureGapAnnotation,
   PlanReviewMixedAuthorshipAnnotation,
   PlanReviewProjection,
-  SaveCardBundle,
+  SaveIntentUnitDto,
 } from '../../shared/types';
 import type { MissionBoardPlanEvidence } from './mission-board-evidence';
 
@@ -27,8 +28,10 @@ export interface PlanReviewProjectionInput {
   evidence: MissionBoardPlanEvidence;
   /** Exact SC-WP-3G result: embedded without cloning or re-shaping. */
   scObject: CommitCandidate | SelectionPreview;
-  /** Raw SC bundles are annotation + D-1 audit inputs, never reassembled here. */
-  scBundles: readonly SaveCardBundle[];
+  /** Intent units own grouping; topology and health remain read-only evidence. */
+  intentUnits: readonly SaveIntentUnitDto[];
+  topologyComponents: readonly ConflictComponent[];
+  captureHealthByComponentId: Readonly<Record<string, BundleCaptureHealth>>;
 }
 
 export interface PlanReviewProjectionDeps {
@@ -65,10 +68,10 @@ function repositoryPath(workspacePrefix: string, path: string): string {
 }
 
 function untrackedRepositoryPaths(
-  bundles: readonly SaveCardBundle[],
+  intentUnits: readonly SaveIntentUnitDto[],
   included: ReadonlySet<string>,
 ): string[] {
-  return uniqueSorted(bundles.flatMap((bundle) => bundle.members.flatMap(({ entry }) => {
+  return uniqueSorted(intentUnits.flatMap((unit) => unit.members.flatMap(({ entry }) => {
     if (entry.entryKind !== 'untracked') return [];
     const path = entry.path.displayPath.replace(/\\/g, '/');
     return included.has(path) ? [path] : [];
@@ -80,7 +83,7 @@ function untrackedRepositoryPaths(
  * with read-only `diff --no-index`. No identity is derived from this patch. */
 export async function readPlanReviewBaselineDiff(
   input: Pick<PlanReviewProjectionInput,
-    'repoRoot' | 'workspacePrefix' | 'executionRun' | 'evidence' | 'scBundles'>,
+    'repoRoot' | 'workspacePrefix' | 'executionRun' | 'evidence' | 'intentUnits'>,
   deps: PlanReviewProjectionDeps = {},
 ): Promise<PlanReviewBaselineDiff> {
   const runGit = deps.runGit ?? realRunGit;
@@ -122,7 +125,7 @@ export async function readPlanReviewBaselineDiff(
   ], { gitExe: deps.gitExe, maxBytes: DIFF_MAX_BYTES, timeoutMs: DIFF_TIMEOUT_MS });
 
   const patchParts = tracked.stdout ? [tracked.stdout] : [];
-  for (const path of untrackedRepositoryPaths(input.scBundles, new Set(repositoryPaths))) {
+  for (const path of untrackedRepositoryPaths(input.intentUnits, new Set(repositoryPaths))) {
     const diff = await runGit(input.repoRoot, [
       '--no-pager', 'diff', '--no-index', '--no-ext-diff', '--no-textconv', '--binary',
       '--', '/dev/null', path,
@@ -142,22 +145,21 @@ export async function readPlanReviewBaselineDiff(
   };
 }
 
-function selectedComponentBundles(
+function selectedTopologyComponents(
   scObject: CommitCandidate | SelectionPreview,
-  bundles: readonly SaveCardBundle[],
-): SaveCardBundle[] {
-  const byId = new Map(bundles.flatMap((bundle) =>
-    bundle.component ? [[bundle.component.componentId, bundle] as const] : []));
+  components: readonly ConflictComponent[],
+): ConflictComponent[] {
+  const byId = new Map(components.map((component) => [component.componentId, component] as const));
   const selected = scObject.componentIds.map((componentId) => {
-    const bundle = byId.get(componentId);
-    if (!bundle) throw new Error(`SC component '${componentId}' is unavailable for plan review`);
-    return bundle;
+    const component = byId.get(componentId);
+    if (!component) throw new Error(`SC component '${componentId}' is unavailable for plan review`);
+    return component;
   });
   const memberIds = new Set(scObject.members.map((member) => member.entryId));
-  for (const bundle of selected) {
-    const missing = bundle.component!.dirtyEntryIds.filter((entryId) => !memberIds.has(entryId));
+  for (const component of selected) {
+    const missing = component.dirtyEntryIds.filter((entryId) => !memberIds.has(entryId));
     if (missing.length > 0) {
-      throw new Error(`plan review cannot split SC component '${bundle.component!.componentId}' (missing ${missing.join(', ')})`);
+      throw new Error(`plan review cannot split SC component '${component.componentId}' (missing ${missing.join(', ')})`);
     }
   }
   return selected;
@@ -165,10 +167,9 @@ function selectedComponentBundles(
 
 function mixedAuthorshipAnnotations(
   planId: string,
-  bundles: readonly SaveCardBundle[],
+  components: readonly ConflictComponent[],
 ): PlanReviewMixedAuthorshipAnnotation[] {
-  return bundles.flatMap((bundle) => {
-    const component = bundle.component!;
+  return components.flatMap((component) => {
     const planIds = [...new Set(component.associations.map((a) => a.planId))];
     const otherPlanIds = planIds.filter((id) => id !== planId);
     const reasons: PlanReviewMixedAuthorshipAnnotation['reasons'] = [];
@@ -189,10 +190,12 @@ function mixedAuthorshipAnnotations(
 
 function captureGapAnnotations(
   evidence: MissionBoardPlanEvidence,
-  bundles: readonly SaveCardBundle[],
+  components: readonly ConflictComponent[],
+  captureHealthByComponentId: Readonly<Record<string, BundleCaptureHealth>>,
 ): PlanReviewCaptureGapAnnotation[] {
-  const componentGaps = bundles.flatMap((bundle): PlanReviewCaptureGapAnnotation[] => {
-    const health = bundle.captureHealth;
+  const componentGaps = components.flatMap((component): PlanReviewCaptureGapAnnotation[] => {
+    const health = captureHealthByComponentId[component.componentId];
+    if (!health) return [];
     const incompleteTurnIds = health.turns.filter((turn) =>
       turn.beforeEdge !== 'verified-live' || turn.afterEdge !== 'verified-live'
       || turn.failureClass !== 'none').map((turn) => turn.turnId);
@@ -203,7 +206,7 @@ function captureGapAnnotations(
     }
     if (reasons.length === 0) return [];
     return [{
-      source: 'component-capture', componentId: bundle.component!.componentId,
+      source: 'component-capture', componentId: component.componentId,
       turnIds: uniqueSorted(incompleteTurnIds),
       pathsWithoutFinalizationEdge: uniqueSorted(health.pathsWithoutFinalizationEdge), reasons,
     }];
@@ -227,15 +230,15 @@ export async function projectPlanReview(
   if (input.evidence.workspaceId !== input.workspaceId || input.evidence.planId !== input.planId) {
     throw new Error('mission-board evidence does not match the requested workspace/plan');
   }
-  const selectedBundles = selectedComponentBundles(input.scObject, input.scBundles);
+  const selectedComponents = selectedTopologyComponents(input.scObject, input.topologyComponents);
   return {
     workspaceId: input.workspaceId,
     planId: input.planId,
     baselineDiff: await readPlanReviewBaselineDiff(input, deps),
     scObject: input.scObject,
     annotations: {
-      mixedAuthorship: mixedAuthorshipAnnotations(input.planId, selectedBundles),
-      captureGaps: captureGapAnnotations(input.evidence, selectedBundles),
+      mixedAuthorship: mixedAuthorshipAnnotations(input.planId, selectedComponents),
+      captureGaps: captureGapAnnotations(input.evidence, selectedComponents, input.captureHealthByComponentId),
     },
     evidenceSemantics: 'activity-only-never-completion',
   };

@@ -94,10 +94,6 @@ import {
   type ProtectionCheckpointEdge,
   type RunProtectionGitBytes,
 } from './protection-read';
-import {
-  projectWorkBundles,
-  type WorkBundle,
-} from './work-bundle';
 import { ComposeLockRegistry } from './compose-lock-registry';
 import {
   parseFinalizationManifest,
@@ -120,7 +116,7 @@ function isCrossIntentAtom(atom: ReviewChallengeAtom): atom is import('../../sha
 }
 
 export function reviewChallengeAtomsForInventory(inventory: DirtyInventory): readonly ReviewChallengeAtom[] {
-  return assemblyByInventory.get(inventory)?.overlapChallengeAtoms ?? [];
+  return assemblyByInventory.get(inventory)?.reviewChallengeAtoms ?? [];
 }
 
 export type CandidateTokenState = 'issued' | 'consuming' | 'consumed';
@@ -206,6 +202,10 @@ export interface CandidateServiceDeps {
   tokenStore?: CandidateTokenStoreOptions;
   /** WP-5 inventory roots. These are physical worktrees, not workspace rows. */
   readActivePlanningWorktrees?: () => readonly PlanningActivityWorktree[];
+  listSaveIntents?: typeof listSaveIntentsForRepository;
+  listNamedSaveSetMembers?: typeof listNamedSaveSetMembers;
+  getPlan?: typeof getPlan;
+  getPlanItem?: typeof getPlanWorkPackage;
 }
 
 function deepFreeze<T>(value: T): T {
@@ -373,7 +373,7 @@ export class CommitCandidateService {
           eligibility: {
             eligible: false,
             reason: acknowledgement
-              ? ('overlap-not-acknowledged' as const)
+              ? ('unattributed-not-acknowledged' as const)
               : ('byte-mismatch' as const),
           },
         };
@@ -466,9 +466,6 @@ export class CommitCandidateService {
     request: MintCandidateTokenRequestV2 & ReviewCarryEvidence,
     context: CandidateBuildContext,
   ): CommitCandidate | SelectionPreview {
-    if (process.env.LARES_INTENT_PACKAGING !== '1') {
-      throw new Error('intent-first candidate packaging is disabled');
-    }
     const normalizedRequest: MintCandidateTokenRequestV2 = {
       selectedIntentIds: sortedUniqueStrings(request.selectedIntentIds),
       selectedNamedSaveSetIds: sortedUniqueStrings(request.selectedNamedSaveSetIds),
@@ -604,9 +601,7 @@ export class CommitCandidateService {
     }));
     const activityRows = this.deps.readActivePlanningWorktrees
       ? this.deps.readActivePlanningWorktrees()
-      : process.env.LARES_INTENT_PACKAGING === '1'
-        ? listPlanningActivityWorktrees(['active'])
-        : [];
+      : listPlanningActivityWorktrees(['active']);
     const inputs = enumeratePlanningActivityScopeInputs(primaryInputs, activityRows.map((row) => ({
       executionRunId: row.executionRunId,
       logicalWorkspaceId: row.logicalWorkspaceId,
@@ -777,24 +772,21 @@ export class CommitCandidateService {
       gitExe,
     });
 
-    let intentUnits: CandidateIntentUnit[] | undefined;
-    if (process.env.LARES_INTENT_PACKAGING === '1') {
-      const intentAssembly = projectIntentUnits({
+    const intentAssembly = projectIntentUnits({
         inventory: assembly.inventory,
         witnesses,
-        intents: listSaveIntentsForRepository(repository.repositoryKey),
-        namedMembers: listNamedSaveSetMembers(repository.repositoryKey),
+        intents: (this.deps.listSaveIntents ?? listSaveIntentsForRepository)(repository.repositoryKey),
+        namedMembers: (this.deps.listNamedSaveSetMembers ?? listNamedSaveSetMembers)(repository.repositoryKey),
         topology: assembly,
       });
-      intentUnits = intentAssembly.intentUnits.map((unit) => ({
+    const intentUnits: CandidateIntentUnit[] = intentAssembly.intentUnits.map((unit) => ({
         intentId: unit.intent.id, kind: unit.intent.kind, revision: unit.intent.revision,
         title: unit.intent.title, planId: unit.intent.planId, planItemId: unit.intent.planItemId,
-        planTitle: unit.intent.planId ? getPlan(unit.intent.planId)?.slug ?? null : null,
-        planItemTitle: unit.intent.planItemId ? getPlanWorkPackage(unit.intent.planItemId)?.title ?? null : null,
+        planTitle: unit.intent.planId ? (this.deps.getPlan ?? getPlan)(unit.intent.planId)?.slug ?? null : null,
+        planItemTitle: unit.intent.planItemId ? (this.deps.getPlanItem ?? getPlanWorkPackage)(unit.intent.planItemId)?.title ?? null : null,
         memberEntryIds: unit.memberEntryIds,
         contributingTurnIds: unit.contributingTurnIds,
       }));
-    }
     const witnessedProvenanceByTurnId = new Map<string, Readonly<WitnessedCommitProvenance>>();
     if (this.deps.readWitnessedProvenance) {
       for (const witness of witnesses) {
@@ -814,21 +806,6 @@ export class CommitCandidateService {
       ...(intentUnits ? { intentUnits } : {}),
       ...(witnessedProvenanceByTurnId.size > 0 ? { witnessedProvenanceByTurnId } : {}),
     };
-  }
-
-  async listWorkBundles(request: CandidateReadRequest): Promise<WorkBundle[]> {
-    return projectWorkBundles(await this.assembleInventory(request));
-  }
-
-  /**
-   * SC-WP-2L — the full read-only inventory view: renderer bundles plus the
-   * retention quota-weakening warning attached to the same assembly.
-   */
-  async listInventoryView(
-    request: CandidateReadRequest,
-  ): Promise<{ bundles: WorkBundle[]; quotaWeakening: SaveCardQuotaWeakening | null }> {
-    const read = await this.assembleInventory(request);
-    return { bundles: projectWorkBundles(read), quotaWeakening: read.quotaWeakening };
   }
 }
 
@@ -1014,20 +991,11 @@ function projectTopology(
     && retainedMemberPaths.has(edge.rightPathBytesBase64));
   const selectedUnattributedPathBytesBase64 = topology.selectedUnattributedPathBytesBase64
     .filter((path) => retainedMemberPaths.has(path));
-  const requiresOverlapAck = ownershipGroupKeys.length >= 2 || componentPathSets.some((paths) => {
-    const pathSet = new Set(paths);
-    return new Set(
-      contributors
-        .filter((contributor) => pathSet.has(contributor.pathBytesBase64))
-        .map(ownershipGroupKey),
-    ).size >= 2;
-  });
   return {
     componentPathSets,
     contributors,
     ownershipGroupKeys,
     componentEdges,
-    requiresOverlapAck,
     selectedUnattributedPathBytesBase64,
   };
 }
@@ -1039,7 +1007,7 @@ function selectedTopologyEvidence(
   const selectedMemberPaths = new Set(candidate.members.map((member) => member.path.pathBytesBase64));
   const assembly = assemblyByInventory.get(context.inventory);
   const topology = context.reviewedAttributionTopology ?? assembly?.selectedTopology;
-  const atoms = context.reviewChallengeAtoms ?? assembly?.overlapChallengeAtoms;
+  const atoms = context.reviewChallengeAtoms ?? assembly?.reviewChallengeAtoms;
   if (topology && atoms) {
     return {
       topology: projectTopology(topology, selectedMemberPaths),
@@ -1048,14 +1016,10 @@ function selectedTopologyEvidence(
     };
   }
 
-  // Compatibility for directly-constructed, non-overlapping unit contexts. A
-  // carry-capable overlapping context must supply WP-2's structured evidence;
-  // an opaque digest is deliberately never promoted into review identity.
+  // Compatibility for directly-constructed unit contexts. Topology remains
+  // disclosure evidence and never creates a generic acknowledgement gate.
   const selectedComponents = context.components.filter((component) =>
     candidate.componentIds.includes(component.componentId));
-  if (selectedComponents.some((component) => component.overlap.requiresOverlapAck)) {
-    throw new Error('Structured overlap topology is unavailable for reviewed-manifest construction.');
-  }
   const entryById = new Map(context.inventory.entries.map((entry) => [entry.entryId, entry]));
   const componentPathSets = selectedComponents.map((component) => component.dirtyEntryIds
     .map((entryId) => entryById.get(entryId)?.path.pathBytesBase64)
@@ -1067,7 +1031,6 @@ function selectedTopologyEvidence(
       contributors: [],
       ownershipGroupKeys: [],
       componentEdges: [],
-      requiresOverlapAck: false,
       selectedUnattributedPathBytesBase64: candidate.selectedUnattributedEntryIds
         .map((entryId) => entryById.get(entryId)?.path.pathBytesBase64)
         .filter((path): path is string => path !== undefined)
@@ -1299,8 +1262,7 @@ function challengeMatchesTopology(manifest: AnyReviewedSemanticManifest): boolea
     .map((atom) => atom.pathBytesBase64));
   if (!manifest.attributionTopology.selectedUnattributedPathBytesBase64.every((path) =>
     unattributedAtoms.has(path))) return false;
-  return !manifest.attributionTopology.requiresOverlapAck
-    || manifest.challengeAtoms.some((atom) => atom.kind === 'overlap');
+  return true;
 }
 
 /** Adopted carry predicate: equality of the reviewed universe with the sole
@@ -1912,7 +1874,7 @@ export function buildCandidateV2(
     return { ...built, eligibility: { eligible: false, reason: 'resolution-stale' } };
   }
   const resolutions = selectedResolutions as ReviewedAttributionResolution[];
-  const crossAtoms = (context.reviewChallengeAtoms ?? assemblyByInventory.get(context.inventory)?.overlapChallengeAtoms ?? [])
+  const crossAtoms = (context.reviewChallengeAtoms ?? assemblyByInventory.get(context.inventory)?.reviewChallengeAtoms ?? [])
     .filter((atom): atom is import('../../shared/commit-candidates').CrossIntentChallengeAtom =>
       isCrossIntentAtom(atom)
       && selectedEntrySet.has(context.inventory.entries.find((entry) =>
@@ -1983,9 +1945,4 @@ function evaluateEligibility(inputs: EligibilityInputs): CommitEligibility {
 // Kept structural and read-only for consumers that prefer a facade interface.
 export interface CommitCandidateReadFacade {
   assembleInventory(request: CandidateReadRequest): Promise<CandidateInventoryRead>;
-  listWorkBundles(request: CandidateReadRequest): Promise<WorkBundle[]>;
-  listInventoryView(request: CandidateReadRequest): Promise<{
-    bundles: WorkBundle[];
-    quotaWeakening: SaveCardQuotaWeakening | null;
-  }>;
 }

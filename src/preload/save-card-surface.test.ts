@@ -46,7 +46,8 @@ for (const surface of [saveCard, plan, missionBoard]) {
   assert.equal(surface.includes('window.api.commitCoordinator.mint('), false);
 }
 assert.ok(candidateSubmit.includes('window.api.saveCard.preview('));
-assert.ok(candidateSubmit.includes('window.api.commitCoordinator.mint('));
-assert.ok(candidateSubmit.includes('window.api.commitCoordinator.commit('));
+assert.ok(candidateSubmit.includes('window.api.saveCard.sweep('));
+assert.equal(candidateSubmit.includes('window.api.commitCoordinator.mint('), false);
+assert.equal(candidateSubmit.includes('window.api.commitCoordinator.commit('), false);
 
 console.log('  ✓ preload bindings match the one shared Save/Plan transaction helper');

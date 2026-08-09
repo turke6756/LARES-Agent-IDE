@@ -140,8 +140,7 @@ export async function consumeCommitCoordinatorForSweep(
     telemetry({ stage: 'token-consume', code: 'token-unresolved-or-expired' });
     return { attempt: { created: false }, reconciliation: 'not-applicable', response };
   }
-  if (process.env.LARES_INTENT_PACKAGING === '1'
-      && snapshot.token.contractVersion !== 2) {
+  if (snapshot.token.contractVersion !== 2) {
     const response = passthroughResult({ kind: 'token-unresolved' });
     telemetry({ stage: 'token-consume', code: 'v2-token-required' });
     return { attempt: { created: false }, reconciliation: 'not-applicable', response };

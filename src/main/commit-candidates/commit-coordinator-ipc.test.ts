@@ -13,12 +13,7 @@ import {
   type CommitCoordinatorRoutes,
 } from './commit-coordinator-ipc';
 import type { IpcLike } from './save-card-ipc';
-import {
-  reconcileCommittedCandidate,
-  type CommitClosureStore,
-  type ReconcileCommittedCandidateResult,
-} from '../git-checkpoints/commit-reconciler';
-import type { CommitLedgerWrite } from '../database';
+import type { ReconcileCommittedCandidateResult } from '../git-checkpoints/commit-reconciler';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -40,17 +35,23 @@ const PARENT_OID = 'a'.repeat(40);
 
 function snapshotFixture(candidateId = 'candidate-1', tokenId = 'token-1'): CandidateTokenSnapshot {
   const pathBytesBase64 = Buffer.from('file.txt').toString('base64');
-  const token = { tokenId, candidateId, contractVersion: 1, issuedAt: 1, expiresAt: 999 };
+  const token = {
+    tokenId, candidateId, contractVersion: 2, issuedAt: 1,
+    expiresAt: Number.MAX_SAFE_INTEGER,
+  };
   return {
     token,
     candidate: {
       candidateId,
-      contractVersion: 1,
+      contractVersion: 2,
       repository: {
         repositoryKey: 'repo-1', objectDatabaseKey: 'odb-1', gitObjectFormat: 'sha1',
         bareRepo: false, workspaces: [{ workspaceId: 'ws-1', workspacePrefix: '' }],
       },
       componentIds: ['component-1'],
+      saveIntentIds: ['intent-1'],
+      selectedNamedSaveSetIds: [],
+      attributionResolutions: [],
       selectedUnattributedEntryIds: [],
       members: [{
         entryId: 'entry-1',
@@ -70,10 +71,10 @@ function snapshotFixture(candidateId = 'candidate-1', tokenId = 'token-1'): Cand
     },
     repositoryKey: 'repo-1',
     normalizedRequest: {
-      selectedComponentIds: [],
-      selectedUnattributedEntryIds: [],
+      selectedIntentIds: ['intent-1'],
+      selectedNamedSaveSetIds: [],
+      resolutionIds: [],
       finalizationIds: [],
-      acknowledgeUnattributedEntryIds: [],
     },
     componentTopologyDigest: 'topology-1',
     pinnedHeadOid: PARENT_OID,
@@ -231,21 +232,9 @@ test('funnel telemetry contains stage and stable code only', async () => {
   assert.equal(serialized.includes('C:\\repo'), false);
 });
 
-test('saved is withheld until the integrated 4D → 4G path completes', async () => {
+test('a v2 coordinator outcome closes as saved with intent finalizations', async () => {
   const ipc = new FakeIpc();
   const events: string[] = [];
-  const ledgerWrites: CommitLedgerWrite[] = [];
-  const store: CommitClosureStore = {
-    getCommitRecord: () => null,
-    recordCommitLedger: (write) => { ledgerWrites.push(write); },
-    getPackageFinalization: () => null,
-    listCommitPathLinks: () => [],
-    markPackageFinalizationCommitted: () => undefined,
-  };
-  let releaseReconciliation!: () => void;
-  const reconciliationGate = new Promise<void>((resolve) => {
-    releaseReconciliation = resolve;
-  });
   registerCommitCoordinatorIpc(ipc, () => routesFixture({
     coordinator: {
       commit: async (request) => {
@@ -253,77 +242,16 @@ test('saved is withheld until the integrated 4D → 4G path completes', async ()
         return committedResult();
       },
     },
-    reconcileCommitted: async (input) => {
-      events.push(`4G:${input.outcome.status}:${input.snapshot.candidate.candidateId}`);
-      await reconciliationGate;
-      return reconcileCommittedCandidate({
-        ...input,
-        store,
-        now: () => 10,
-        runGit: async (_cwd, args) => {
-          if (args[0] === 'rev-list') {
-            return { code: 0, stdout: `${COMMIT_OID} ${PARENT_OID}\n`, stderr: '' };
-          }
-          if (args[0] === 'for-each-ref') return { code: 0, stdout: '', stderr: '' };
-          throw new Error(`unexpected git command: ${args.join(' ')}`);
-        },
-        runGitBytes: async (_cwd, args) => {
-          assert.equal(args[0], 'ls-tree');
-          return {
-            code: 0,
-            stdout: Buffer.concat([
-              Buffer.from(`100644 blob ${'b'.repeat(40)}\tfile.txt`),
-              Buffer.from([0]),
-            ]),
-            stderr: '',
-          };
-        },
-      });
-    },
-  }), () => true);
-
-  let settled = false;
-  const pending = ipc.invoke(COMMIT_COORDINATOR_CHANNEL, {
-    candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save it',
-  }).then((value) => { settled = true; return value; });
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(events, ['4D:token-1', '4G:committed:candidate-1']);
-  assert.equal(settled, false, 'the route must not expose saved while 4G is pending');
-
-  releaseReconciliation();
-  const response = await pending;
-  assert.deepEqual(response, {
-    kind: 'saved',
-    outcome: committedResult().outcome,
-    finalizations: [],
-  });
-  assert.equal(ledgerWrites.length, 1, '4G must persist exact ledger links before saved');
-  assert.deepEqual(ledgerWrites[0].pathLinks?.map((link) => link.pathBytesBase64), [
-    Buffer.from('file.txt').toString('base64'),
-  ]);
-  assert.deepEqual(ledgerWrites[0].turnLinks?.map((link) => link.turnId), ['turn-1']);
-});
-
-test('a 4G failure is explicit and can never be mislabeled saved', async () => {
-  const ipc = new FakeIpc();
-  registerCommitCoordinatorIpc(ipc, () => routesFixture({
-    reconcileCommitted: async () => ({
-      ok: false,
-      error: { code: 'tree-mismatch', message: 'marked tree differs' },
-    }),
   }), () => true);
 
   const response = await ipc.invoke(COMMIT_COORDINATOR_CHANNEL, {
     candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save it',
   });
+  assert.deepEqual(events, ['4D:token-1']);
   assert.deepEqual(response, {
-    kind: 'reconciliation-error',
+    kind: 'saved',
     outcome: committedResult().outcome,
-    error: { code: 'tree-mismatch', message: 'marked tree differs' },
-    refusal: {
-      stage: 'reconciliation', code: 'tree-mismatch',
-      message: 'Reconciliation stage refused: marked tree differs',
-    },
+    finalizations: [],
   });
 });
 
@@ -341,27 +269,6 @@ test('the sweep adapter distinguishes pre-consumption refusal from an attempt', 
       refusal: {
         stage: 'token-consume', code: 'token-consume-busy',
         message: 'Token-consume stage refused because another save holds the repository coordinator.',
-      },
-    },
-  });
-});
-
-test('the sweep adapter preserves the known commit when reconciliation transport fails', async () => {
-  const result = await consumeCommitCoordinatorForSweep(
-    { candidateId: 'candidate-1', tokenId: 'token-1', message: 'Save it' },
-    routesFixture({ reconcileCommitted: async () => { throw new Error('database unavailable'); } }),
-    () => undefined,
-  );
-  assert.deepEqual(result, {
-    attempt: { created: true, attemptId: 'attempt-1', commitOid: COMMIT_OID },
-    reconciliation: 'failed',
-    response: {
-      kind: 'reconciliation-error',
-      outcome: committedResult().outcome,
-      error: { code: 'reconciliation-transport-error', message: 'database unavailable' },
-      refusal: {
-        stage: 'reconciliation', code: 'reconciliation-transport-error',
-        message: 'Reconciliation stage refused: database unavailable',
       },
     },
   });

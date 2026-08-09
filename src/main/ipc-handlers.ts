@@ -180,7 +180,6 @@ export function registerActivityMergeIpc(
   getService: () => ActivityMergeService | null,
 ): void {
   ipc.handle(SAVECARD_ACTIVITY_MERGE_RESOLVE_CHANNEL, async (_event, request: SaveCardActivityMergeResolveRequest) => {
-    if (process.env.LARES_INTENT_PACKAGING !== '1') throw new Error('intent packaging is disabled');
     const service = getService();
     if (!service) throw new Error('activity merge unavailable (the engine has not finished bootstrapping)');
     const result = await service.resolveAndPromote(request);
@@ -311,7 +310,7 @@ export function registerIpcHandlers(
   registerSaveCardPreviewIpc(ipcMain, () => saveCardPreviewRoutes);
   registerSaveCardMintIpc(ipcMain, () => saveCardMintRoutes);
   registerSaveCardAttributionResolutionIpc(ipcMain, () =>
-    process.env.LARES_INTENT_PACKAGING === '1' && saveCardMintRoutes?.persistAttributionResolution ? {
+    saveCardMintRoutes?.persistAttributionResolution ? {
       persistAttributionResolution: saveCardMintRoutes.persistAttributionResolution,
     } : null);
   registerSaveCardFinalizeIpc(ipcMain, () => saveCardFinalizeRoutes);

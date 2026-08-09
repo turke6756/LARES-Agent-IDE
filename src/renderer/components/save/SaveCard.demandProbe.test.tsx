@@ -54,7 +54,10 @@ beforeEach(() => {
   storeState.selectedWorkspaceId = 'ws-1';
   storeState.saveCardOpenGesture = false;
   // A clean tree so the card lands in its empty state with a Refresh button.
-  getInventory = vi.fn().mockResolvedValue({ bundles: [], quotaWeakening: null });
+  getInventory = vi.fn().mockResolvedValue({
+    intentUnits: [], unwitnessed: [], legacyTaskIdentityUnavailable: [],
+    legacyFinalizations: [], planningActivities: [], quotaWeakening: null,
+  });
   record = vi.fn().mockResolvedValue({ appended: true, duplicate: false });
   (window as unknown as { api: unknown }).api = {
     saveCard: { getInventory },

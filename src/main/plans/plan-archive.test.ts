@@ -276,44 +276,6 @@ test('reimplementPlan leaves the plan `ready` (resurrected) when Implement fails
   assert.deepEqual(res.failures, ['baseline-ref-failed']);
 });
 
-// ── end-to-end (real DB): archive → reimplement mints a new run, old row retained ──
-
-test('e2e: archive then reimplement mints a NEW run row; the archived run is retained', async () => {
-  const { planId, workspaceId } = mkPlan('ready');
-  mkPkg(workspaceId, planId, 'wp-e2e', 'ready');
-  mkRun('run-old', planId, 1000);                     // plan executing, run-old active
-  const archived = dbm.archivePlanClosingRun(planId);
-  assert.equal(archived.closedRun?.id, 'run-old');
-
-  // Re-Implement with real DB writes; git/tab/supervisor seams injected (unborn ⇒ no ref).
-  const res = await svc.reimplementPlan({ planId, appUserId: 'edward' }, {
-    implementDeps: {
-      refreshAndGetReadiness: async () => ({
-        planId, runState: 'ready',
-        packageCounts: { ready: 1, blocked: 0, executing: 0, done: 0, archived: 0 },
-        wpStatus: 'synced', responsibilityStatus: 'valid', overviewStatus: 'synced',
-        supervisorValid: true, tabsMissingOverview: [], packageConflicts: [],
-        wpDiagnostics: [], overviewDiagnostics: [], refreshError: null, failures: [],
-        canMarkReady: false, canImplement: true,
-      }),
-      resolveRepoContext: async () => ({ repoRoot: 'C:/w', repositoryKey: 'rk' }),
-      probeBaseline: async () => ({ ok: true, kind: 'unborn' }),
-    },
-  });
-
-  assert.equal(res.ok, true, `reimplement failed: ${res.failures.join(',')}`);
-  assert.equal(res.resurrected, true);
-  const newId = res.run?.id;
-  assert.ok(newId && newId !== 'run-old', 'a fresh run id was minted');
-  assert.equal(dbm.getPlan(planId)?.runState, 'executing');
-  assert.equal(dbm.getActivePlanExecutionRun(planId)?.id, newId);
-
-  // The old run is untouched: still archived, still present (retains its ref/row).
-  assert.equal(dbm.getPlanExecutionRun('run-old')?.lifecycleState, 'archived');
-  assert.ok(dbm.listAllPlanExecutionRunIds().has('run-old'));
-  assert.ok(dbm.listAllPlanExecutionRunIds().has(newId!));
-});
-
 (async () => {
   const tmpAppData = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-archive-'));
   process.env.APPDATA = tmpAppData;

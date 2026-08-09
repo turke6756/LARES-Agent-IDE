@@ -218,7 +218,7 @@ test('revive freezes carry/explicit/none, validates explicit items (SC-WP-3A), a
   }
 });
 
-test('intentPackaging carries the immutable task stamp through fork and revive', async () => {
+test('immutable task stamps carry through fork and revive', async () => {
   const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), 'intent-carry-'));
   const source = makeAgent('intent-source', {
     workspaceId: 'ws-1', workingDirectory: workspacePath, command: 'claude',
@@ -226,8 +226,6 @@ test('intentPackaging carries the immutable task stamp through fork and revive',
   });
   const agents = [source];
   const restore = patchDatabase(workspacePath, agents);
-  const priorFlag = process.env.LARES_INTENT_PACKAGING;
-  process.env.LARES_INTENT_PACKAGING = '1';
   try {
     const supervisor = quietSupervisor();
     const forked = await supervisor.forkAgent(source.id, { message: 'same task fork' });
@@ -260,8 +258,6 @@ test('intentPackaging carries the immutable task stamp through fork and revive',
     assert.equal((await contextOf(source, explicit.dispatch)).intentStamp, undefined,
       'an explicit new dispatch choice cannot inherit the prior task identity');
   } finally {
-    if (priorFlag === undefined) delete process.env.LARES_INTENT_PACKAGING;
-    else process.env.LARES_INTENT_PACKAGING = priorFlag;
     restore();
     fs.rmSync(workspacePath, { recursive: true, force: true });
   }

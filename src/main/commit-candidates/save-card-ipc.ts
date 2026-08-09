@@ -2,7 +2,7 @@
 //
 // The routes object owns the CommitCandidateService and all Git/database
 // dependencies. This layer only validates the renderer request and transports
-// the renderer-safe WorkBundle DTO. The Stage 1 inventory channel is deliberately
+// the renderer-safe intent-unit DTO. The inventory channel is deliberately
 // read-only.
 //
 // SC-WP-3E — fleet-adhoc mark-done finalization channel.
@@ -52,6 +52,7 @@ import {
 } from './finalization-service';
 import {
   buildCandidate,
+  buildCandidateV2,
   buildReviewedSemanticManifest,
   computeCandidateTopologyDigest,
   rememberReviewedSemanticManifest,
@@ -379,37 +380,22 @@ export function registerSaveCardFinalizeIpc(
       }
       throw error;
     }
-    const finalizeRequest: FinalizePackageRequest = {
+    const result = await finalizeSaveUnit({
       ...context,
+      saveUnitId: context.packageId,
+      saveUnitKind: 'named-save-set',
+    }, routes.finalizeIntentDeps);
+    const outcome: FinalizeOutcome = result.outcome;
+    const response: Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }> = {
+      finalizationId: result.finalization.id,
+      packageId: result.finalization.saveUnitId,
       finalizationKind: 'fleet-adhoc',
-      planId: null,
-      planItemId: null,
+      outcome,
+      boundaryRef: result.finalization.boundaryRef,
+      boundaryStatus: result.finalization.boundaryStatus,
+      packageRevision: result.finalization.revision,
+      pinnedSelection: context.pinnedSelection,
     };
-    const intentPackaging = process.env.LARES_INTENT_PACKAGING === '1';
-    let outcome: FinalizeOutcome;
-    let response: Exclude<SaveCardFleetAdhocMarkDoneResponse, { ok: false }>;
-    if (intentPackaging) {
-      const result = await finalizeSaveUnit({
-        ...context,
-        saveUnitId: context.packageId,
-        saveUnitKind: 'named-save-set',
-      }, routes.finalizeIntentDeps);
-      outcome = result.outcome;
-      response = {
-        finalizationId: result.finalization.id,
-        packageId: result.finalization.saveUnitId,
-        finalizationKind: 'fleet-adhoc',
-        outcome,
-        boundaryRef: result.finalization.boundaryRef,
-        boundaryStatus: result.finalization.boundaryStatus,
-        packageRevision: result.finalization.revision,
-        pinnedSelection: context.pinnedSelection,
-      };
-    } else {
-      const result = await finalizePackage(finalizeRequest, routes.finalizeDeps);
-      outcome = result.outcome;
-      response = toMarkDoneResponse(result.finalization, outcome, context.pinnedSelection);
-    }
     if (outcome !== 'boundary-unavailable') {
       telemetry({ stage: 'freeze', code: 'freeze-ready' });
       return response;
@@ -483,13 +469,15 @@ function requirePreviewRequest(raw: unknown): SaveCardPreviewRequest {
     }
     return value as string[];
   };
+  const optionalStrings = (field: string): string[] => record[field] === undefined
+    ? [] : asStringArray(record[field], field);
   return {
     workspaceId: record.workspaceId,
-    selectedComponentIds: asStringArray(record.selectedComponentIds, 'selectedComponentIds'),
-    selectedUnattributedEntryIds: asStringArray(
-      record.selectedUnattributedEntryIds,
-      'selectedUnattributedEntryIds',
-    ),
+    selectedComponentIds: optionalStrings('selectedComponentIds'),
+    selectedUnattributedEntryIds: optionalStrings('selectedUnattributedEntryIds'),
+    selectedIntentIds: optionalStrings('selectedIntentIds'),
+    selectedNamedSaveSetIds: optionalStrings('selectedNamedSaveSetIds'),
+    resolutionIds: optionalStrings('resolutionIds'),
     finalizationIds: asStringArray(record.finalizationIds, 'finalizationIds'),
     ...(record.reviewedManifestDigest !== undefined
       ? { reviewedManifestDigest: requireOptionalDigest(record.reviewedManifestDigest) }
@@ -515,18 +503,6 @@ function requireMintRequest(raw: unknown): SaveCardMintRequest {
     throw new SaveCardIpcError('a mint request is required', 'save-card-bad-request');
   }
   const record = raw as Record<string, unknown>;
-  if (process.env.LARES_INTENT_PACKAGING !== '1'
-      && Array.isArray(record.selectedComponentIds)
-      && Array.isArray(record.selectedUnattributedEntryIds)) {
-    const legacyFields = new Set([
-      'workspaceId', 'selectedComponentIds', 'selectedUnattributedEntryIds', 'finalizationIds',
-      'acknowledgeUnattributedEntryIds', 'reviewedManifestDigest', 'acknowledgedChallengeAtoms',
-      ['acknowledge', 'TopologyDigest'].join(''),
-    ]);
-    const unexpected = Object.keys(record).find((field) => !legacyFields.has(field));
-    if (unexpected) throw new SaveCardIpcError(`unexpected mint request field: ${unexpected}`, 'save-card-bad-request');
-    return record as unknown as SaveCardMintRequest;
-  }
   const unexpected = Object.keys(record).filter((field) => !MINT_REQUEST_FIELDS.has(field));
   if (unexpected.length > 0) {
     throw new SaveCardIpcError(`unexpected mint request field: ${unexpected[0]}`, 'save-card-bad-request');
@@ -608,17 +584,6 @@ function deriveLaresTrailers(
 
 /** Whether the selected components fuse ≥2 owners/plans and so need an explicit
  *  overlap acknowledgement before a token can mint. */
-function selectionRequiresOverlapAck(
-  request: SaveCardPreviewRequest,
-  context: CandidateBuildContext,
-): boolean {
-  const selectedComponentIds = new Set(request.selectedComponentIds);
-  return context.components.some(
-    (component) =>
-      selectedComponentIds.has(component.componentId) && component.overlap.requiresOverlapAck,
-  );
-}
-
 /** The server-computed union topology digest for the exact selected set. Stable
  *  across previews of the same selection (a hash of the selection, not the bytes),
  *  so the renderer can echo it back as the overlap acknowledgement. */
@@ -866,8 +831,8 @@ function toPreviewResponse(
         inventory: context.inventory,
         components: context.components,
         finalizations: context.finalizations.filter((row) => requestedIds.has(row.id)),
-        requestedComponentIds: request.selectedComponentIds,
-        requestedUnattributedEntryIds: request.selectedUnattributedEntryIds,
+        requestedComponentIds: request.selectedComponentIds ?? [],
+        requestedUnattributedEntryIds: request.selectedUnattributedEntryIds ?? [],
       })
     : null;
   const pinnedSelection = driftResult?.pinnedSelection ?? {
@@ -888,7 +853,6 @@ function toPreviewResponse(
     isCandidate: isCommitCandidate(candidate),
     laresTrailers: deriveLaresTrailers(request, candidate, context),
     defaultMessageBody,
-    requiresOverlapAck: selectionRequiresOverlapAck(request, context),
     // Every selected unattributed atom needs an explicit acknowledgement (D-5).
     unacknowledgedUnattributedEntryIds: [...pinnedSelection.selectedUnattributedEntryIds],
     componentTopologyDigest: selectionTopologyDigest(request, candidate, context),
@@ -916,8 +880,7 @@ function candidateRefusal(
     };
   }
   if (!candidate.eligibility.eligible) {
-    const acknowledgement = candidate.eligibility.reason === 'overlap-not-acknowledged'
-      || candidate.eligibility.reason === 'unattributed-not-acknowledged';
+    const acknowledgement = candidate.eligibility.reason === 'unattributed-not-acknowledged';
     return {
       stage,
       code: mint && acknowledgement ? 'acknowledgement-stale' : mint ? 'mint-refused' : 'preview-ineligible',
@@ -954,13 +917,25 @@ export function registerSaveCardPreviewIpc(
     const routes = requirePreviewRoutes(getRoutes());
     const request = requirePreviewRequest(raw);
     const context = await routes.resolvePreviewContext(request);
-    const selection: CandidateSelectionRequest = {
-      selectedComponentIds: request.selectedComponentIds,
-      selectedUnattributedEntryIds: request.selectedUnattributedEntryIds,
+    const intentSelection = (request.selectedIntentIds?.length ?? 0) > 0
+      || (request.selectedNamedSaveSetIds?.length ?? 0) > 0;
+    const candidate = intentSelection ? buildCandidateV2({
+      selectedIntentIds: request.selectedIntentIds ?? [],
+      selectedNamedSaveSetIds: request.selectedNamedSaveSetIds ?? [],
+      resolutionIds: request.resolutionIds ?? [],
       finalizationIds: request.finalizationIds,
+      acknowledgeUnattributedEntryIds: [],
+    }, context) : buildCandidate({
+      selectedComponentIds: request.selectedComponentIds ?? [],
+      selectedUnattributedEntryIds: request.selectedUnattributedEntryIds ?? [],
+      finalizationIds: request.finalizationIds,
+    }, context);
+    const compatibilityRequest: SaveCardPreviewRequest = {
+      ...request,
+      selectedComponentIds: candidate.componentIds,
+      selectedUnattributedEntryIds: candidate.selectedUnattributedEntryIds,
     };
-    const candidate = buildCandidate(selection, context);
-    const response = toPreviewResponse(request, candidate, context);
+    const response = toPreviewResponse(compatibilityRequest, candidate, context);
     telemetry(response.refusal
       ? { stage: response.refusal.stage, code: response.refusal.code }
       : { stage: 'preview-verify', code: 'preview-eligible' });

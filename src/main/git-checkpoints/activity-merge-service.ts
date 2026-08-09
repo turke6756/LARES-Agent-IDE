@@ -23,6 +23,7 @@ import {
   type PlanningActivityWorktree,
 } from '../database';
 import { runGit as realRunGit, runGitBytes as realRunGitBytes, type GitRunBytesResult, type GitRunResult, type RunGitOptions } from './git-command';
+import { recordIntentArchitectureEvent } from './intent-architecture-telemetry';
 
 const OID_RE = /^[0-9a-f]{40,64}$/;
 const OPTS: RunGitOptions = { allowNonzero: true, timeoutMs: 60_000, maxBytes: 64 << 20 };
@@ -191,6 +192,7 @@ export class ActivityMergeService {
     }
     if (base === theirs) {
       this.store.updateActivity({ executionRunId, promotedHeadOid: ours, state: 'active', failureCode: null, updatedAt: this.now() });
+      recordIntentArchitectureEvent('promoted');
       return { status: 'promoted', attemptId: resumed?.id ?? 'already-promoted', primaryHeadOid: ours };
     }
 
@@ -325,6 +327,7 @@ export class ActivityMergeService {
       });
       this.store.updateAttempt({ id: attempt.id, state: 'committed', proposedCommitOid: proposed, endedAt: this.now() });
       this.store.updateActivity({ executionRunId, promotedHeadOid: proposed, state: 'active', failureCode: null, updatedAt: this.now() });
+      recordIntentArchitectureEvent('promoted');
       return { status: 'promoted', attemptId: attempt.id, primaryHeadOid: proposed };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);

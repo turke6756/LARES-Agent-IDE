@@ -792,8 +792,7 @@ function resolveLifecycleIntentStamp(
   requested: RequestedPlanBinding | undefined,
   carrySource: 'fork-carry' | 'revive-carry',
 ): ResolvedIntentStamp | undefined {
-  if (process.env.LARES_INTENT_PACKAGING !== '1'
-      || (requested && requested.mode !== 'agent-default')) return undefined;
+  if (requested && requested.mode !== 'agent-default') return undefined;
   const latest = listTurnRecords(agent.workspaceId, { agentId: agent.id, limit: 200 })
     .reverse()
     .find((turn) => turn.intentId && turn.status !== 'delivery_failed');

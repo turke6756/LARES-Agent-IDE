@@ -179,7 +179,6 @@ test('confirmation fails closed when the private dispatch intent differs from th
     targetAgentId: s.agentId, ownerAgentId: null, promptText: 'Implement package',
     createdAt: 2000,
   }, {
-    intentPackaging: true,
     getActiveActivity: () => activeActivity(s),
     deliver: async ({ dispatch }) => {
       const row = dbm.getPlanDispatchAttempt(`attempt-${serial}`);
@@ -244,11 +243,11 @@ test('intent get-or-create is keyed by dispatch attempt while separate briefs mi
     seen.push(ctx.intentStamp.intentId);
     return { disposition: 'delivered-unconfirmed' as const };
   };
-  await svc.dispatchPlanPackage(input, { intentPackaging: true, getActiveActivity: () => activeActivity(s), deliver });
-  await svc.dispatchPlanPackage(input, { intentPackaging: true, getActiveActivity: () => activeActivity(s), deliver });
+  await svc.dispatchPlanPackage(input, { getActiveActivity: () => activeActivity(s), deliver });
+  await svc.dispatchPlanPackage(input, { getActiveActivity: () => activeActivity(s), deliver });
   await svc.dispatchPlanPackage({
     ...input, attemptId: `attempt-second-${serial}`, promptText: 'A second brief',
-  }, { intentPackaging: true, getActiveActivity: () => activeActivity(s), deliver });
+  }, { getActiveActivity: () => activeActivity(s), deliver });
 
   assert.equal(seen[0], seen[1], 'one dispatch retry reuses one intent');
   assert.notEqual(seen[0], seen[2], 'two briefs under one item mint two intents');
@@ -268,7 +267,6 @@ test('production registrar preserves an unconfirmed private-intent delivery as p
       handler = listener as typeof handler;
     },
   }, {
-    intentPackaging: true,
     getActiveActivity: () => activeActivity(s),
     now: () => 3200,
     newId: () => `route-${serial}`,
@@ -309,7 +307,10 @@ test('failed send marks the attempt failed and leaves the package ready', async 
     attemptId: `attempt-${serial}`, lifecycleEventId: `event-${serial}`,
     packageId: s.packageId, planId: s.planId, planItemId: s.packageId,
     targetAgentId: s.agentId, ownerAgentId: null, promptText: 'go', createdAt: 2200,
-  }, { deliver: async () => ({ disposition: 'failed', reason: 'runner gone' }) });
+  }, {
+    getActiveActivity: () => activeActivity(s),
+    deliver: async () => ({ disposition: 'failed', reason: 'runner gone' }),
+  });
   assert.equal(result.failure, 'send-failed');
   assert.equal(dbm.getPlanDispatchAttempt(`attempt-${serial}`)?.state, 'failed');
   assert.equal(dbm.getPlanWorkPackage(s.packageId)?.state, 'ready');
@@ -338,7 +339,7 @@ test('wrong-cwd planning dispatch is refused before attempt insertion or deliver
     packageId: s.packageId, planId: s.planId, planItemId: s.packageId,
     targetAgentId: s.agentId, ownerAgentId: null, promptText: 'go', createdAt: 2350,
   }, {
-    intentPackaging: true, getActiveActivity: () => activity,
+    getActiveActivity: () => activity,
     deliver: async () => { delivered = true; return { disposition: 'delivered-unconfirmed' }; },
   });
   assert.equal(result.failure, 'target-agent-worktree-mismatch');

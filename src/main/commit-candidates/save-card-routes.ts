@@ -2,9 +2,9 @@
 //
 // This is the bootstrap-side adapter that turns the renderer's `{ workspaceId }`
 // request into a full `CandidateReadRequest` and delegates to the committed
-// SC-WP-1G facade (`CommitCandidateService.listWorkBundles`). It owns NO new
+// intent-first projection. It owns no new
 // assembly logic — the facade already unions scoped inventories, projects
-// witnesses, and emits renderer-safe `WorkBundle` DTOs (which are structurally
+// witnesses, and emits renderer-safe intent-unit DTOs (which are structurally
 // `SaveCardInventoryResponse`).
 //
 // Read-only invariant: every Git seam here is a read (`runGit`/`runGitBytes`
@@ -19,7 +19,7 @@
 
 import * as fs from 'node:fs';
 
-import type { Agent, GitCapability, SaveCardBundle, SaveCardBundleIdentity, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveIntentUnitDto, SaveCardPackageSaveability, SaveCardWorkerUnit } from '../../shared/types';
+import type { Agent, GitCapability, SaveCardInventoryRequest, SaveCardInventoryResponse, SaveIntentUnitDto, SaveCardPackageSaveability, SaveCardWorkerUnit } from '../../shared/types';
 import type { SaveCardQuotaWeakening } from '../../shared/commit-candidates';
 import {
   getAgentsByWorkspace as dbGetAgentsByWorkspace,
@@ -54,8 +54,6 @@ import type { TurnWitnessReader } from './witness-projection';
 import type { CommitPathLinkReader } from './protection-read';
 import { createTurnStampSource, type TurnStampRecordReader } from './stamp-projection';
 import type { SaveCardRoutes } from './save-card-ipc';
-import type { WorkBundle } from './work-bundle';
-import { projectWorkBundles } from './work-bundle';
 import { projectWitnesses } from './witness-projection';
 import { projectIntentUnits } from './intent-assembler';
 
@@ -86,8 +84,6 @@ export interface SaveCardRoutesDeps {
    * source is wired in; the Save card simply omits the banner while it is null.
    */
   readQuotaWeakening?: (repositoryKey: string) => SaveCardQuotaWeakening | null;
-  /** Staged architecture flag. Production enables with LARES_INTENT_PACKAGING=1. */
-  intentPackaging?: boolean;
   listSaveIntents?: typeof dbListSaveIntentsForRepository;
   listNamedSaveSetMembers?: typeof dbListNamedSaveSetMembers;
   getPlan?: typeof dbGetPlan;
@@ -117,153 +113,6 @@ function rendererSafeText(value: string): string {
     .replace(/\b[A-Za-z]:[\\/][^\s,;]+/g, '[local path]')
     .replace(/(^|\s)\/(?:Users|home|var|tmp|opt|mnt)\/[^\s,;]+/g, '$1[local path]');
 }
-
-const IDENTITY_NAME_MAX_LENGTH = 80;
-const IDENTITY_ROLE_MAX_LENGTH = 200;
-
-function clampText(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-  return `${value.slice(0, maxLength - 1).trimEnd()}…`;
-}
-
-function mixedIdentityName(workerUnits: readonly SaveCardWorkerUnit[]): string {
-  const visibleNames = workerUnits.slice(0, 2).map((unit) => unit.name);
-  if (workerUnits.length <= 2) {
-    return clampText(visibleNames.join(' + ') || 'Unknown agent', IDENTITY_NAME_MAX_LENGTH);
-  }
-
-  const suffix = ` + ${workerUnits.length - visibleNames.length} more agents`;
-  const prefix = clampText(
-    visibleNames.join(', '),
-    IDENTITY_NAME_MAX_LENGTH - suffix.length,
-  );
-  return `${prefix}${suffix}`;
-}
-
-/** Attach presentation identity without changing component membership/topology. */
-function attachBundleIdentity(
-  bundle: WorkBundle,
-  agents: ReadonlyMap<string, Agent>,
-  turns: ReadonlyMap<string, BundleTurn>,
-  witnesses: readonly TurnWitnessRead[],
-  capabilityByWorkspaceId: ReadonlyMap<string, GitCapability>,
-  workspaceTitleById: ReadonlyMap<string, string>,
-  targetWorkspaceId: string,
-): SaveCardBundle {
-  // Saveability is a property of the PANE's workspace (the repository the commit
-  // would land in), NOT of any contributing agent's home workspace. The inventory
-  // is already repository-scoped to the pane's repo, so every package it surfaces
-  // has its files inside that repo. A package is unsavable ONLY when the pane's
-  // OWN workspace has no repoRoot (the genuine "Computer Root has no repo" case),
-  // never because a contributor came from a repo-less workspace. This mirrors the
-  // finalize routing, which pins by the pane's target workspace.
-  const targetCapability = capabilityByWorkspaceId.get(targetWorkspaceId);
-  const saveability: SaveCardPackageSaveability =
-    targetCapability && !targetCapability.repoRoot
-      ? {
-          saveable: false,
-          reason: 'no-repository',
-          workspaceId: targetWorkspaceId,
-          workspaceTitle: workspaceTitleById.get(targetWorkspaceId) ?? targetWorkspaceId,
-          refusal: {
-            stage: 'saveability',
-            code: 'save-card-no-repository',
-            message: `Saveability stage refused because workspace '${workspaceTitleById.get(targetWorkspaceId) ?? targetWorkspaceId}' has no Git repository.`,
-          },
-        }
-      : { saveable: true };
-
-  if (bundle.kind === 'unattributed' || !bundle.component) {
-    return { ...bundle, identity: null, saveability };
-  }
-
-  const turnIds = new Set(bundle.component.associations.flatMap((a) => a.contributingTurnIds));
-  const relevantWitnesses = witnesses.filter((witness) => turnIds.has(witness.turnId));
-  const agentIds = new Set(relevantWitnesses.flatMap((w) => w.agentId ? [w.agentId] : []));
-  const ownerIds = new Set<string>();
-
-  // Owner resolution uses ONLY real data: the witness's recorded owner edge, else
-  // the contributing agent's own owner edge. We never fabricate ownership — an
-  // agent with no owner edge (even an isSupervised one) contributes as itself, and
-  // a component whose contributors lack a single real owner resolves to 'agent'
-  // (single contributor) or 'mixed' (multiple), never to a guessed supervisor.
-  for (const witness of relevantWitnesses) {
-    const agent = witness.agentId ? agents.get(witness.agentId) : undefined;
-    const ownerId = witness.ownerAgentId ?? agent?.ownerAgentId;
-    if (ownerId) ownerIds.add(ownerId);
-  }
-
-  const workerUnits: SaveCardWorkerUnit[] = [...agentIds].sort().map((agentId) => {
-    const agent = agents.get(agentId);
-    const agentTurns = relevantWitnesses
-      .filter((witness) => witness.agentId === agentId)
-      .map((witness) => turns.get(witness.turnId))
-      .filter((turn): turn is BundleTurn => Boolean(turn));
-    const memberEntryIds = Object.entries(bundle.component!.overlap.perPathContributors)
-      .filter(([, contributors]) => contributors.agentIds.includes(agentId))
-      .map(([entryId]) => entryId)
-      .sort();
-    return {
-      agentId,
-      name: rendererSafeText(nonEmpty(agent?.title, agentTurns.find((turn) => turn.agentTitle)?.agentTitle || 'Unknown agent')),
-      roleDescription: rendererSafeText(nonEmpty(agent?.roleDescription, 'No role description recorded.')),
-      kind: agent?.isSupervisor ? 'supervisor' : agent?.isWorker || agent?.isSupervised ? 'worker' : 'agent',
-      startedAt: minTime(agentTurns.map((turn) => turn.startedAt)),
-      endedAt: maxTime(agentTurns.map((turn) => turn.endedAt ?? turn.startedAt)),
-      turnCount: new Set(agentTurns.map((turn) => turn.id)).size,
-      memberEntryIds,
-    };
-  });
-
-  const owners = [...ownerIds].map((id) => agents.get(id)).filter((agent): agent is Agent => Boolean(agent));
-  let source: SaveCardBundleIdentity['source'];
-  let identityAgent: Agent | undefined;
-  if (owners.length === 1) {
-    identityAgent = owners[0];
-    source = identityAgent.isSupervisor ? 'supervisor' : 'agent';
-  } else if (owners.length === 0 && workerUnits.length === 1) {
-    source = 'agent';
-    identityAgent = workerUnits[0].agentId ? agents.get(workerUnits[0].agentId) : undefined;
-  } else {
-    source = 'mixed';
-  }
-
-  const name = clampText(rendererSafeText(identityAgent?.title
-    ?? (source === 'mixed' ? mixedIdentityName(workerUnits) : workerUnits[0]?.name)
-    ?? 'Unknown agent'), IDENTITY_NAME_MAX_LENGTH);
-  const distinctRoleDescriptions = workerUnits
-    .map((unit) => unit.roleDescription)
-    .filter((value, index, all) => all.indexOf(value) === index);
-  const roleFallback = source === 'mixed'
-    ? `Overlapping work from ${workerUnits.length} agents across ${turnIds.size} turns${
-      distinctRoleDescriptions[0] ? ` — ${distinctRoleDescriptions[0]}` : ''
-    }`
-    : distinctRoleDescriptions.join(' ');
-  const roleDescription = clampText(rendererSafeText(nonEmpty(
-    identityAgent?.roleDescription,
-    roleFallback,
-  )), IDENTITY_ROLE_MAX_LENGTH);
-  const identity: SaveCardBundleIdentity = {
-    groupingKey: identityAgent
-      ? `${source}:${identityAgent.id}`
-      : `mixed:${bundle.component.componentId}`,
-    source,
-    agentId: identityAgent?.id ?? null,
-    name,
-    roleDescription,
-    startedAt: minTime(workerUnits.map((unit) => unit.startedAt)),
-    endedAt: maxTime(workerUnits.map((unit) => unit.endedAt)),
-    workerUnits,
-  };
-  return {
-    ...bundle,
-    label: name,
-    labels: [name, ...bundle.labels],
-    identity,
-    saveability,
-  };
-}
-
 /** Canonicalize a workspace directory best-effort, mirroring the checkpoint
  *  engine's `canonicalDir` so a probe keys off the same root the facade reads. */
 function canonicalDir(realpath: (p: string) => string, p: string): string {
@@ -277,7 +126,7 @@ function canonicalDir(realpath: (p: string) => string, p: string): string {
 /**
  * Build the production `SaveCardRoutes`. `getInventory` probes every registered
  * workspace once per request, assembles the repository-scoped candidate set, and
- * returns the facade's `WorkBundle[]` verbatim (identical to the DTO shape).
+ * returns renderer-safe intent units projected from current evidence.
  */
 export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
   const gitExe = deps.gitExe;
@@ -309,6 +158,11 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
     readCommitPathLinks,
     readActiveFinalizations: deps.readActiveFinalizations ?? dbListActivePackageFinalizationsForRepository,
     readQuotaWeakening: deps.readQuotaWeakening,
+    readActivePlanningWorktrees: deps.listPlanningActivities ?? dbListPlanningActivityWorktrees,
+    listSaveIntents: deps.listSaveIntents ?? dbListSaveIntentsForRepository,
+    listNamedSaveSetMembers: deps.listNamedSaveSetMembers ?? dbListNamedSaveSetMembers,
+    getPlan: deps.getPlan ?? dbGetPlan,
+    getPlanItem: deps.getPlanItem ?? dbGetPlanWorkPackage,
   });
   const latestReadByWorkspace = new Map<string, CandidateInventoryRead>();
 
@@ -343,11 +197,10 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
       workspaces,
     });
     latestReadByWorkspace.set(req.workspaceId, read);
-    const bundles = projectWorkBundles(read);
     const quotaWeakening = read.quotaWeakening;
 
-    const includedWorkspaceIds = new Set(bundles.flatMap((bundle) =>
-      bundle.workspaces.map((workspace) => workspace.workspaceId),
+    const includedWorkspaceIds = new Set(read.inventory.repository.workspaces.map(
+      (workspace) => workspace.workspaceId,
     ));
     const agentRows = [...includedWorkspaceIds].flatMap((workspaceId) => getAgentsByWorkspace(workspaceId));
     const agents = new Map(agentRows.map((agent) => [agent.id, agent]));
@@ -366,22 +219,6 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
         if (owner) agents.set(ownerId, owner);
       }
     }
-
-    const rendererBundles = bundles.map((bundle) => attachBundleIdentity(
-        bundle,
-        agents,
-        turns,
-        witnesses,
-        capabilityByWorkspaceId,
-        workspaceTitleById,
-        req.workspaceId,
-      ));
-    const response: SaveCardInventoryResponse = {
-      bundles: rendererBundles,
-      quotaWeakening,
-    };
-    const intentPackaging = deps.intentPackaging ?? process.env.LARES_INTENT_PACKAGING === '1';
-    if (!intentPackaging) return response;
 
     const projectedWitnesses = projectWitnesses(
       read.inventory.repository,
@@ -404,9 +241,22 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
       topology: { components: read.components } as import('./component-assembler').ComponentAssembly,
     });
     const entriesById = new Map(read.inventory.entries.map((entry) => [entry.entryId, entry]));
-    const workerByAgentId = new Map(rendererBundles.flatMap((bundle) =>
-      (bundle.identity?.workerUnits ?? []).flatMap((worker) =>
-        worker.agentId === null ? [] : [[worker.agentId, worker] as const])));
+    const workerByAgentId = new Map([...agents].map(([agentId, agent]) => {
+      const agentWitnesses = witnesses.filter((witness) => witness.agentId === agentId);
+      const agentTurns = agentWitnesses.map((witness) => turns.get(witness.turnId))
+        .filter((turn): turn is BundleTurn => Boolean(turn));
+      const worker: SaveCardWorkerUnit = {
+        agentId,
+        name: rendererSafeText(nonEmpty(agent.title, agentTurns.find((turn) => turn.agentTitle)?.agentTitle || 'Unknown agent')),
+        roleDescription: rendererSafeText(nonEmpty(agent.roleDescription, 'No role description recorded.')),
+        kind: agent.isSupervisor ? 'supervisor' : agent.isWorker || agent.isSupervised ? 'worker' : 'agent',
+        startedAt: minTime(agentTurns.map((turn) => turn.startedAt)),
+        endedAt: maxTime(agentTurns.map((turn) => turn.endedAt ?? turn.startedAt)),
+        turnCount: new Set(agentTurns.map((turn) => turn.id)).size,
+        memberEntryIds: [],
+      };
+      return [agentId, worker] as const;
+    }));
     const targetCapability = capabilityByWorkspaceId.get(req.workspaceId);
     const saveability: SaveCardPackageSaveability = targetCapability && !targetCapability.repoRoot
       ? {
@@ -420,7 +270,7 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
           },
         }
       : { saveable: true };
-    response.intentUnits = assembly.intentUnits.map((unit): SaveIntentUnitDto => {
+    const intentUnits = assembly.intentUnits.map((unit): SaveIntentUnitDto => {
       const plan = unit.intent.planId ? (deps.getPlan ?? dbGetPlan)(unit.intent.planId) : null;
       const planItem = unit.intent.planItemId
         ? (deps.getPlanItem ?? dbGetPlanWorkPackage)(unit.intent.planItemId) : null;
@@ -460,11 +310,11 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
       entry: entriesById.get(entryId)!,
       protection: read.protectionByEntryId[entryId] ?? 'unprotected' as const,
     }));
-    response.unwitnessed = members(assembly.unwitnessedEntryIds);
-    response.legacyTaskIdentityUnavailable = members(
+    const unwitnessed = members(assembly.unwitnessedEntryIds);
+    const legacyTaskIdentityUnavailable = members(
       assembly.legacyTaskIdentityUnavailableEntryIds,
     );
-    response.planningActivities = (deps.listPlanningActivities ?? dbListPlanningActivityWorktrees)()
+    const planningActivities = (deps.listPlanningActivities ?? dbListPlanningActivityWorktrees)()
       .filter((activity) => activity.logicalWorkspaceId === req.workspaceId)
       .map((activity) => {
         const attempt = (deps.listActivityMergeAttempts ?? dbListActivityMergeAttempts)(activity.executionRunId)[0] ?? null;
@@ -495,7 +345,24 @@ export function createSaveCardRoutes(deps: SaveCardRoutesDeps): SaveCardRoutes {
           failureCode: activity.failureCode,
         };
       });
-    return response;
+    const legacyFinalizations = (deps.readActiveFinalizations ?? dbListActivePackageFinalizationsForRepository)(
+      read.inventory.repository.repositoryKey,
+    ).filter((row) => row.contractVersion !== 2).map((row) => ({
+      finalizationId: row.id,
+      packageId: row.packageId,
+      packageRevision: row.packageRevision,
+      finalizationKind: row.finalizationKind,
+      boundaryStatus: row.boundaryStatus,
+      finalizedAt: row.finalizedAt,
+    }));
+    return {
+      intentUnits,
+      unwitnessed,
+      legacyTaskIdentityUnavailable,
+      legacyFinalizations,
+      planningActivities,
+      quotaWeakening,
+    };
   }
 
   async function adoptAllAsBaseline(

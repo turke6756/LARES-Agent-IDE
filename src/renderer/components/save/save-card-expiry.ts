@@ -2,17 +2,16 @@
 //
 // The retention pass emits a `SaveCardCheckpointExpiryNotice` whose edges carry
 // `affectedEntryIds` (renderer-safe dirty-entry identities). The Save pane already
-// renders WorkBundle cards; this module maps expiring edges onto those bundles by
+// renders intent-unit cards; this module maps expiring edges onto those units by
 // intersecting each edge's `affectedEntryIds` with the bundle's member entry ids,
 // so an "expiring soon" warning lands on the exact card that holds the work.
 
-import type { SaveCardCheckpointExpiryNotice } from '../../../shared/types';
-import type { WorkBundleDto } from './SaveBundle';
+import type { SaveCardCheckpointExpiryNotice, SaveIntentUnitDto } from '../../../shared/types';
 
 export type ExpiryEdge = SaveCardCheckpointExpiryNotice['edges'][number];
 
-export interface BundleExpiry {
-  bundle: WorkBundleDto;
+export interface IntentUnitExpiry {
+  unit: SaveIntentUnitDto;
   /** The notice edges whose `affectedEntryIds` intersect this bundle's members,
    *  soonest-expiring first. */
   edges: ExpiryEdge[];
@@ -21,8 +20,8 @@ export interface BundleExpiry {
 }
 
 /** The set of dirty-entry ids a bundle holds (its member entries). */
-export function bundleEntryIds(bundle: WorkBundleDto): Set<string> {
-  return new Set(bundle.members.map((member) => member.entry.entryId));
+export function intentUnitEntryIds(unit: SaveIntentUnitDto): Set<string> {
+  return new Set(unit.members.map((member) => member.entry.entryId));
 }
 
 /**
@@ -32,27 +31,27 @@ export function bundleEntryIds(bundle: WorkBundleDto): Set<string> {
  * no intersecting edge is omitted. Result is ordered by soonest bundle deadline,
  * then by bundle id, so the block is deterministic. A null notice ⇒ [].
  */
-export function groupExpiryEdgesByBundle(
+export function groupExpiryEdgesByIntentUnit(
   notice: SaveCardCheckpointExpiryNotice | null | undefined,
-  bundles: readonly WorkBundleDto[],
-): BundleExpiry[] {
+  units: readonly SaveIntentUnitDto[],
+): IntentUnitExpiry[] {
   if (!notice || notice.edges.length === 0) return [];
-  const grouped: BundleExpiry[] = [];
-  for (const bundle of bundles) {
-    const memberIds = bundleEntryIds(bundle);
+  const grouped: IntentUnitExpiry[] = [];
+  for (const unit of units) {
+    const memberIds = intentUnitEntryIds(unit);
     if (memberIds.size === 0) continue;
     const edges = notice.edges
       .filter((edge) => edge.affectedEntryIds.some((id) => memberIds.has(id)))
       .sort((a, b) => a.expiresAt - b.expiresAt);
     if (edges.length === 0) continue;
-    grouped.push({ bundle, edges, earliestExpiresAt: edges[0].expiresAt });
+    grouped.push({ unit, edges, earliestExpiresAt: edges[0].expiresAt });
   }
   return grouped.sort((a, b) =>
     a.earliestExpiresAt !== b.earliestExpiresAt
       ? a.earliestExpiresAt - b.earliestExpiresAt
-      : a.bundle.bundleId < b.bundle.bundleId
+      : a.unit.intentId < b.unit.intentId
         ? -1
-        : a.bundle.bundleId > b.bundle.bundleId
+        : a.unit.intentId > b.unit.intentId
           ? 1
           : 0,
   );

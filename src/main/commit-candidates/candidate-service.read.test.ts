@@ -29,6 +29,13 @@ let service: CommitCandidateService;
 let workspaces: CandidateWorkspaceInput[] = [];
 let initialCommitOid = '';
 const observedCommands: string[][] = [];
+const intentReadDeps = {
+  readActivePlanningWorktrees: () => [],
+  listSaveIntents: () => [],
+  listNamedSaveSetMembers: () => [],
+  getPlan: () => null,
+  getPlanItem: () => null,
+};
 
 // Live checkpoint refs pointing at the fixture's initial commit. Their tree holds
 // the ORIGINAL blobs, so the (now dirty) worktree members never match — protection
@@ -177,6 +184,7 @@ async function setup(): Promise<void> {
     (workspaceId) => captureRows[workspaceId] ?? [];
 
   service = new CommitCandidateService({
+    ...intentReadDeps,
     runGit: async (cwd, args, options) => {
       observedCommands.push([...args]);
       return runGit(cwd, args, { ...options, gitExe });
@@ -230,43 +238,24 @@ test('same worktree multi-workspace attribution produces one repository componen
   );
 });
 
-test('listWorkBundles carries components, pseudo-bundle, capture health, and weakest rung', async () => {
-  const bundles = await service.listWorkBundles({
+test('assembleInventory carries intent evidence, capture health, and unattributed membership', async () => {
+  const read = await service.assembleInventory({
     targetWorkspaceId: 'workspace-a',
     workspaces,
   });
-  assert.equal(bundles.length, 2);
-  const component = bundles.find((bundle) => bundle.kind === 'component')!;
-  const unattributed = bundles.find((bundle) => bundle.kind === 'unattributed')!;
-  assert.ok(component.component);
-  assert.deepEqual(component.captureHealth.turns.map((turn) => turn.turnId), [
+  assert.equal(read.components.length, 1);
+  const component = read.components[0];
+  assert.deepEqual(read.captureHealthByComponentId[component.componentId].turns.map((turn) => turn.turnId), [
     'turn-a',
     'turn-b',
   ]);
-  assert.equal(component.captureHealth.pathsWithoutFinalizationEdge.length, 2);
-  assert.equal(component.weakestProtection, 'unprotected');
-  assert.equal(unattributed.component, null);
-  assert.equal(unattributed.members.length, 1);
-  assert.equal(unattributed.weakestProtection, 'unprotected');
-});
-
-test('serialized DTOs never leak raw absolute filesystem paths', async () => {
-  const bundles = await service.listWorkBundles({
-    targetWorkspaceId: 'workspace-a',
-    workspaces,
-  });
-  const serialized = JSON.stringify(bundles);
-  assert.equal(serialized.includes(repo), false);
-  assert.equal(serialized.includes(repo.replace(/\\/g, '/')), false);
-  for (const workspace of workspaces) {
-    assert.equal(serialized.includes(workspace.workspaceDir), false);
-  }
-  assert.equal(serialized.includes(gitExe), false);
-  assert.equal(serialized.includes('objectDatabaseKey'), false);
+  assert.equal(read.captureHealthByComponentId[component.componentId].pathsWithoutFinalizationEdge.length, 2);
+  assert.equal(read.inventory.unattributedEntryIds.length, 1);
+  assert.equal(Object.values(read.protectionByEntryId).every((rung) => rung === 'unprotected'), true);
 });
 
 test('facade issues only the expected read-only Git command family', async () => {
-  await service.listWorkBundles({
+  await service.assembleInventory({
     targetWorkspaceId: 'workspace-a',
     workspaces,
   });
@@ -304,6 +293,7 @@ test('protection Git probes are request-scoped and batched, independent of edge 
   const cmdName = (args: string[]): string =>
     args[0] === '--no-optional-locks' ? args[1] : args[0];
   const perfService = new CommitCandidateService({
+    ...intentReadDeps,
     runGit: async (cwd, args, options) => {
       commands.push([...args]);
       return runGit(cwd, args, { ...options, gitExe });
@@ -352,6 +342,7 @@ test('turns with no live edges issue zero liveness/tree Git (batch stays honest)
   const cmdName = (args: string[]): string =>
     args[0] === '--no-optional-locks' ? args[1] : args[0];
   const deadService = new CommitCandidateService({
+    ...intentReadDeps,
     runGit: async (cwd, args, options) => {
       commands.push([...args]);
       return runGit(cwd, args, { ...options, gitExe });
@@ -378,6 +369,7 @@ test('turns with no live edges issue zero liveness/tree Git (batch stays honest)
 test('scope probe memo is request-local and deduplicates only repeated target reads', async () => {
   const revParseReads: Array<{ cwd: string; args: string[] }> = [];
   const memoService = new CommitCandidateService({
+    ...intentReadDeps,
     runGit: async (cwd, args, options) => {
       if (args[0] === 'rev-parse') revParseReads.push({ cwd, args: [...args] });
       return runGit(cwd, args, { ...options, gitExe });

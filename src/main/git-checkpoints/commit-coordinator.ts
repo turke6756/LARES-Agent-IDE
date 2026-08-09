@@ -437,8 +437,7 @@ export class CommitCoordinator {
     this.newAttemptId = deps.newAttemptId ?? (() => randomUUID());
     this.validateMessage = deps.validateMessage ?? defaultValidateMessage;
     this.deriveTrailers = deps.deriveTrailers ?? defaultDeriveTrailers;
-    this.contractVersion = deps.contractVersion
-      ?? (process.env.LARES_INTENT_PACKAGING === '1' ? 2 : BUNDLE_CONTRACT_VERSION);
+    this.contractVersion = deps.contractVersion ?? 2;
   }
 
   /**
@@ -769,17 +768,12 @@ export class CommitCoordinator {
         throw new Error(`constructed tree diverged at ${constructionMismatches.map((entry) => entry.displayPath).join(', ')}`);
       }
 
-      // WP-D6 is architecture-flagged and independently OFF by default per repo.
+      // Candidate validation remains independently opt-in per repository.
       // Validation sees a materialized copy of this exact tree OID, after construction
       // proof and before commit-object creation / ref CAS. It may only accept or refuse.
-      const policy = process.env.LARES_INTENT_PACKAGING === '1'
-        ? await (this.d.resolveCandidateCommitPolicy ?? readCandidateCommitPolicy)({
-          repoRoot, gitExe, runGit: this.d.runGit,
-        })
-        : {
-          validation: { enabled: false, commands: [], timeoutMs: 0 },
-          signing: { enabled: false, signingKey: null },
-        };
+      const policy = await (this.d.resolveCandidateCommitPolicy ?? readCandidateCommitPolicy)({
+        repoRoot, gitExe, runGit: this.d.runGit,
+      });
       const validation = await (this.d.validateCandidateTree ?? validateCandidateTree)({
         repoRoot,
         gitExe,

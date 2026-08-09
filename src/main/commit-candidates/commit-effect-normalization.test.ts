@@ -108,7 +108,7 @@ test('reviewed manifest canonicalization ignores insertion order of set-like arr
     ],
     attributionTopology: {
       componentPathSets: [[path('b.txt')], [path('a.txt')]], contributors: [],
-      ownershipGroupKeys: ['z', 'a'], componentEdges: [], requiresOverlapAck: false,
+      ownershipGroupKeys: ['z', 'a'], componentEdges: [],
       selectedUnattributedPathBytesBase64: [path('b.txt'), path('a.txt')],
     },
     closureObligations: [], challengeVersion: 1, challengeAtoms: [],

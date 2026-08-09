@@ -223,35 +223,9 @@ test('the shared evaluator awaits coordinator refresh before reading every gate'
   assert.ok(log.indexOf('refresh') < log.indexOf('projection'), log.join(','));
 });
 
-test('a valid head trigger creates the ref BEFORE the run row and records truthful fields', async () => {
-  const log: SpyLog = [];
-  const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'edward' }, svcDeps({}, log));
-  assert.equal(res.ok, true);
-  // Ref pinned before the row — the load-bearing GC-safety ordering.
-  assert.deepEqual(log, ['ref:refs/lares/plans/' + Buffer.from('plan-1').toString('base64url') + '/' + Buffer.from('run-fixed').toString('base64url'), 'row']);
-  assert.equal(res.run?.baselineKind, 'head');
-  assert.equal(res.run?.baselineHeadOid, 'b'.repeat(40));
-  assert.equal(res.run?.triggerSource, svc.IMPLEMENT_TRIGGER_SOURCE);
-  assert.equal(res.run?.appUserId, 'edward');
-  assert.equal(res.run?.triggeredAt, 4242);
-  assert.equal(res.run?.repositoryKey, 'rk');
-});
-
-test('an unborn HEAD stores kind=unborn with no ref and never creates a ref', async () => {
-  const log: SpyLog = [];
-  const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'e' },
-    svcDeps({ probeBaseline: async () => ({ ok: true, kind: 'unborn' }) }, log));
-  assert.equal(res.ok, true);
-  assert.equal(res.run?.baselineKind, 'unborn');
-  assert.equal(res.run?.baselineRef, null);
-  assert.equal(res.run?.baselineHeadOid, null);
-  assert.deepEqual(log, ['row']); // no ref created
-});
-
-test('intent-packaging refuses unborn HEAD before provisioning', async () => {
+test('Implement refuses unborn HEAD before provisioning', async () => {
   let provisioned = false;
   const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'e' }, svcDeps({
-    intentPackaging: true,
     probeBaseline: async () => ({ ok: true, kind: 'unborn' }),
     provisionActivity: async () => { provisioned = true; return { ok: false, reason: 'worktree-provision-failed' }; },
   }));
@@ -260,7 +234,7 @@ test('intent-packaging refuses unborn HEAD before provisioning', async () => {
   assert.equal(provisioned, false);
 });
 
-test('intent-packaging activates the run through the provisioned activity binding', async () => {
+test('Implement activates the run through the provisioned activity binding', async () => {
   const log: SpyLog = [];
   const activity = {
     executionRunId: 'run-fixed', planId: 'plan-1', logicalWorkspaceId: 'ws-1',
@@ -270,7 +244,6 @@ test('intent-packaging activates the run through the provisioned activity bindin
     state: 'active' as const, failureCode: null, createdAt: 4242, updatedAt: 4242,
   };
   const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'e' }, svcDeps({
-    intentPackaging: true,
     appUserDataPath: 'C:/app',
     provisionActivity: async (_input: unknown, deps: { activate: (row: typeof activity) => void }) => {
       log.push('provision');
@@ -282,25 +255,6 @@ test('intent-packaging activates the run through the provisioned activity bindin
   assert.deepEqual(log, ['provision', 'row']);
   assert.equal(res.run?.repositoryKey, 'primary-key');
   assert.equal(res.run?.baselineRef, activity.activityHeadRef);
-});
-
-test('a ref-creation failure refuses the trigger and never inserts a run row', async () => {
-  const log: SpyLog = [];
-  const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'e' },
-    svcDeps({ createBaselineRef: async () => { log.push('ref-fail'); return { ok: false, error: 'x' }; },
-      insertRun: () => { log.push('row'); return {} as any; } }, log));
-  assert.equal(res.ok, false);
-  assert.deepEqual(res.failures, ['baseline-ref-failed']);
-  assert.ok(!log.includes('row'));
-});
-
-test('a run-persist failure AFTER ref creation leaves an orphan ref (ref was created)', async () => {
-  const log: SpyLog = [];
-  const res = await svc.implementPlan({ planId: 'plan-1', appUserId: 'e' },
-    svcDeps({ insertRun: () => { throw new Error('txn lost'); } }, log));
-  assert.equal(res.ok, false);
-  assert.deepEqual(res.failures, ['run-persist-failed']);
-  assert.ok(log.some((e) => e.startsWith('ref:')), 'ref was created before the failing txn');
 });
 
 test('an agent caller (no proven appUserId) is refused before any git/db touch', async () => {

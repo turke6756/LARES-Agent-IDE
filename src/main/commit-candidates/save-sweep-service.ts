@@ -181,7 +181,6 @@ export class SaveSweepService {
           selectedComponentIds: [...resolved.selection.selectedComponentIds],
           selectedUnattributedEntryIds: [...resolved.selection.selectedUnattributedEntryIds],
           finalizationIds: [...resolved.selection.finalizationIds],
-          acknowledgeTopologyDigest: null,
           acknowledgeUnattributedEntryIds: [],
           reviewedManifestDigest: intent.reviewedManifestDigest,
           acknowledgedChallengeAtoms,

@@ -19,8 +19,6 @@ export function renderSaveRefusal(refusal: SaveRefusal): string {
       return 'This package changed since it was reviewed.';
     case 'mint': {
       const acknowledgementCopy: Record<string, string> = {
-        'overlap-ack-missing': 'This package contains multi-owner work that needs your review.',
-        'overlap-ack-stale': 'The multi-owner work changed and needs another review.',
         'unattributed-ack-incomplete': 'This package contains unattributed work that needs your review.',
         'unattributed-ack-stale': 'The unattributed work changed and needs another review.',
         'candidate-ack-stale': 'This package changed since it was reviewed.',
@@ -28,7 +26,7 @@ export function renderSaveRefusal(refusal: SaveRefusal): string {
       };
       if (acknowledgementCopy[refusal.code]) return acknowledgementCopy[refusal.code];
       if (refusal.code === 'acknowledgement-stale') {
-        return "This package's multi-owner or unattributed work needs your review.";
+        return "This package's unattributed work needs your review.";
       }
       return 'This package changed before Lares could save it.';
     }
@@ -56,15 +54,14 @@ export function mintRefusal(response: SaveCardMintResponse): SaveRefusal | null 
   }
   const eligibility = response.candidate.eligibility;
   if (!eligibility.eligible) {
-    const acknowledgement = eligibility.reason === 'overlap-not-acknowledged'
-      || eligibility.reason === 'unattributed-not-acknowledged';
+    const acknowledgement = eligibility.reason === 'unattributed-not-acknowledged';
     return {
       stage: 'mint',
       code: acknowledgement ? 'acknowledgement-stale' : 'mint-refused',
       message: `The package is not ready to save: ${eligibility.reason}.`,
     };
   }
-  if (!response.candidate.token) {
+  if (!('token' in response.candidate) || !response.candidate.token) {
     return { stage: 'mint', code: 'mint-token-missing', message: 'The package could not be prepared for saving.' };
   }
   return null;

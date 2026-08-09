@@ -11,6 +11,7 @@ import type {
   ReviewChallengeAtom,
 } from '../../shared/commit-candidates';
 import type { GitRunResult, RunGitOptions } from './git-command';
+import { recordIntentArchitectureEvent } from './intent-architecture-telemetry';
 
 export const CONCURRENCY_CLASSIFIER_VERSION = 1 as const;
 
@@ -87,7 +88,7 @@ export async function resolveCheckpointPathBlob(input: {
 export async function observePathIntents(
   input: ObservePathIntentsInput,
 ): Promise<PathIntentObservation[]> {
-  return Promise.all(input.turns.map(async (turn) => {
+  const observations = await Promise.all(input.turns.map(async (turn) => {
     const [beforeBlobOid, afterBlobOid] = await Promise.all([
       resolveCheckpointPathBlob({ ...input, commitOid: turn.beforeCommitOid }),
       resolveCheckpointPathBlob({ ...input, commitOid: turn.afterCommitOid }),
@@ -100,9 +101,11 @@ export async function observePathIntents(
       afterBlobOid,
       finalBlobOid: input.finalBlobOid,
       evidenceQuality: turn.beforeCommitOid && turn.afterCommitOid
-        && beforeBlobOid && afterBlobOid && input.finalBlobOid ? 'complete' : 'partial',
+        && beforeBlobOid && afterBlobOid && input.finalBlobOid ? 'complete' as const : 'partial' as const,
     };
   }));
+  if (observations.length > 0) recordIntentArchitectureEvent('observed', observations.length);
+  return observations;
 }
 
 export interface ConcurrencyCase {
@@ -210,7 +213,7 @@ export function classifyPathConcurrency(
     }
   }
 
-  return pairs.map(([left, right]) => {
+  const cases = pairs.map(([left, right]) => {
     const result = classifyPair(left, right);
     const ordered = result.earlier && result.later ? [result.earlier, result.later] : [left, right];
     const digest = concurrencyEvidenceDigest(ordered);
@@ -227,6 +230,8 @@ export function classifyPathConcurrency(
       note: carried ? 'The later task builds on the earlier task in this file.' : null,
     };
   });
+  if (cases.length > 0) recordIntentArchitectureEvent('classified', cases.length);
+  return cases;
 }
 
 export interface ConcurrencyActionProjection {

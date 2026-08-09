@@ -73,7 +73,6 @@ function componentFor(entries: readonly DirtyEntry[], id: string): ConflictCompo
       contributingAgentCount: 0,
       mergedGroupCount: 0,
       perPathContributors: {},
-      requiresOverlapAck: false,
     },
     componentTopologyDigest: `topology-${id}`,
   };
@@ -116,7 +115,6 @@ function topology(entries: readonly DirtyEntry[]): ReviewedAttributionTopology {
     contributors: [],
     ownershipGroupKeys: [],
     componentEdges: [],
-    requiresOverlapAck: false,
     selectedUnattributedPathBytesBase64: [],
   };
 }

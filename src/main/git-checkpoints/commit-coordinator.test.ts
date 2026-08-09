@@ -322,10 +322,14 @@ function fakeHarness(snapshot: CandidateTokenSnapshot, git: ReturnType<typeof ma
         };
       }),
     locateRepository: () => ({ repoRoot: 'X:/repo', gitExe: undefined }),
+    resolveCandidateCommitPolicy: async () => ({
+      validation: { enabled: false, commands: [], timeoutMs: 0 },
+      signing: { enabled: false, signingKey: null },
+    }),
     now: () => 1000,
     newAttemptId: () => 'attempt-1',
     writeIntentLedger: overrides.writeIntentLedger,
-    contractVersion: overrides.contractVersion,
+    contractVersion: overrides.contractVersion ?? snapshot.candidate.contractVersion,
     resolvePlanningActivity: overrides.resolvePlanningActivity,
     advancePlanningActivityHead: overrides.advancePlanningActivityHead,
     promotePlanningActivity: overrides.promotePlanningActivity,
@@ -336,12 +340,13 @@ function fakeHarness(snapshot: CandidateTokenSnapshot, git: ReturnType<typeof ma
 test('production Save activity path atomically advances activity ref then originates eager promotion', async () => {
   const parent = 'a'.repeat(40);
   const committed = 'b'.repeat(40);
-  const snapshot = makeSnapshot({ members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }] });
+  const snapshot = makeSnapshot({ contractVersion: 2, members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }] });
   const git = makeFakeGit({ currentHead: committed, reflog: `${committed} lares-commit:attempt-1`,
     parents: { [committed]: parent }, trees: { [committed]: [{ pathB64: pathOf('a.txt').pathBytesBase64, mode: '100644', oid: 'c1' }] },
     indexReads: [Buffer.alloc(0), Buffer.alloc(0)] });
   const calls: string[] = [];
   const { coordinator } = fakeHarness(snapshot, git, {
+    writeIntentLedger: () => undefined,
     resolvePlanningActivity: () => ({
       executionRunId: 'run-activity', planId: 'plan', logicalWorkspaceId: 'ws', objectDatabaseKey: 'odb',
       activityRepositoryKey: REPOSITORY_KEY, primaryRepositoryKey: 'primary', path: 'X:/repo',
@@ -397,7 +402,9 @@ test('trailer policy distinguishes witnessed agent work from claimed and adopted
 test('contract-version mismatch → token-unresolved before any lock or CAS', async () => {
   const snapshot = makeSnapshot({ contractVersion: BUNDLE_CONTRACT_VERSION + 99, members: [{ entryId: 'e1', relative: 'a.txt', rawBlobOid: 'r1', commitBlobOid: 'c1', commitMode: '100644' }] });
   const git = makeFakeGit({ currentHead: 'a'.repeat(40) });
-  const { coordinator, tokens, composeLocks } = fakeHarness(snapshot, git);
+  const { coordinator, tokens, composeLocks } = fakeHarness(snapshot, git, {
+    contractVersion: BUNDLE_CONTRACT_VERSION,
+  });
   const result = await coordinator.commit({ tokenId: 'tok-1', message: 'msg' });
   assert.equal(result.kind, 'token-unresolved');
   assert.equal(tokens.consumes, 0, 'CAS never attempted');
@@ -738,6 +745,7 @@ function realHarness(snapshot: CandidateTokenSnapshot, root: string) {
   const attempts = new FakeAttempts();
   const composeLocks = new ComposeLockRegistry();
   const coordinator = new CommitCoordinator({
+    contractVersion: snapshot.candidate.contractVersion,
     composeLocks,
     queue: new CheckpointQueue(),
     tokens,
@@ -751,6 +759,10 @@ function realHarness(snapshot: CandidateTokenSnapshot, root: string) {
         entry: { path: member.path, commitPathspecs: member.commitPathspecs, expectedWorktreeState: member.expectedWorktreeState, rawWorktreeBlobOid: member.rawWorktreeBlobOid },
       }),
     locateRepository: () => ({ repoRoot: root, gitExe: EXE }),
+    resolveCandidateCommitPolicy: async () => ({
+      validation: { enabled: false, commands: [], timeoutMs: 0 },
+      signing: { enabled: false, signingKey: null },
+    }),
     newAttemptId: () => 'attempt-real',
   });
   return { coordinator, attempts, tokens };

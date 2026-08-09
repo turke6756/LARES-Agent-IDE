@@ -89,7 +89,6 @@ function component(entries: DirtyEntry[], topology = `topology-${++componentSequ
       contributingAgentCount: 1,
       mergedGroupCount: 1,
       perPathContributors: {},
-      requiresOverlapAck: false,
     },
     componentTopologyDigest: topology,
   };
@@ -427,8 +426,6 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
 // WP-4 v2: intent documents and evidence-bound resolutions are required and
 // become part of candidate identity/token state.
 {
-  const priorFlag = process.env.LARES_INTENT_PACKAGING;
-  process.env.LARES_INTENT_PACKAGING = '1';
   const shared = entry('shared.ts');
   const one = finalization([frozen('shared.ts')], 'fin-intent-a');
   const two = finalization([frozen('shared.ts')], 'fin-intent-b');
@@ -481,8 +478,6 @@ function asCandidate(value: ReturnType<CommitCandidateService['mintCandidateToke
     localCheckpointRefs: ['refs/lares/turn-a/after', 'refs/lares/turn-b/after'],
   });
   assert.equal(witnessedSnapshot, null, 'tokens remain service-local');
-  if (priorFlag === undefined) delete process.env.LARES_INTENT_PACKAGING;
-  else process.env.LARES_INTENT_PACKAGING = priorFlag;
 }
 
 console.log('candidate-service.mint: v1 refusals + v2 intent/resolution contract passed');

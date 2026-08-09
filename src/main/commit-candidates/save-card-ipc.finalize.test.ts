@@ -153,12 +153,12 @@ function boundaryContext(over: Partial<FleetAdhocBoundaryContext> = {}): FleetAd
   };
 }
 
-function makeRoutes(store: FakeStore, opts: { fail?: boolean } = {}, over: Partial<FleetAdhocBoundaryContext> = {}): SaveCardFinalizeRoutes {
+function makeRoutes(store: FakeIntentStore, opts: { fail?: boolean } = {}, over: Partial<FleetAdhocBoundaryContext> = {}): SaveCardFinalizeRoutes {
   return {
-    resolveBoundary: async (req) => boundaryContext({ packageId: req.packageId, ...over }),
-    finalizeDeps: {
+    resolveBoundary: async (req) => boundaryContext({ packageId: req.packageId, contractVersion: 2, ...over }),
+    finalizeIntentDeps: {
       store,
-      writeRef: makeWriter(store, opts),
+      writeRef: makeWriter(new FakeStore(), opts),
       freeze: fakeFreeze,
       now: () => 100,
       newId: () => 'fin-fleet',
@@ -168,9 +168,9 @@ function makeRoutes(store: FakeStore, opts: { fail?: boolean } = {}, over: Parti
 
 // ── ACCEPT: fleet-adhoc mark-done creates a distinct finalization with boundary_ref
 
-test('fleet-adhoc mark-done creates a distinct finalization that captures boundary_ref', async () => {
+test('fleet-adhoc mark-done creates a named-save-set finalization that captures boundary_ref', async () => {
   const ipc = new FakeIpc();
-  const store = new FakeStore();
+  const store = new FakeIntentStore();
   registerSaveCardFinalizeIpc(ipc, () => makeRoutes(store));
 
   const res = (await ipc.invoke(
@@ -186,20 +186,16 @@ test('fleet-adhoc mark-done creates a distinct finalization that captures bounda
   assert.equal(res.boundaryRef, finalizationRef('pkg-fleet', 1));
   assert.equal(res.boundaryStatus, 'ready');
 
-  // A distinct finalization row exists, with NULL plan attribution.
+  // A distinct intent-first finalization row exists.
   const row = store.rows.get('fin-fleet');
   assert.ok(row, 'the mark-done minted a finalization row');
-  assert.equal(row!.finalizationKind, 'fleet-adhoc');
-  assert.equal(row!.planId, null);
-  assert.equal(row!.planItemId, null);
+  assert.equal(row!.saveUnitKind, 'named-save-set');
   assert.equal(row!.boundaryRef, finalizationRef('pkg-fleet', 1));
 });
 
-test('intent-packaging production handler writes a v2 named-save-set finalization', async () => {
+test('production handler writes a v2 named-save-set finalization', async () => {
   const ipc = new FakeIpc();
   const store = new FakeIntentStore();
-  const previous = process.env.LARES_INTENT_PACKAGING;
-  process.env.LARES_INTENT_PACKAGING = '1';
   try {
     registerSaveCardFinalizeIpc(ipc, () => ({
       resolveBoundary: async (req) => boundaryContext({ packageId: req.packageId, contractVersion: 2 }),
@@ -216,8 +212,6 @@ test('intent-packaging production handler writes a v2 named-save-set finalizatio
     assert.equal(store.rows.get('fin-intent')?.saveUnitKind, 'named-save-set');
     assert.equal(store.rows.get('fin-intent')?.lifecycleStatus, 'active');
   } finally {
-    if (previous === undefined) delete process.env.LARES_INTENT_PACKAGING;
-    else process.env.LARES_INTENT_PACKAGING = previous;
   }
 });
 
@@ -232,7 +226,7 @@ test('the mark-done channel is DISTINCT — it registers its own mutating channe
 
 test('a boundary-unavailable outcome still surfaces the ref it could not pin', async () => {
   const ipc = new FakeIpc();
-  const store = new FakeStore();
+  const store = new FakeIntentStore();
   registerSaveCardFinalizeIpc(ipc, () => makeRoutes(store, { fail: true }));
 
   const res = (await ipc.invoke(

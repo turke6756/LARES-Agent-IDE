@@ -252,7 +252,6 @@ const TESTS = [
   'dist/main/main/commit-candidates/component-assembler.test.js',
   'dist/main/main/commit-candidates/protection-read.test.js',
   'dist/main/main/commit-candidates/candidate-service.read.test.js',
-  'dist/main/main/commit-candidates/work-bundle.test.js',
   'dist/main/main/commit-candidates/save-card-ipc.test.js',
   // Save-card SC-WP-N2: checkpoint-expiry attention IPC — the lightweight read
   // channel (own channel, provider-gated, null before injection) + the push broadcast.
@@ -719,6 +718,9 @@ const TESTS = [
   // Intent architecture WP-3: per-path checkpoint-tree observation and the
   // five-way graduated concurrency classifier, including pruned evidence.
   'dist/main/main/git-checkpoints/concurrency-policy.test.js',
+  // WP-7: intent lifecycle telemetry exposes the six cutover counters and
+  // increments each counter at its production transition seam.
+  'dist/main/main/git-checkpoints/intent-architecture-telemetry.test.js',
   // WP-P7C: blame-to-intent — file→contributing turns→plans with a confidence
   // label + conflicting-contributor list ("contributed," never "authored"); file-level
   // v1, no exact-line/clobber overclaim; post-ledger strengthen via SC-WP-2G.
