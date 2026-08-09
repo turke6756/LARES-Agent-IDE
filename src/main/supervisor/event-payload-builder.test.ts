@@ -242,7 +242,9 @@ test('BUG-20: filesTouched section renders one row per file', () => {
       { filePath: 'src/bar.ts', operation: 'read' },
     ],
   }));
-  assert.match(payload, /Files touched:/);
+  assert.match(payload, /Files touched in current session:/);
+  assert.doesNotMatch(payload, /\nFiles touched:\n/,
+    'F3: the ambiguous retained-vs-current heading cannot render');
   assert.match(payload, /> src\/foo\.ts \(write\)/);
   assert.match(payload, /> src\/bar\.ts \(read\)/);
 });
@@ -253,7 +255,7 @@ test('BUG-20: filesTouched section omitted when undefined or empty', () => {
       lastAssistantMessage: 'done',
       filesTouched,
     }));
-    assert.equal(payload.indexOf('Files touched:'), -1,
+    assert.equal(payload.indexOf('Files touched in current session:'), -1,
       `BUG-20: empty/undefined filesTouched must omit section (input: ${JSON.stringify(filesTouched)})`);
   }
 });
@@ -281,7 +283,7 @@ test('BUG-20: filesTouched section appears AFTER Last output (not before)', () =
     filesTouched: [{ filePath: 'a.ts', operation: 'write' }],
   }));
   const lastIdx = payload.indexOf('Last output:');
-  const filesIdx = payload.indexOf('Files touched:');
+  const filesIdx = payload.indexOf('Files touched in current session:');
   assert.ok(lastIdx >= 0 && filesIdx > lastIdx, 'order: Last output → Files touched');
 });
 

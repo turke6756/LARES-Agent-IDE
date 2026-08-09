@@ -72,10 +72,10 @@ export interface EventBridgeDeps {
    *  `undefined` (or throwing — the caller swallows errors) makes the bridge
    *  fall back to the PTY-frame logTail preview. */
   getLastAssistantMessage(agentId: string): Promise<string | undefined>;
-  /** BUG-20: fetch recent file activities for the agent — typically a thin
-   *  wrapper over `getFileActivities(agentId)`. Returning an empty array (or
-   *  throwing) makes the bridge omit the "Files touched:" section. */
-  getFileActivities(agentId: string): FileActivity[];
+  /** BUG-20 / F3: fetch file activities for the agent. Terminal previews
+   *  request only the live session so retained renewal generations cannot be
+   *  presented as current work. Empty results (or errors) omit the section. */
+  getFileActivities(agentId: string, currentOnly: boolean): FileActivity[];
 }
 
 // P2-03: 'waiting' is a trigger status so the supervisor gets a notification
@@ -1021,11 +1021,11 @@ export class EventBridge {
     }
   }
 
-  /** BUG-20: safe wrapper around the file-activities dep. Errors degrade to
-   *  undefined so the "Files touched:" section is omitted. */
+  /** BUG-20 / F3: safe wrapper requesting only the live session. Errors
+   *  degrade to undefined so the file-activity section is omitted. */
   private fetchFileActivities(agentId: string): FileActivity[] | undefined {
     try {
-      const all = this.deps.getFileActivities(agentId);
+      const all = this.deps.getFileActivities(agentId, true);
       if (!all || all.length === 0) return undefined;
       return all.slice(0, FILE_ACTIVITY_FETCH_CAP);
     } catch (err) {

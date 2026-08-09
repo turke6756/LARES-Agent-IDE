@@ -175,7 +175,12 @@ function makeHarness(): Harness {
     // path, not the supervisor preview path) keep their original payload
     // shape; the BUG-20 scenarios populate the maps explicitly.
     getLastAssistantMessage: async (id) => lastAssistantMessages.get(id),
-    getFileActivities: (id) => fileActivities.get(id) ?? [],
+    getFileActivities: (id, currentOnly) => {
+      const rows = fileActivities.get(id) ?? [];
+      if (!currentOnly) return rows;
+      const liveSessionId = fakes.agents.get(id)?.resumeSessionId ?? null;
+      return rows.filter(row => row.sessionId === liveSessionId);
+    },
   };
   const bridge = new EventBridge(bridgeDeps);
 
@@ -707,7 +712,7 @@ async function MS_05_mcpLaunchedWorkerWithExplicitSupervisorId(): Promise<void> 
 
 // ── BUG-20: chat-first preview + filesTouched ───────────────────────
 
-async function single_idle_chatFirstPreview_BUG_20(): Promise<void> {
+async function single_idle_chatFirstPreview_BUG_20_F3(): Promise<void> {
   // BUG-20 acceptance: an idle Claude worker's event must surface the agent's
   // clean last assistant message (via the bridge's `getLastAssistantMessage`
   // dep) instead of the PTY-frame logTail that today reliably grabs Claude
@@ -716,7 +721,11 @@ async function single_idle_chatFirstPreview_BUG_20(): Promise<void> {
   const h = makeHarness();
   try {
     const sup = makeSup('sup-bug20');
-    const worker = makeWorker('w-bug20', { provider: 'claude' });
+    const worker = makeWorker('w-bug20', {
+      provider: 'claude',
+      continuationGeneration: 2,
+      resumeSessionId: 'session-generation-2',
+    });
     h.agents.set(sup.id, sup);
     h.agents.set(worker.id, worker);
 
@@ -738,18 +747,27 @@ async function single_idle_chatFirstPreview_BUG_20(): Promise<void> {
         filePath: 'src/main/supervisor/event-payload-builder.ts',
         operation: 'write',
         timestamp: '2026-05-21T12:00:00Z',
-        generation: 0,
-        sessionId: null,
+        generation: 2,
+        sessionId: 'session-generation-2',
       },
-      {
-        id: 2,
+      ...Array.from({ length: 23 }, (_, i): FileActivity => ({
+        id: i + 2,
         agentId: worker.id,
-        filePath: 'src/main/supervisor/event-bridge.ts',
-        operation: 'read',
+        filePath: `src/retained/generation-1-${i}.ts`,
+        operation: 'write',
         timestamp: '2026-05-21T11:59:00Z',
+        generation: 1,
+        sessionId: 'session-generation-1',
+      })),
+      ...Array.from({ length: 23 }, (_, i): FileActivity => ({
+        id: i + 25,
+        agentId: worker.id,
+        filePath: `src/retained/generation-0-${i}.ts`,
+        operation: 'write',
+        timestamp: '2026-05-21T11:58:00Z',
         generation: 0,
-        sessionId: null,
-      },
+        sessionId: 'session-generation-0',
+      })),
     ]);
 
     // Worker-lane idle now arrives via the Stop hook (forceIdle), not the
@@ -768,9 +786,11 @@ async function single_idle_chatFirstPreview_BUG_20(): Promise<void> {
     );
     assert.equal(payload.indexOf('⏵⏵'), -1, 'BUG-20: TUI ribbon must not leak');
     assert.equal(payload.indexOf('Opus 4.7'), -1, 'BUG-20: TUI status bar must not leak');
-    assert.match(payload, /Files touched:/, 'BUG-20: section header rendered');
+    assert.match(payload, /Files touched in current session:/,
+      'F3: section label states the current-session scope');
     assert.match(payload, /> src\/main\/supervisor\/event-payload-builder\.ts \(write\)/);
-    assert.match(payload, /> src\/main\/supervisor\/event-bridge\.ts \(read\)/);
+    assert.doesNotMatch(payload, /src\/retained\/generation-[01]-\d+\.ts/,
+      'F3: retained renewal generations cannot render under the current-session heading');
     console.log('  single/idle/bug-20 ✓ chat-first preview + filesTouched');
   } finally { h.dispose(); }
 }
@@ -791,7 +811,7 @@ async function single_idle_fallbackOnChatError_BUG_20(): Promise<void> {
     // Install throwing implementations by swapping deps after construction —
     // simpler: monkey-patch on the bridge's deps view. The harness exposes
     // the maps; we install one-shot rejections via local closure swaps.
-    const bridgeAny = h.bridge as unknown as { deps: { getLastAssistantMessage: (id: string) => Promise<string | undefined>; getFileActivities: (id: string) => unknown[] } };
+    const bridgeAny = h.bridge as unknown as { deps: { getLastAssistantMessage: (id: string) => Promise<string | undefined>; getFileActivities: (id: string, currentOnly: boolean) => unknown[] } };
     const origChat = bridgeAny.deps.getLastAssistantMessage;
     const origFiles = bridgeAny.deps.getFileActivities;
     bridgeAny.deps.getLastAssistantMessage = async () => {
@@ -810,7 +830,7 @@ async function single_idle_fallbackOnChatError_BUG_20(): Promise<void> {
       const payload = h.sendInputCalls[0].text;
       assert.match(payload, /> real PTY-tail content line/,
         'BUG-20: logTail fallback when chat dep throws');
-      assert.equal(payload.indexOf('Files touched:'), -1,
+      assert.equal(payload.indexOf('Files touched in current session:'), -1,
         'BUG-20: section omitted when files dep throws');
     } finally {
       bridgeAny.deps.getLastAssistantMessage = origChat;
@@ -829,7 +849,7 @@ async function main(): Promise<void> {
   await single_contextThreshold();
   await single_waiting_notification_BR_13_20();
   await single_inferStatus_noPtyPattern_BR_14();
-  await single_idle_chatFirstPreview_BUG_20();
+  await single_idle_chatFirstPreview_BUG_20_F3();
   await single_idle_fallbackOnChatError_BUG_20();
 
   if (RUN_MS) {

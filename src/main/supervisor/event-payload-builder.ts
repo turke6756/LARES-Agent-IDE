@@ -59,9 +59,8 @@ export interface SupervisorEvent {
    *  Claude Code workers reliably slices TUI footer chrome (status bar,
    *  permission ribbon, hook spinner) instead of the real assistant prose. */
   lastAssistantMessage?: string;
-  /** BUG-20: file activities the agent has produced recently (db rows from
-   *  `getFileActivities`, sorted newest-first). Rendered as a "Files touched:"
-   *  block after "Last output:". Section is omitted when empty/undefined. */
+  /** BUG-20 / F3: live-session file activities, sorted newest-first. Rendered
+   *  under an explicit current-session heading after "Last output:". */
   filesTouched?: Array<{ filePath: string; operation: FileOperation }>;
   /** P2-03: populated when `toStatus === 'waiting'`. Kind is shared with the
    *  StatusMonitor's `WaitingKind` union (question / y-n / enter / choice /
@@ -154,9 +153,8 @@ function formatChatFull(message: string | undefined): string {
   return '\nLast output:\n' + rendered;
 }
 
-/** BUG-20: render the "Files touched:" block. Section is omitted when the
- *  array is empty/undefined so events for read-only / chat-only turns
- *  stay compact. */
+/** BUG-20 / F3: render the explicitly current-session file-activity block.
+ *  Omit it when empty/undefined so read-only / chat-only events stay compact. */
 function formatFilesTouched(
   files: SupervisorEvent['filesTouched'],
 ): string {
@@ -166,7 +164,7 @@ function formatFilesTouched(
   const overflow = files.length > FILES_TOUCHED_MAX_ENTRIES
     ? `\n> … (${files.length - FILES_TOUCHED_MAX_ENTRIES} more)`
     : '';
-  return '\nFiles touched:\n' + lines.join('\n') + overflow;
+  return '\nFiles touched in current session:\n' + lines.join('\n') + overflow;
 }
 
 /** BUG-20: single-line, char-capped hint used in the consolidated digest. */

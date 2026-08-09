@@ -2194,7 +2194,7 @@ export class AgentSupervisor extends EventEmitter {
         });
         return messages[0]?.content;
       },
-      getFileActivities: (id) => getFileActivities(id),
+      getFileActivities: (id, currentOnly) => getFileActivities(id, undefined, currentOnly),
     };
     this.bridge = new EventBridge(bridgeDeps);
 
