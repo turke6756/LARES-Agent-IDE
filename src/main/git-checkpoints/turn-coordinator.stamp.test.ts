@@ -74,6 +74,25 @@ test('openTurn passes every resolved stamp field into allocateAndInsertTurn', as
   );
 });
 
+test('openTurn persists the resolved intent stamp at allocation', async () => {
+  const store = new RecordingStore();
+  const coordinator = new TurnCoordinator({ capture, completion: new Completion(), store });
+  await coordinator.beforeCheckpoint('agent-1', {
+    ...ctx({ planId: 'plan-1', planItemId: 'item-1', source: 'explicit' }),
+    intentStamp: {
+      intentId: 'svi_turn', kind: 'task', executionRunId: 'run-1',
+      planId: 'plan-1', planItemId: 'item-1', source: 'task-dispatch',
+    },
+  });
+  assert.deepEqual(
+    {
+      intentId: store.allocations[0].intentId,
+      intentStampSource: store.allocations[0].intentStampSource,
+    },
+    { intentId: 'svi_turn', intentStampSource: 'task-dispatch' },
+  );
+});
+
 test('overlap re-open stamps the NEW send context, not the interrupted turn', async () => {
   const store = new RecordingStore();
   const coordinator = new TurnCoordinator({ capture, completion: new Completion(), store });

@@ -41,7 +41,7 @@ import {
   getTurnRecord as dbGetTurnRecord,
   listTurnRecords as dbListTurnRecords,
 } from '../database';
-import type { GitCapability } from '../../shared/types';
+import type { GitCapability, ResolvedIntentStamp } from '../../shared/types';
 import { deriveTaskLabel } from './dispatch-context';
 import type { CaptureEdgeParams, EdgeCaptureResult } from './checkpoint-service';
 import type { AfterQuality, TurnCompleteEvent } from '../supervisor/turn-completion-tracker';
@@ -120,6 +120,8 @@ export interface TurnContext {
   /** Frozen by the dispatch boundary. Optional only for pre-stamping adapters; live
    * dispatch contexts always supply it. */
   planStamp?: ResolvedPlanStamp;
+  /** Main-resolved save intent; wire callers cannot populate this carrier. */
+  intentStamp?: ResolvedIntentStamp;
   sessionId?: string | null;
   taskLabel?: string | null;
   /** Free prompt text for this turn (WP3). A turn-opening input — deliberately NOT on
@@ -230,6 +232,8 @@ export class TurnCoordinator {
       planId: ctx.planStamp?.planId ?? null,
       planItemId: ctx.planStamp?.planItemId ?? null,
       planStampSource: ctx.planStamp?.source ?? 'agent-default',
+      intentId: ctx.intentStamp?.intentId ?? null,
+      intentStampSource: ctx.intentStamp?.source ?? null,
       sessionId: ctx.sessionId ?? null,
       // WP3: explicit dispatch brief (`taskLabel`) wins; else derive from the first
       // usable prompt line; else null. `.trim() || …` makes a blank brief fall through.

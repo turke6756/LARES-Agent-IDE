@@ -15,6 +15,7 @@
 // can render exactly why a plan is not yet ready.
 
 import type { Plan, PlanTabKey } from '../../shared/types';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   archivePlanClosingRun,
   confirmPlanDispatchAttempt,
@@ -39,6 +40,7 @@ import {
 } from '../database';
 import {
   resolvePackageDispatchContext,
+  withResolvedIntentStamp,
   type DispatchContext,
   type DispatchDeps,
   type PlanBindingResolution,
@@ -81,11 +83,18 @@ export interface PackageDispatchDeps {
   insertAttempt?: typeof insertPlanDispatchAttempt;
   markFailed?: typeof markPlanDispatchAttemptFailed;
   confirmAttempt?: typeof confirmPlanDispatchAttempt;
+  /** Staged architecture flag. Production enables with LARES_INTENT_PACKAGING=1. */
+  intentPackaging?: boolean;
   deliver: (input: {
     targetAgentId: string;
     promptText: string;
     dispatch: DispatchContext;
   }) => Promise<PackageDeliveryResult>;
+}
+
+function normalizedBriefDigest(promptText: string): string {
+  const normalized = promptText.replace(/\r\n?/g, '\n').trim();
+  return createHash('sha256').update(normalized, 'utf8').digest('hex');
 }
 
 type PackageBindingFailure = Extract<PlanBindingResolution, { ok: false }>['reason'];
@@ -181,6 +190,8 @@ export async function dispatchPlanPackage(
   const insertAttempt = deps.insertAttempt ?? insertPlanDispatchAttempt;
   const markFailed = deps.markFailed ?? markPlanDispatchAttemptFailed;
   const confirmAttempt = deps.confirmAttempt ?? confirmPlanDispatchAttempt;
+  const intentPackaging = deps.intentPackaging
+    ?? process.env.LARES_INTENT_PACKAGING === '1';
   let attempt = insertAttempt({
     id: input.attemptId,
     packageId: input.packageId,
@@ -189,13 +200,30 @@ export async function dispatchPlanPackage(
     targetAgentId: input.targetAgentId,
     requestedPlanItemId: input.planItemId,
     createdAt: input.createdAt,
+    intent: intentPackaging ? {
+      id: `svi_${randomUUID()}`,
+      workspaceId: pkg.workspaceId,
+      title: pkg.title,
+      briefDigest: normalizedBriefDigest(input.promptText),
+      createdById: input.ownerAgentId,
+    } : undefined,
   });
+  const dispatch = intentPackaging && attempt.intentId
+    ? withResolvedIntentStamp(resolved.dispatch, {
+        intentId: attempt.intentId,
+        kind: 'task',
+        executionRunId: activeRun.id,
+        planId: input.planId,
+        planItemId: input.planItemId,
+        source: 'task-dispatch',
+      })
+    : resolved.dispatch;
   let delivery: PackageDeliveryResult;
   try {
     delivery = await deps.deliver({
       targetAgentId: input.targetAgentId,
       promptText: input.promptText,
-      dispatch: resolved.dispatch,
+      dispatch,
     });
   } catch (err) {
     attempt = markFailed(input.attemptId);

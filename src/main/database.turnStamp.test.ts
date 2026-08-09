@@ -84,6 +84,8 @@ type TurnRecord = {
   planId: string | null;
   planItemId: string | null;
   planStampSource: string;
+  intentId: string | null;
+  intentStampSource: string | null;
 };
 type DbModule = {
   initDatabase(): void;
@@ -100,6 +102,9 @@ type DbModule = {
   allocateAndInsertTurn(workspaceId: string, fields?: Record<string, unknown>): TurnRecord;
   getTurnRecord(id: string): TurnRecord | null;
   updateTurnRecord(id: string, updates: Record<string, unknown>): TurnRecord | null;
+  createContinuationHandoffAttempt(agentId: string): { id: string };
+  freezeContinuationAttemptBinding(attemptId: string, binding: Record<string, unknown>): Record<string, unknown>;
+  getContinuationAttemptBinding(attemptId: string): Record<string, unknown> | null;
   recordCommitLedger(write: Record<string, unknown>): void;
   getCommitRecord(repositoryKey: string, commitOid: string): Record<string, unknown> | null;
   listCommitTurnLinks(repositoryKey: string, commitOid: string): Record<string, unknown>[];
@@ -132,6 +137,90 @@ test('schema creates workspace-leading indexes and the immutable trigger', () =>
     { type: 'index', name: 'idx_turn_records_ws_plan_seq' },
     { type: 'trigger', name: 'turn_records_plan_stamp_immutable' },
   ]);
+});
+
+test('WP-1 migration registers save_intents, intent columns, indexes, and immutable triggers', () => {
+  const schema = dbm.getDb().prepare(
+    `SELECT type, name FROM sqlite_master
+      WHERE name IN (?, ?, ?, ?, ?, ?) ORDER BY name`,
+  ).all(
+    'save_intents', 'idx_save_intents_plan_item', 'idx_save_intents_run_state',
+    'turn_records_intent_stamp_immutable', 'plan_dispatch_attempts_intent_immutable',
+    'continuation_attempts_intent_immutable',
+  );
+  assert.deepEqual(schema, [
+    { type: 'trigger', name: 'continuation_attempts_intent_immutable' },
+    { type: 'index', name: 'idx_save_intents_plan_item' },
+    { type: 'index', name: 'idx_save_intents_run_state' },
+    { type: 'trigger', name: 'plan_dispatch_attempts_intent_immutable' },
+    { type: 'table', name: 'save_intents' },
+    { type: 'trigger', name: 'turn_records_intent_stamp_immutable' },
+  ]);
+  for (const [table, columns] of [
+    ['turn_records', ['intent_id', 'intent_stamp_source']],
+    ['plan_dispatch_attempts', ['intent_id']],
+    ['continuation_handoff_attempts', ['intent_id']],
+  ] as const) {
+    const actual = dbm.getDb().prepare(`PRAGMA table_info(${table})`).all()
+      .map((row) => row.name);
+    for (const column of columns) assert.ok(actual.includes(column), `${table}.${column}`);
+  }
+});
+
+test('turn allocation writes an immutable intent stamp and raw mutation is rejected', () => {
+  const ws = freshWorkspace();
+  const turn = dbm.allocateAndInsertTurn(ws, {
+    id: 'intent-stamped-turn',
+    intentId: 'svi_original',
+    intentStampSource: 'task-dispatch',
+  });
+  assert.deepEqual(
+    { intentId: turn.intentId, intentStampSource: turn.intentStampSource },
+    { intentId: 'svi_original', intentStampSource: 'task-dispatch' },
+  );
+  assert.throws(
+    () => dbm.getDb().prepare(
+      'UPDATE turn_records SET intent_id = ? WHERE id = ?',
+    ).run('svi_forged', turn.id),
+    /turn intent stamp is immutable/,
+  );
+  assert.equal(dbm.getTurnRecord(turn.id)?.intentId, 'svi_original');
+});
+
+test('continuation freeze carries the latest immutable turn intent and retries cannot replace it', () => {
+  const ws = freshWorkspace();
+  const agent = dbm.createAgent({
+    workspaceId: ws, title: 'continuation-intent', roleDescription: '',
+    workingDirectory: 'C:\\tmp', command: 'claude', provider: 'claude',
+    tmuxSessionName: null, autoRestartEnabled: false, logPath: 'C:\\tmp\\intent.log',
+  });
+  dbm.allocateAndInsertTurn(ws, {
+    id: 'continuation-source-turn', agentId: agent.id, planId: 'plan-intent',
+    planItemId: 'item-intent', planStampSource: 'explicit',
+    intentId: 'svi_continuation', intentStampSource: 'task-dispatch',
+  });
+  const attempt = dbm.createContinuationHandoffAttempt(agent.id);
+  const first = dbm.freezeContinuationAttemptBinding(attempt.id, {
+    planId: 'plan-intent', planItemId: null, source: 'continuation-carry',
+  });
+  assert.deepEqual((first as { intentStamp?: unknown }).intentStamp, {
+    intentId: 'svi_continuation', kind: 'task', executionRunId: null,
+    planId: 'plan-intent', planItemId: null, source: 'continuation-carry',
+  });
+
+  dbm.allocateAndInsertTurn(ws, {
+    id: 'later-unrelated-turn', agentId: agent.id, planStampSource: 'explicit-none',
+    intentId: 'svi_other', intentStampSource: 'task-dispatch',
+  });
+  const retry = dbm.freezeContinuationAttemptBinding(attempt.id, {
+    planId: null, planItemId: null, source: 'continuation-carry',
+  });
+  assert.equal(
+    ((retry as { intentStamp?: { intentId: string } }).intentStamp)?.intentId,
+    'svi_continuation',
+  );
+  assert.deepEqual(dbm.getContinuationAttemptBinding(attempt.id), retry,
+    'restart rehydrates only the attempt-frozen carry');
 });
 
 test('commit protection ledger schema and CRUD round-trip exact evidence atomically', () => {

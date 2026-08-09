@@ -14,7 +14,7 @@
 //     regardless of any ownerAgentId the caller passed.
 
 import type { RequestedPlanBinding, ResolvedPlanStamp } from '../../shared/commit-candidates';
-import type { GitCapability } from '../../shared/types';
+import type { GitCapability, ResolvedIntentStamp } from '../../shared/types';
 import type { TurnContext } from './turn-coordinator';
 
 export type { ResolvedPlanStamp } from '../../shared/commit-candidates';
@@ -40,7 +40,26 @@ export interface DispatchContext {
  * Lifecycle rails use `withResolvedPlanStamp`; ordinary callers use
  * `requestedPlanBinding` and are resolved against authoritative state below. */
 const TRUSTED_PLAN_STAMP: unique symbol = Symbol('lares.trusted-plan-stamp');
+const TRUSTED_INTENT_STAMP: unique symbol = Symbol('lares.trusted-intent-stamp');
 type TrustedStampCarrier = { readonly [TRUSTED_PLAN_STAMP]?: ResolvedPlanStamp };
+type TrustedIntentCarrier = { readonly [TRUSTED_INTENT_STAMP]?: ResolvedIntentStamp };
+
+function copyTrustedCarriers(
+  source: DispatchContext,
+  target: DispatchContext,
+  skip: 'plan' | 'intent',
+): void {
+  const trusted = source as DispatchContext & TrustedStampCarrier & TrustedIntentCarrier;
+  const targetTrusted = target as DispatchContext & TrustedStampCarrier & TrustedIntentCarrier;
+  const planStamp = trusted[TRUSTED_PLAN_STAMP];
+  const intentStamp = trusted[TRUSTED_INTENT_STAMP];
+  if (planStamp && skip !== 'plan') Object.defineProperty(targetTrusted, TRUSTED_PLAN_STAMP, {
+    value: planStamp, enumerable: false, writable: false, configurable: false,
+  });
+  if (intentStamp && skip !== 'intent') Object.defineProperty(targetTrusted, TRUSTED_INTENT_STAMP, {
+    value: intentStamp, enumerable: false, writable: false, configurable: false,
+  });
+}
 
 /** Attach a stamp already resolved by trusted boundary/lifecycle code. The symbol is
  * intentionally private: a `RequestedPlanBinding`, even when coerced, cannot name it. */
@@ -49,7 +68,39 @@ export function withResolvedPlanStamp(
   stamp: ResolvedPlanStamp,
 ): DispatchContext {
   const trusted = { ...dispatch } as DispatchContext & TrustedStampCarrier;
+  copyTrustedCarriers(dispatch, trusted, 'plan');
+  const carriedIntent = (stamp as ResolvedPlanStamp & {
+    intentStamp?: ResolvedIntentStamp;
+  }).intentStamp;
   Object.defineProperty(trusted, TRUSTED_PLAN_STAMP, {
+    value: Object.freeze({
+      planId: stamp.planId,
+      planItemId: stamp.planItemId,
+      source: stamp.source,
+    }),
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+  if (carriedIntent && !(trusted as DispatchContext & TrustedIntentCarrier)[TRUSTED_INTENT_STAMP]) {
+    Object.defineProperty(trusted, TRUSTED_INTENT_STAMP, {
+      value: Object.freeze({ ...carriedIntent }),
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return trusted;
+}
+
+/** Attach a main-resolved intent stamp through a non-wire, private-symbol carrier. */
+export function withResolvedIntentStamp(
+  dispatch: DispatchContext,
+  stamp: ResolvedIntentStamp,
+): DispatchContext {
+  const trusted = { ...dispatch } as DispatchContext & TrustedIntentCarrier;
+  copyTrustedCarriers(dispatch, trusted, 'intent');
+  Object.defineProperty(trusted, TRUSTED_INTENT_STAMP, {
     value: Object.freeze({ ...stamp }),
     enumerable: false,
     writable: false,
@@ -314,6 +365,7 @@ export async function buildDispatchTurnContext(
   // (e.g. the Implement/dispatch service that has ALREADY minted the execution run), so
   // it bypasses the WP-P5C-gate pre-Implement check applied to wire/default bindings.
   const trustedStamp = (dispatch as DispatchContext & TrustedStampCarrier)[TRUSTED_PLAN_STAMP];
+  const trustedIntentStamp = (dispatch as DispatchContext & TrustedIntentCarrier)[TRUSTED_INTENT_STAMP];
   const resolution = trustedStamp
     ? { ok: true as const, stamp: trustedStamp }
     : resolveRequestedPlanBinding(deps, agent, dispatch.requestedPlanBinding);
@@ -329,6 +381,7 @@ export async function buildDispatchTurnContext(
     ownerAgentId,
     ownerBrickGeneration,
     planStamp: resolution.stamp,
+    intentStamp: trustedIntentStamp,
     sessionId: dispatch.sessionId ?? agent.resumeSessionId ?? null,
     taskLabel: dispatch.taskLabel ?? null,
     quality: 'guaranteed',

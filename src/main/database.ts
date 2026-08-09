@@ -12,6 +12,7 @@ import { OrchestrationBinding, OrchestrationEvent, OrchestrationRun, Orchestrati
 import { resolveWorkspaceForCwd, WORKSPACE_LINEAGE_VERSION, type WorkspaceRecordLite } from './skill-analytics/workspace-lineage';
 import { unwrapOsc8, stripTerminalEscapes, canonicalizeToAbsolute, looksPolluted } from './file-activity-normalize';
 import type { CommitOutcome, ResolvedPlanStamp } from '../shared/commit-candidates';
+import type { ResolvedIntentStamp } from '../shared/types';
 
 let db: Database.Database;
 let dbPath: string;
@@ -1718,7 +1719,6 @@ function initContextOptimizerSchema(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_plan_work_packages_plan ON plan_work_packages(plan_id);
   `);
-
   try { db.exec(`ALTER TABLE plan_work_packages ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
 
   // Save-card SC-WP-3B — package_finalizations (§5 of the shared bundle contract):
@@ -2167,6 +2167,7 @@ function initContextOptimizerSchema(): void {
       CHECK (to_state IN ('ready','executing','blocked','done','archived'))
     )
   `);
+
   // Legacy P5B databases reject `done`. Probe the actual constraint in a
   // rolled-back savepoint, then perform SQLite's table-rebuild migration only
   // when required. The probe leaves no rows behind; on subsequent starts it
@@ -2282,6 +2283,61 @@ function initContextOptimizerSchema(): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_dispatch_attempts_reconcile
     ON plan_dispatch_attempts(state, created_at)`);
+
+  // Save-card intent architecture WP-1. Schema ships ahead of the projection and
+  // remains additive for existing databases. execution_run_id is deliberately
+  // nullable and otherwise unused until activity worktrees land in WP-5.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS save_intents (
+      id                  TEXT PRIMARY KEY,
+      workspace_id        TEXT NOT NULL,
+      execution_run_id    TEXT,
+      repository_key      TEXT,
+      kind                TEXT NOT NULL CHECK (kind IN ('task','named-save-set')),
+      plan_id             TEXT,
+      plan_item_id        TEXT,
+      title               TEXT NOT NULL,
+      brief_digest        TEXT,
+      dispatch_attempt_id TEXT UNIQUE,
+      created_by          TEXT NOT NULL CHECK (created_by IN ('task-dispatch','human-save-card')),
+      created_by_id       TEXT,
+      state               TEXT NOT NULL
+                          CHECK (state IN ('open','ready','committed','superseded','abandoned')),
+      revision            INTEGER NOT NULL DEFAULT 1,
+      created_at          INTEGER NOT NULL,
+      ready_at            INTEGER,
+      committed_at        INTEGER,
+      CHECK (
+        (kind='task'           AND dispatch_attempt_id IS NOT NULL) OR
+        (kind='named-save-set' AND dispatch_attempt_id IS NULL)
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_save_intents_plan_item
+      ON save_intents(plan_id, plan_item_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_save_intents_run_state
+      ON save_intents(execution_run_id, state);
+  `);
+  try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE turn_records ADD COLUMN intent_stamp_source TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE plan_dispatch_attempts ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
+  try { db.exec(`ALTER TABLE continuation_handoff_attempts ADD COLUMN intent_id TEXT`); } catch { /* exists */ }
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS turn_records_intent_stamp_immutable
+    BEFORE UPDATE OF intent_id, intent_stamp_source ON turn_records
+    WHEN NEW.intent_id IS NOT OLD.intent_id
+      OR NEW.intent_stamp_source IS NOT OLD.intent_stamp_source
+    BEGIN SELECT RAISE(ABORT, 'turn intent stamp is immutable'); END;
+
+    CREATE TRIGGER IF NOT EXISTS plan_dispatch_attempts_intent_immutable
+    BEFORE UPDATE OF intent_id ON plan_dispatch_attempts
+    WHEN OLD.intent_id IS NOT NULL AND NEW.intent_id IS NOT OLD.intent_id
+    BEGIN SELECT RAISE(ABORT, 'dispatch intent stamp is immutable'); END;
+
+    CREATE TRIGGER IF NOT EXISTS continuation_attempts_intent_immutable
+    BEFORE UPDATE OF intent_id ON continuation_handoff_attempts
+    WHEN OLD.intent_id IS NOT NULL AND NEW.intent_id IS NOT OLD.intent_id
+    BEGIN SELECT RAISE(ABORT, 'continuation intent stamp is immutable'); END;
+  `);
 
   // Mechanics D1: freeze the dispatched revision and explicit orchestration /
   // session correlations. Legacy rows remain nullable unless an exact key join
@@ -4011,13 +4067,15 @@ export interface ContinuationHandoffAttempt {
   status: ContinuationAttemptStatus;
   reason: string | null;
   thresholdContextPct: number | null;
+  intentId: string | null;
 }
 
-export type ContinuationAttemptBinding = ResolvedPlanStamp | {
+type ContinuationIntentCarry = { intentStamp?: ResolvedIntentStamp };
+export type ContinuationAttemptBinding = (ResolvedPlanStamp & ContinuationIntentCarry) | ({
   planId: null;
   planItemId: null;
   source: 'legacy-unstamped';
-};
+} & ContinuationIntentCarry);
 
 export interface ContinuationBrickRow {
   id: string;
@@ -4071,6 +4129,7 @@ function rowToContinuationAttempt(row: any): ContinuationHandoffAttempt {
     status: row.status as ContinuationAttemptStatus,
     reason: row.reason ?? null,
     thresholdContextPct: row.threshold_context_pct ?? null,
+    intentId: row.intent_id ?? null,
   };
 }
 
@@ -4149,16 +4208,24 @@ export function freezeContinuationAttemptBinding(
   }
   const tx = db.transaction(() => {
     const attempt = queryOne(
-      'SELECT plan_id, plan_item_id, plan_stamp_source FROM continuation_handoff_attempts WHERE id = ?',
+      `SELECT plan_id, plan_item_id, plan_stamp_source, intent_id, dashboard_agent_id
+         FROM continuation_handoff_attempts WHERE id = ?`,
       [attemptId],
     );
     if (!attempt) throw new Error(`freezeContinuationAttemptBinding: no attempt ${attemptId}`);
     if (attempt.plan_stamp_source === 'legacy-unstamped') {
+      const latestIntent = queryOne(
+        `SELECT intent_id FROM turn_records
+          WHERE agent_id = ? AND intent_id IS NOT NULL
+          ORDER BY turn_seq DESC LIMIT 1`,
+        [attempt.dashboard_agent_id],
+      );
       run(
         `UPDATE continuation_handoff_attempts
-            SET plan_id = ?, plan_item_id = ?, plan_stamp_source = ?
+            SET plan_id = ?, plan_item_id = ?, plan_stamp_source = ?, intent_id = ?
           WHERE id = ? AND plan_stamp_source = 'legacy-unstamped'`,
-        [binding.planId, binding.planItemId, binding.source, attemptId],
+        [binding.planId, binding.planItemId, binding.source,
+          latestIntent?.intent_id ?? null, attemptId],
       );
       return;
     }
@@ -4176,7 +4243,13 @@ export function freezeContinuationAttemptBinding(
  * unavailable instead of falling back to turn_records or agents.plan_id. */
 export function getContinuationAttemptBinding(attemptId: string): ContinuationAttemptBinding | null {
   const row = queryOne(
-    'SELECT plan_id, plan_item_id, plan_stamp_source FROM continuation_handoff_attempts WHERE id = ?',
+    `SELECT c.plan_id, c.plan_item_id, c.plan_stamp_source, c.intent_id,
+            s.plan_id AS intent_plan_id, s.plan_item_id AS intent_plan_item_id,
+            d.execution_run_id AS intent_execution_run_id
+       FROM continuation_handoff_attempts c
+       LEFT JOIN save_intents s ON s.id = c.intent_id
+       LEFT JOIN plan_dispatch_attempts d ON d.intent_id = c.intent_id
+      WHERE c.id = ?`,
     [attemptId],
   );
   if (!row) return null;
@@ -4191,6 +4264,14 @@ export function getContinuationAttemptBinding(attemptId: string): ContinuationAt
     planId: row.plan_id ?? null,
     planItemId: row.plan_item_id ?? null,
     source,
+    ...(row.intent_id ? { intentStamp: {
+      intentId: row.intent_id,
+      kind: 'task' as const,
+      executionRunId: row.intent_execution_run_id ?? null,
+      planId: row.intent_plan_id ?? row.plan_id ?? null,
+      planItemId: row.intent_plan_item_id ?? row.plan_item_id ?? null,
+      source: 'continuation-carry' as const,
+    } } : {}),
   };
 }
 
@@ -7031,11 +7112,70 @@ export function archivePlanClosingRun(planId: string): ArchivePlanClosingRunResu
 
 export type PlanDispatchAttemptState = 'pending' | 'delivered' | 'failed' | 'reconciled';
 
+export type SaveIntentKind = 'task' | 'named-save-set';
+export type SaveIntentState = 'open' | 'ready' | 'committed' | 'superseded' | 'abandoned';
+
+export interface SaveIntent {
+  id: string;
+  workspaceId: string;
+  executionRunId: string | null;
+  repositoryKey: string | null;
+  kind: SaveIntentKind;
+  planId: string | null;
+  planItemId: string | null;
+  title: string;
+  briefDigest: string | null;
+  dispatchAttemptId: string | null;
+  createdBy: 'task-dispatch' | 'human-save-card';
+  createdById: string | null;
+  state: SaveIntentState;
+  revision: number;
+  createdAt: number;
+  readyAt: number | null;
+  committedAt: number | null;
+}
+
+function rowToSaveIntent(row: any): SaveIntent {
+  return {
+    id: row.id,
+    workspaceId: row.workspace_id,
+    executionRunId: row.execution_run_id ?? null,
+    repositoryKey: row.repository_key ?? null,
+    kind: row.kind,
+    planId: row.plan_id ?? null,
+    planItemId: row.plan_item_id ?? null,
+    title: row.title,
+    briefDigest: row.brief_digest ?? null,
+    dispatchAttemptId: row.dispatch_attempt_id ?? null,
+    createdBy: row.created_by,
+    createdById: row.created_by_id ?? null,
+    state: row.state,
+    revision: row.revision,
+    createdAt: row.created_at,
+    readyAt: row.ready_at ?? null,
+    committedAt: row.committed_at ?? null,
+  };
+}
+
+export function getSaveIntent(id: string): SaveIntent | null {
+  const row = queryOne('SELECT * FROM save_intents WHERE id = ?', [id]);
+  return row ? rowToSaveIntent(row) : null;
+}
+
+export function getSaveIntentByDispatchAttempt(dispatchAttemptId: string): SaveIntent | null {
+  const row = queryOne(
+    'SELECT * FROM save_intents WHERE dispatch_attempt_id = ?',
+    [dispatchAttemptId],
+  );
+  return row ? rowToSaveIntent(row) : null;
+}
+
 export interface PlanDispatchAttempt {
   id: string;
   packageId: string;
   planId: string;
   executionRunId: string;
+  intentId: string | null;
   targetAgentId: string | null;
   packageRevision: number | null;
   orchestrationId: string | null;
@@ -7054,6 +7194,7 @@ function rowToPlanDispatchAttempt(row: any): PlanDispatchAttempt {
     packageId: row.package_id,
     planId: row.plan_id,
     executionRunId: row.execution_run_id,
+    intentId: row.intent_id ?? null,
     targetAgentId: row.target_agent_id ?? null,
     packageRevision: row.package_revision ?? null,
     orchestrationId: row.orchestration_id ?? null,
@@ -7080,8 +7221,26 @@ export function insertPlanDispatchAttempt(input: {
   createdAt: number;
   orchestrationId?: string | null;
   targetSessionId?: string | null;
+  intent?: {
+    id: string;
+    workspaceId: string;
+    title: string;
+    briefDigest: string;
+    createdById: string | null;
+  };
 }): PlanDispatchAttempt {
   return getDb().transaction((): PlanDispatchAttempt => {
+    const existing = getPlanDispatchAttempt(input.id);
+    if (existing) {
+      if (existing.packageId !== input.packageId
+          || existing.planId !== input.planId
+          || existing.executionRunId !== input.executionRunId
+          || existing.targetAgentId !== input.targetAgentId
+          || existing.requestedPlanItemId !== input.requestedPlanItemId) {
+        throw new Error('insertPlanDispatchAttempt: attempt id belongs to a different dispatch');
+      }
+      return existing;
+    }
     const pkg = getPlanWorkPackage(input.packageId);
     if (!pkg || pkg.id !== input.requestedPlanItemId || pkg.planId !== input.planId) {
       throw new Error('insertPlanDispatchAttempt: package is not the requested plan item');
@@ -7093,16 +7252,34 @@ export function insertPlanDispatchAttempt(input: {
     if (!executionRun || executionRun.planId !== input.planId || executionRun.lifecycleState !== 'active') {
       throw new Error('insertPlanDispatchAttempt: no matching active execution run');
     }
+    let intentId: string | null = null;
+    if (input.intent) {
+      if (input.intent.workspaceId !== pkg.workspaceId) {
+        throw new Error('insertPlanDispatchAttempt: intent workspace does not match package');
+      }
+      run(
+        `INSERT INTO save_intents
+           (id, workspace_id, execution_run_id, repository_key, kind, plan_id,
+            plan_item_id, title, brief_digest, dispatch_attempt_id, created_by,
+            created_by_id, state, revision, created_at, ready_at, committed_at)
+         VALUES (?, ?, NULL, NULL, 'task', ?, ?, ?, ?, ?, 'task-dispatch', ?,
+                 'open', 1, ?, NULL, NULL)`,
+        [input.intent.id, input.intent.workspaceId, input.planId,
+          input.requestedPlanItemId, input.intent.title, input.intent.briefDigest,
+          input.id, input.intent.createdById, input.createdAt],
+      );
+      intentId = input.intent.id;
+    }
     run(
       `INSERT INTO plan_dispatch_attempts
-         (id, package_id, plan_id, execution_run_id, target_agent_id,
+       (id, package_id, plan_id, execution_run_id, target_agent_id,
           requested_plan_item_id, confirmed_turn_id, state, created_at,
           confirmed_at, reconciled_at, package_revision, orchestration_id,
-          target_session_id)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, NULL, NULL, ?, ?, ?)`,
+          target_session_id, intent_id)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, NULL, NULL, ?, ?, ?, ?)`,
       [input.id, input.packageId, input.planId, input.executionRunId,
         input.targetAgentId, input.requestedPlanItemId, input.createdAt, pkg.revision,
-        input.orchestrationId ?? null, input.targetSessionId ?? null],
+        input.orchestrationId ?? null, input.targetSessionId ?? null, intentId],
     );
     return getPlanDispatchAttempt(input.id)!;
   })();
@@ -7142,6 +7319,7 @@ function turnMatchesPlanDispatchAttempt(
     || turn.agentId !== attempt.targetAgentId
     || turn.planId !== attempt.planId
     || turn.planItemId !== attempt.requestedPlanItemId
+    || (attempt.intentId !== null && turn.intentId !== attempt.intentId)
   ) return false;
   const executionRun = getPlanExecutionRun(attempt.executionRunId);
   if (!executionRun || executionRun.planId !== attempt.planId) return false;
@@ -7946,6 +8124,8 @@ export interface TurnRecord {
   planId?: string | null;
   planItemId?: string | null;
   planStampSource?: PersistedTurnPlanStampSource;
+  intentId?: string | null;
+  intentStampSource?: string | null;
   sessionId: string | null;
   taskLabel: string | null;
   startedAt: number | null;
@@ -7981,6 +8161,8 @@ export interface AllocateTurnFields {
   planId?: string | null;
   planItemId?: string | null;
   planStampSource?: TurnPlanStampSource;
+  intentId?: string | null;
+  intentStampSource?: string | null;
   sessionId?: string | null;
   taskLabel?: string | null;
   startedAt?: number | null;
@@ -8041,6 +8223,8 @@ function rowToTurnRecord(row: any): TurnRecord {
     planId: row.plan_id ?? null,
     planItemId: row.plan_item_id ?? null,
     planStampSource: (row.plan_stamp_source ?? 'legacy-unstamped') as PersistedTurnPlanStampSource,
+    intentId: row.intent_id ?? null,
+    intentStampSource: row.intent_stamp_source ?? null,
     sessionId: row.session_id ?? null,
     taskLabel: row.task_label ?? null,
     startedAt: row.started_at ?? null,
@@ -8152,6 +8336,8 @@ export function listTurnRecords(
 
 export interface TurnWitnessRead {
   turnId: string;
+  /** Optional only for legacy/test readers; the production DB reader always sets it. */
+  intentId?: string | null;
   agentId: string | null;
   /** Owner/supervisor attribution frozen on the row at dispatch, if any. */
   ownerAgentId: string | null;
@@ -8172,11 +8358,12 @@ function isWitnessingOp(op: TurnWitnessOp): boolean {
  */
 export function getTurnWitnessReads(workspaceId: string): TurnWitnessRead[] {
   return queryAll(
-    `SELECT id, agent_id, owner_agent_id, owner_brick_generation, touched
+    `SELECT id, intent_id, agent_id, owner_agent_id, owner_brick_generation, touched
        FROM turn_records WHERE workspace_id = ? ORDER BY turn_seq ASC`,
     [workspaceId]
   ).map((row: any): TurnWitnessRead => ({
     turnId: row.id,
+    intentId: row.intent_id ?? null,
     agentId: row.agent_id ?? null,
     ownerAgentId: row.owner_agent_id ?? null,
     ownerBrickGeneration: row.owner_brick_generation ?? null,
@@ -8225,8 +8412,9 @@ export function allocateAndInsertTurn(
       `INSERT INTO turn_records
          (id, workspace_id, turn_seq, agent_id, agent_title, owner_agent_id,
           owner_brick_generation, plan_id, plan_item_id, plan_stamp_source,
+          intent_id, intent_stamp_source,
           session_id, task_label, started_at, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       workspaceId,
@@ -8238,6 +8426,8 @@ export function allocateAndInsertTurn(
       fields.planId ?? null,
       planItemId,
       planStampSource,
+      fields.intentId ?? null,
+      fields.intentStampSource ?? null,
       fields.sessionId ?? null,
       fields.taskLabel ?? null,
       fields.startedAt ?? null,

@@ -6,6 +6,7 @@ import type { GitCapability } from '../../shared/types';
 import {
   buildDispatchTurnContext,
   resolveRequestedPlanBinding,
+  withResolvedIntentStamp,
   withResolvedPlanStamp,
   type DispatchAgentInfo,
   type DispatchDeps,
@@ -94,7 +95,8 @@ test('SC-WP-3A: an item absent from its plan rejects; a boundary with no lookup 
 
 test('a wire RequestedPlanBinding cannot forge any carry source', async () => {
   const forged = {
-    mode: 'explicit', planId: 'plan-explicit', planItemId: null, source: 'fork-carry',
+    mode: 'explicit', planId: 'plan-explicit', planItemId: null,
+    source: 'fork-carry', intentId: 'svi_forged',
   } as never;
   const resolution = resolveRequestedPlanBinding(deps(), agent, forged);
   assert.equal(resolution.ok, true);
@@ -108,6 +110,19 @@ test('a wire RequestedPlanBinding cannot forge any carry source', async () => {
   } as never);
   assert.equal(ctx?.planStamp?.source, 'explicit');
   assert.equal(ctx?.planStamp?.planId, 'plan-explicit');
+  assert.equal(ctx?.intentStamp, undefined);
+});
+
+test('trusted main-side intent factory freezes a non-serializable task stamp', async () => {
+  const stamp = {
+    intentId: 'svi_trusted', kind: 'task' as const, executionRunId: 'run-1',
+    planId: 'plan-explicit', planItemId: 'item-1', source: 'task-dispatch' as const,
+  };
+  const dispatch = withResolvedIntentStamp({ origin: 'orchestration' }, stamp);
+  assert.equal(JSON.stringify(dispatch).includes('svi_trusted'), false);
+  stamp.intentId = 'svi_mutated';
+  const ctx = await buildDispatchTurnContext(deps(), 'worker', dispatch);
+  assert.equal(ctx?.intentStamp?.intentId, 'svi_trusted');
 });
 
 test('trusted lifecycle factory can carry a source through the non-wire symbol path', async () => {

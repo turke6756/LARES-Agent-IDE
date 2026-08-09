@@ -46,6 +46,7 @@ function dirtyEntry(entryId: string, path: EncodedGitPath): DirtyEntry {
 function turn(turnId: string, agentId: string, ...paths: string[]): TurnWitnessRead {
   return {
     turnId,
+    intentId: null,
     agentId,
     ownerAgentId: null,
     ownerBrickGeneration: null,
@@ -90,6 +91,21 @@ test('prepends each workspace prefix before matching two workspaces in one repos
       { entryId: 'entry-lib', workspaceId: 'ws-lib', turnId: 'turn-lib' },
     ],
   );
+});
+
+test('projects the immutable turn intent id without consulting mutable task labels', () => {
+  const entries = [
+    dirtyEntry('entry-app', encodedPath(Buffer.from('packages/app/src/intent.ts'))),
+  ];
+  const stamped = turn('turn-intent', 'agent-intent', 'src/intent.ts');
+  stamped.intentId = 'svi_projected';
+  const result = projectWitnesses(
+    repository,
+    entries,
+    fixtureReader({ 'ws-app': [stamped] }),
+    () => ({ planId: 'plan-frozen', planItemId: 'item-frozen' }),
+  );
+  assert.equal(result[0].intentId, 'svi_projected');
 });
 
 test('never matches a non-UTF-8 Git path through its lossy display string', () => {

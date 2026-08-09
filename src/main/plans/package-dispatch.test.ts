@@ -110,10 +110,12 @@ function seed(activeRun = true): {
 
 function openStampedTurn(
   s: ReturnType<typeof seed>, id: string, startedAt: number,
+  intent?: { intentId: string; source: string },
 ): void {
   dbm.allocateAndInsertTurn(s.workspaceId, {
     id, agentId: s.agentId, planId: s.planId, planItemId: s.packageId,
     planStampSource: 'explicit', startedAt, status: 'open',
+    intentId: intent?.intentId ?? null, intentStampSource: intent?.source ?? null,
   });
 }
 
@@ -122,7 +124,8 @@ test('schema has the exact dispatch-attempt columns and bounded states', () => {
   assert.deepEqual(rows.map((r) => r.name), [
     'id', 'package_id', 'plan_id', 'execution_run_id', 'target_agent_id',
     'requested_plan_item_id', 'confirmed_turn_id', 'state', 'created_at',
-    'confirmed_at', 'reconciled_at',
+    'confirmed_at', 'reconciled_at', 'intent_id', 'package_revision',
+    'orchestration_id', 'target_session_id',
   ]);
 });
 
@@ -135,6 +138,7 @@ test('pending precedes send; open turn confirmation moves ready→executing atom
     targetAgentId: s.agentId, ownerAgentId: null, promptText: 'Implement package',
     createdAt: 2000,
   }, {
+    intentPackaging: true,
     deliver: async ({ dispatch }) => {
       const row = dbm.getPlanDispatchAttempt(`attempt-${serial}`);
       sawPendingBeforeSend = row?.state === 'pending'
@@ -154,7 +158,9 @@ test('pending precedes send; open turn confirmation moves ready→executing atom
       assert.deepEqual(ctx?.planStamp, {
         planId: s.planId, planItemId: s.packageId, source: 'explicit',
       }, 'the already-gated internal dispatch retains the explicit item stamp');
-      openStampedTurn(s, `turn-${serial}`, 2100);
+      assert.equal(ctx?.intentStamp?.intentId, row?.intentId);
+      assert.equal(ctx?.intentStamp?.source, 'task-dispatch');
+      openStampedTurn(s, `turn-${serial}`, 2100, ctx?.intentStamp);
       return { disposition: 'confirmed', confirmedTurnId: `turn-${serial}`, confirmedAt: 2100 };
     },
   });
@@ -166,6 +172,47 @@ test('pending precedes send; open turn confirmation moves ready→executing atom
   assert.deepEqual(dbm.listPlanWpLifecycleEvents(s.packageId).map((e) => e.toState), ['executing']);
   assert.equal(dbm.getTurnRecord(`turn-${serial}`)?.status, 'open',
     'terminal accepted is not required for executing');
+});
+
+test('intent get-or-create is keyed by dispatch attempt while separate briefs mint separately', async () => {
+  const s = seed();
+  const seen: string[] = [];
+  const input = {
+    attemptId: `attempt-retry-${serial}`, lifecycleEventId: `event-retry-${serial}`,
+    packageId: s.packageId, planId: s.planId, planItemId: s.packageId,
+    targetAgentId: s.agentId, ownerAgentId: 'supervisor-1',
+    promptText: 'Implement\r\nthis package', createdAt: 2150,
+  };
+  const deliver = async ({ dispatch }: {
+    dispatch: import('../git-checkpoints/dispatch-context').DispatchContext;
+  }) => {
+    const ctx = await import('../git-checkpoints/dispatch-context').then((m) =>
+      m.buildDispatchTurnContext({
+        getAgent: (id) => id === s.agentId
+          ? { workspaceId: s.workspaceId, title: 'worker' } : null,
+        resolveCapability: async () => ({
+          resolution: { agentShell: { source: null, note: '' }, internal: null },
+          repoState: 'repo', commonDir: '/r/.git', commonDirQueueKey: '/r',
+          repoRoot: '/r', workspacePrefix: '', protectedRoot: false,
+          reason: 'ok', detail: null,
+        }),
+      }, s.agentId, dispatch));
+    assert.ok(ctx?.intentStamp?.intentId);
+    seen.push(ctx.intentStamp.intentId);
+    return { disposition: 'delivered-unconfirmed' as const };
+  };
+  await svc.dispatchPlanPackage(input, { intentPackaging: true, deliver });
+  await svc.dispatchPlanPackage(input, { intentPackaging: true, deliver });
+  await svc.dispatchPlanPackage({
+    ...input, attemptId: `attempt-second-${serial}`, promptText: 'A second brief',
+  }, { intentPackaging: true, deliver });
+
+  assert.equal(seen[0], seen[1], 'one dispatch retry reuses one intent');
+  assert.notEqual(seen[0], seen[2], 'two briefs under one item mint two intents');
+  const first = dbm.getSaveIntentByDispatchAttempt(input.attemptId);
+  assert.equal(first?.id, seen[0]);
+  assert.equal(first?.executionRunId, null, 'WP-1 ships execution_run_id nullable and unused');
+  assert.equal(first?.briefDigest?.length, 64);
 });
 
 test('failed send marks the attempt failed and leaves the package ready', async () => {

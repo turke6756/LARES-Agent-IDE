@@ -36,6 +36,17 @@ import type {
 
 export type PathType = 'windows' | 'wsl';
 export type AgentProvider = 'claude' | 'gemini' | 'codex' | 'grok' | 'agy';
+
+/** Main-resolved identity for one saveable task dispatch. This shape is shared for
+ * persisted/projection contracts, but is never accepted by an IPC or preload input. */
+export interface ResolvedIntentStamp {
+  intentId: string;
+  kind: 'task';
+  executionRunId: string | null;
+  planId: string | null;
+  planItemId: string | null;
+  source: 'task-dispatch' | 'continuation-carry' | 'fork-carry' | 'revive-carry';
+}
 /** Providers accepted for new launches. `gemini` remains in AgentProvider so
  * persisted historical agents and templates can still be decoded and shown. */
 export type LaunchableAgentProvider = Exclude<AgentProvider, 'gemini'>;

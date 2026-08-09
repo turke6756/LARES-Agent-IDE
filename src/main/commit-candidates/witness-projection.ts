@@ -41,6 +41,7 @@ export interface ProjectedWitness {
   ownerBrickGeneration: number | null;
   planId: string | null;
   planItemId: string | null;
+  intentId: string | null;
   /** Internal presentation signal; deliberately excluded from topology identity. */
   planAttributionAvailable: boolean;
 }
@@ -106,6 +107,7 @@ export function projectWitnesses(
           ownerBrickGeneration: turn.ownerBrickGeneration,
           planId: stamp?.planId ?? null,
           planItemId: stamp?.planItemId ?? null,
+          intentId: turn.intentId ?? null,
           planAttributionAvailable: stamp !== null,
         });
       }
