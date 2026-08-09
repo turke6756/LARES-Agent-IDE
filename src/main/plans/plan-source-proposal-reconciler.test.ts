@@ -50,8 +50,9 @@ class FakeBetterSqlite {
     seq += 1;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), `source-projection-ws-${seq}-`));
     const ws = dbm.createWorkspace({ title: `ws-${seq}`, path: root, pathType: 'windows' });
-    const artifact = `prop_source_${seq}`;
-    const planArtifact = `plan_source_${seq}`;
+    const artifactHex = seq.toString(16).padStart(8, '0');
+    const artifact = `prop_${artifactHex}`;
+    const planArtifact = `plan_${artifactHex}`;
     const proposalRel = `.lares/proposals/source-${seq}.md`;
     fs.mkdirSync(path.join(root, '.lares', 'proposals'), { recursive: true });
     fs.writeFileSync(path.join(root, proposalRel), `---\nartifact_id: ${artifact}\nauthored_at: 2026-08-06\ntitle: Source ${seq}\n---\n# Source\n`);

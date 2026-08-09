@@ -93,7 +93,7 @@ type DbModule = {
 };
 
 type Diagnostic = {
-  kind: 'duplicate-artifact-id' | 'malformed-frontmatter';
+  kind: 'duplicate-artifact-id' | 'malformed-frontmatter' | 'non-contract-artifact-id';
   workspaceId: string; relPath: string; otherRelPath?: string; detail: string;
 };
 type ReconcileResult = { registered: ProposalRecord[]; diagnostics: Diagnostic[] };
@@ -175,12 +175,12 @@ test('ensureProposalsDir creates the resolved dir without a supervisor launch', 
 });
 
 test('an adopted proposal with no witnessed write registers as author_role=unknown', () => {
-  writeProposal('adopt.md', '---\nartifact_id: prop_adopt\ntitle: Adopt Me\nauthored_at: 2026-08-01T10:00:00Z\n---\n\nbody');
+  writeProposal('adopt.md', '---\nartifact_id: prop_ada0beef\ntitle: Adopt Me\nauthored_at: 2026-08-01T10:00:00Z\n---\n\nbody');
   clock = 2000;
   const res = newWatcher().reconcileWorkspace(ws);
   const row = dbm.getProposalByWorkspacePath(ws.id, '.lares/proposals/adopt.md');
   assert.ok(row, 'registered');
-  assert.equal(row!.artifactId, 'prop_adopt');   // adopted, not minted
+  assert.equal(row!.artifactId, 'prop_ada0beef');   // adopted, not minted
   assert.equal(row!.title, 'Adopt Me');
   assert.equal(row!.authorRole, 'unknown');       // no witness ⇒ unknown
   assert.equal(row!.authorAgentId, null);
@@ -190,13 +190,13 @@ test('an adopted proposal with no witnessed write registers as author_role=unkno
 });
 
 test('created_at stays stable across an edit (date-grouping key)', () => {
-  writeProposal('stable.md', '---\nartifact_id: prop_stable\ntitle: One\n---\n\nv1');
+  writeProposal('stable.md', '---\nartifact_id: prop_57ab1e00\ntitle: One\n---\n\nv1');
   clock = 3000;
   newWatcher().reconcileWorkspace(ws);
   const first = dbm.getProposalByWorkspacePath(ws.id, '.lares/proposals/stable.md')!;
   assert.equal(first.createdAt, 3000);
   // Edit the file → new mtime/size; reconcile at a later clock.
-  writeProposal('stable.md', '---\nartifact_id: prop_stable\ntitle: One edited longer body\n---\n\nv2 much longer');
+  writeProposal('stable.md', '---\nartifact_id: prop_57ab1e00\ntitle: One edited longer body\n---\n\nv2 much longer');
   clock = 9999;
   newWatcher().reconcileWorkspace(ws);
   const second = dbm.getProposalByWorkspacePath(ws.id, '.lares/proposals/stable.md')!;
@@ -206,7 +206,7 @@ test('created_at stays stable across an edit (date-grouping key)', () => {
 });
 
 test('a witnessed supervisor write attributes author_role=supervisor + display', () => {
-  const abs = writeProposal('witnessed.md', '---\nartifact_id: prop_wit\ntitle: Witnessed\n---\n\nbody');
+  const abs = writeProposal('witnessed.md', '---\nartifact_id: prop_017e55ed\ntitle: Witnessed\n---\n\nbody');
   const sup = makeSupervisor('Planning Supervisor');
   dbm.addFileActivity(sup.id, abs, 'write');
   clock = 4000;
@@ -236,8 +236,8 @@ test('a missing artifact_id is minted, inserted into the file, and registered', 
 });
 
 test('a duplicate artifact_id leaves the second file unregistered with a both-paths diagnostic', () => {
-  writeProposal('dup-a.md', '---\nartifact_id: prop_dupe\ntitle: A\n---\n\nbody');
-  writeProposal('dup-b.md', '---\nartifact_id: prop_dupe\ntitle: B\n---\n\nbody');
+  writeProposal('dup-a.md', '---\nartifact_id: prop_d00fd00f\ntitle: A\n---\n\nbody');
+  writeProposal('dup-b.md', '---\nartifact_id: prop_d00fd00f\ntitle: B\n---\n\nbody');
   clock = 6000;
   const res = newWatcher().reconcileWorkspace(ws);
   // a sorts before b → a is canonical, b is the duplicate.
@@ -258,8 +258,18 @@ test('malformed frontmatter is quarantined — not registered, never rewritten',
   assert.ok(res.diagnostics.some((d) => d.kind === 'malformed-frontmatter' && d.relPath === '.lares/proposals/broken.md'));
 });
 
+test('a non-contract artifact_id is visibly quarantined and never registered', () => {
+  const abs = writeProposal('non-contract.md', '---\nartifact_id: prop_pigt5a83\ntitle: Legacy shape\n---\n\nbody');
+  const before = fs.readFileSync(abs, 'utf8');
+  const res = newWatcher().reconcileWorkspace(ws);
+  assert.equal(dbm.getProposalByWorkspacePath(ws.id, '.lares/proposals/non-contract.md'), null);
+  assert.equal(fs.readFileSync(abs, 'utf8'), before, 'quarantine never rewrites identity');
+  assert.ok(res.diagnostics.some((d) => d.kind === 'non-contract-artifact-id'
+    && d.relPath === '.lares/proposals/non-contract.md'));
+});
+
 test('a vanished proposal is soft-deleted (row survives with deleted_at)', () => {
-  const abs = writeProposal('ephemeral.md', '---\nartifact_id: prop_eph\ntitle: Bye\n---\n\nbody');
+  const abs = writeProposal('ephemeral.md', '---\nartifact_id: prop_e9eea111\ntitle: Bye\n---\n\nbody');
   clock = 8000;
   newWatcher().reconcileWorkspace(ws);
   assert.ok(dbm.getProposalByWorkspacePath(ws.id, '.lares/proposals/ephemeral.md'));

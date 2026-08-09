@@ -45,7 +45,12 @@ db.getWorkspace = (id: string) => {
 // rail runs. These lifecycle tests don't assert path resolution, so a plans store
 // keyed by id suffices; unknown ids fall back to null → the legacy planPath default.
 const plansStore = new Map<string, { id: string; workspaceId: string; path: string; format?: string }>();
-db.getPlan = (id: string) => (plansStore.has(id) ? clone(plansStore.get(id)!) : null);
+db.getPlan = (id: string) => (plansStore.has(id) ? clone(plansStore.get(id)!) : {
+  id, workspaceId: 'ws-1', path: `.lares/plans/${id}/plan.md`, format: 'structured',
+});
+db.getActivePlanningIntentForLaunch = (_workspaceId: string, planId: string, intentId: string) => (
+  planId && intentId === 'int_1234abcd' ? { planId, intentId, status: 'active' } : null
+);
 db.insertOrchestration = (r: OrchestrationRun) => { runsStore.set(r.runId, clone(r)); };
 db.updateOrchestration = (r: OrchestrationRun) => { runsStore.set(r.runId, clone(r)); };
 db.getOrchestrationRun = (id: string) => (runsStore.has(id) ? clone(runsStore.get(id)!) : null);
@@ -112,14 +117,21 @@ function makeDeliver(ok = true) {
 }
 
 function baseReq(extra: Record<string, unknown> = {}) {
-  return {
+  const req: Record<string, unknown> = {
     name: 'groupthink' as const,
     workspaceId: 'ws-1',
     supervisorId: 'sup-1',
     topic: 'Plan a thing',
     mode: 'serial' as const,
+    planId: 'plan-fixture',
+    planningIntentId: 'int_1234abcd',
     ...extra,
   };
+  if (extra.resumeRunId !== undefined) {
+    if (!Object.prototype.hasOwnProperty.call(extra, 'planId')) delete req.planId;
+    if (!Object.prototype.hasOwnProperty.call(extra, 'planningIntentId')) delete req.planningIntentId;
+  }
+  return req as any;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -435,16 +447,17 @@ test('WP-P8B: concurrent dispatches may target the same plan after HTML writebac
   await waitFor(() => getRun(second.runId)?.status === 'complete');
 });
 
-test('WP6: runs without a planId may coexist', () => {
-  const gate = deferred();
-  const runner: OrchestrationRunner = async () => { await gate.promise; };
+test('new launches reject missing or mismatched plan/intent bindings before persistence', () => {
+  const runner: OrchestrationRunner = async () => {};
   const { fn } = makeDeliver();
   const svc = new OrchestrationService(makeClient(), fn, { serial: runner, parallel: runner });
 
-  const a = svc.start_run(baseReq());   // legacy fresh-file run, no plan rail
-  const b = svc.start_run(baseReq());   // another — no lock applies
-  assert.ok(a.runId && b.runId && a.runId !== b.runId, 'two rail-less runs coexist');
-  gate.resolve();
+  const before = runsStore.size;
+  assert.throws(() => svc.start_run(baseReq({ planId: undefined })), /require both/);
+  assert.throws(() => svc.start_run(baseReq({ planningIntentId: undefined })), /require both/);
+  assert.throws(() => svc.start_run(baseReq({ planningIntentId: 'int_deadbeef' })), /not active/);
+  assert.throws(() => svc.start_run(baseReq({ planningIntentId: 'intent_bad' })), /must match/);
+  assert.equal(runsStore.size, before, 'rejected launches write no orchestration row');
 });
 
 // ── GT-C §1.6 / §1.10 — T1 trail materialization ordering ────────────
@@ -464,7 +477,7 @@ test('a rail run skips legacy stampPlanMembers', async () => {
   assert.equal(stampCalled, false, 'the legacy whole-file stamp is skipped on a rail surface');
 });
 
-test('a non-rail run stamps its legacy fresh-file output', async () => {
+test('a resumed historical non-rail run keeps legacy stamp behavior', async () => {
   const gate = deferred();
   const runner: OrchestrationRunner = async () => { await gate.promise; };
   const svc = new OrchestrationService(makeClient(), makeDeliver().fn, { serial: runner, parallel: runner });
@@ -472,7 +485,8 @@ test('a non-rail run stamps its legacy fresh-file output', async () => {
   let stampCalled = false;
   (svc as any).stampPlanMembers = () => { stampCalled = true; };
 
-  const { runId } = svc.start_run(baseReq());
+  db.insertOrchestration(priorRun('legacy-unbound'));
+  const { runId } = svc.start_run(baseReq({ resumeRunId: 'legacy-unbound' }));
   await waitFor(() => getRun(runId)?.status === 'running');
   gate.resolve();
   await waitFor(() => getRun(runId)?.status === 'complete');

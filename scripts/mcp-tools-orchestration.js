@@ -177,8 +177,8 @@ function getOrchestrationToolDefinitions() {
           lead_provider:      { type: 'string', enum: ['claude', 'codex', 'grok', 'agy'], description: 'Lead/Synthesizer writer provider responsible for producing the final deliverable; omit to inherit the workspace default.' },
           reviewer_provider:  { type: 'string', enum: ['claude', 'codex', 'grok', 'agy'], description: 'Reviewer/peer provider responsible for critique and independent review; omit to inherit the workspace default.' },
           turn_timeout_ms:    { type: 'number', description: 'Per-turn stall timeout, default 600000.' },
-          plan_id:            { type: 'string', description: 'Plan rail: an existing registered plan id. The run targets that plan at section_anchor instead of writing a fresh plan file.' },
-          planning_intent_id: { type: 'string', description: 'Marked PLAN-INTENT id served by this planning deliberation. Requires plan_id; the server validates same-plan active status before launch.' },
+          plan_id:            { type: 'string', description: 'Required for a new launch: an existing registered plan id. Legacy unbound runs may only be resumed.' },
+          planning_intent_id: { type: 'string', pattern: '^int_[0-9a-f]{8}$', description: 'Required for a new launch: the active same-plan PLAN-INTENT id served by this deliberation.' },
           section_anchor:     { type: 'string', description: 'Plan rail: the section this run updates (required with plan_id).' },
           resume_run_id:      { type: 'string', description: 'Resume a prior stalled run by its runId.' },
           resume_lead_id:     { type: 'string', description: 'Legacy serial resume: lead agent id.' },
@@ -186,6 +186,10 @@ function getOrchestrationToolDefinitions() {
           legacy_command:     { type: 'string', description: 'A full old `node scripts/groupthink-v2.js …` command to translate + resume.' },
         },
         required: ['name', 'workspace_id', 'supervisor_id'],
+        anyOf: [
+          { required: ['resume_run_id'] },
+          { required: ['plan_id', 'planning_intent_id'] },
+        ],
       },
     },
     {

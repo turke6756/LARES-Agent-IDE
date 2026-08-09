@@ -14,6 +14,7 @@ import type {
   PlanIntentRunState,
   PlanIntentsProjection,
 } from '../../shared/types';
+import { isPlanArtifactId, isPlanningIntentId } from '../../shared/planning-artifact-ids';
 
 export type {
   PlanIntentOutputProjection,
@@ -120,7 +121,7 @@ function readRegularFile(abs: string, rel: string, maxBytes: number): string {
 function validateIntent(value: unknown): ParsedIntent | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
-  if (typeof v.intent_id !== 'string' || v.intent_id.trim() === '') return null;
+  if (!isPlanningIntentId(v.intent_id)) return null;
   if (typeof v.kind !== 'string' || !INTENT_KINDS.has(v.kind)) return null;
   if (v.part !== undefined && typeof v.part !== 'string') return null;
   if (v.reason !== undefined && typeof v.reason !== 'string') return null;
@@ -130,8 +131,7 @@ function validateIntent(value: unknown): ParsedIntent | null {
     return typeof item.provider !== 'string' || item.provider === ''
       || typeof item.model !== 'string' || item.model === '';
   }))) return null;
-  if (v.supersedes_intent_id !== undefined
-      && (typeof v.supersedes_intent_id !== 'string' || v.supersedes_intent_id.trim() === '')) return null;
+  if (v.supersedes_intent_id !== undefined && !isPlanningIntentId(v.supersedes_intent_id)) return null;
   return {
     intentId: v.intent_id.trim(),
     partSlug: typeof v.part === 'string' ? v.part : null,
@@ -192,7 +192,7 @@ function parseIntegrations(body: string, planRelPath: string): ParsedIntegration
       const value = JSON.parse(record[1]) as Record<string, unknown>;
       const rel = normalizeOutputRelPath(value.output_rel_path);
       const disposition = value.disposition ?? 'active';
-      if (typeof value.intent_id !== 'string' || value.intent_id === '' || !rel
+      if (!isPlanningIntentId(value.intent_id) || !rel
           || typeof disposition !== 'string' || !DISPOSITIONS.has(disposition)
           || (value.changed !== undefined && typeof value.changed !== 'string')) {
         throw new Error('invalid fields');
@@ -309,7 +309,7 @@ function enumerateOutputs(
         const body = readRegularFile(path.join(subAbs, entry.name), `${folderRelPath}/${rel}`, maxBytes);
         const frontmatter = parseFrontmatter(body);
         if (!frontmatter || frontmatter.plan_artifact_id !== planArtifactId
-            || !frontmatter.intent_id || !OUTPUT_KINDS.has(frontmatter.kind)) {
+            || !isPlanningIntentId(frontmatter.intent_id) || !OUTPUT_KINDS.has(frontmatter.kind)) {
           diagnostics.push({
             kind: 'invalid-output', relPath: `${folderRelPath}/${rel}`,
             detail: 'output frontmatter is missing/invalid or does not match this plan artifact',
@@ -478,8 +478,9 @@ export function scanPlanIntentLedger(opts: ScanPlanIntentLedgerOptions): ScanPla
   try {
     const manifestBody = readRegularFile(path.join(opts.folderAbs, 'plan.json'), planJsonRel, documentCap);
     const manifest = JSON.parse(manifestBody) as Record<string, unknown>;
-    if (typeof manifest.plan_artifact_id !== 'string' || manifest.plan_artifact_id === '') {
-      throw new ScanFailure('scan-read-failed', planJsonRel, 'plan.json has no valid plan_artifact_id');
+    if (!isPlanArtifactId(manifest.plan_artifact_id)) {
+      throw new ScanFailure('scan-read-failed', planJsonRel,
+        'plan.json plan_artifact_id does not match plan_[0-9a-f]{8}');
     }
     artifactId = manifest.plan_artifact_id;
 

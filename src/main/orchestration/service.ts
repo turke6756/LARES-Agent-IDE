@@ -3,7 +3,7 @@ import fs from 'fs';
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import { ORCHESTRATIONS } from './catalog';
-import { runSerial, runParallel, archiveStalePlan } from './groupthink-v2';
+import { runSerial, runParallel } from './groupthink-v2';
 import { parseLegacyGroupthinkCommand } from './groupthink-legacy';
 import {
   DashboardClient, RunOrchestrationRequest, OrchestrationRun,
@@ -17,6 +17,7 @@ import {
   insertOrchestrationEvent, insertOrchestrationMember, markActiveRunsAborted,
 } from '../database';
 import { getOrchestrationProviderSettingsCached } from './orchestration-provider-settings';
+import { isPlanningIntentId } from '../../shared/planning-artifact-ids';
 
 const READY_STATUSES = new Set(['idle', 'waiting']);
 
@@ -130,11 +131,14 @@ export class OrchestrationService extends EventEmitter {
       assertGroupthinkProvider('reviewer_provider', req.reviewerProvider);
       const ws = getWorkspace(req.workspaceId);
       if (!ws) throw httpErr(404, 'Workspace not found');
-      if (req.planningIntentId && !req.planId) {
-        throw httpErr(400, 'planningIntentId requires planId');
+      if (!req.planId || !req.planningIntentId) {
+        throw httpErr(400, 'New orchestration launches require both planId and planningIntentId');
       }
-      if (req.planningIntentId && !getActivePlanningIntentForLaunch(
-        req.workspaceId, req.planId!, req.planningIntentId,
+      if (!isPlanningIntentId(req.planningIntentId)) {
+        throw httpErr(400, 'planningIntentId must match int_[0-9a-f]{8}');
+      }
+      if (!getActivePlanningIntentForLaunch(
+        req.workspaceId, req.planId, req.planningIntentId,
       )) {
         throw httpErr(409, 'Planning intent is not active in the requested plan');
       }
@@ -146,11 +150,9 @@ export class OrchestrationService extends EventEmitter {
       // run.planPath), forcing the Lead to self-correct; a sloppier model would
       // have written a stray file. Resolve the row here so every downstream
       // consumer (writebackClause, prompt mentions, completion event) is honest.
-      let planRel = req.planPath || 'plans/new-plan.md';
-      if (req.planId) {
-        const planRow = getPlan(req.planId);
-        if (planRow?.path) planRel = planRow.path;
-      }
+      const planRow = getPlan(req.planId);
+      if (!planRow?.path) throw httpErr(409, 'Requested plan is not available for orchestration launch');
+      const planRel = planRow.path;
       const prov = getOrchestrationProviderSettingsCached(ws.path).groupthink;
       run = {
         runId: uuidv4().slice(0, 8),
@@ -162,7 +164,7 @@ export class OrchestrationService extends EventEmitter {
         topic: req.topic || 'Research and plan a feature.',
         planPath: path.isAbsolute(planRel) ? planRel : path.join(ws.path, planRel),
         planId: req.planId,
-        planningIntentId: req.planningIntentId ?? null,
+        planningIntentId: req.planningIntentId,
         sectionAnchor: req.sectionAnchor,
         leadProvider: req.leadProvider || prov.defaultLeadProvider,
         reviewerProvider: req.reviewerProvider || prov.defaultReviewerProvider,
@@ -180,9 +182,8 @@ export class OrchestrationService extends EventEmitter {
       // WP6: a plan-rail run edits an EXISTING registered surface,
       // so NEVER archive it away — archiving is only for the legacy fresh-file
       // deliverable path where a leftover plan would trip the existsSync gate.
-      if (!req.resumeRunId && !req.resumeLeadId && !req.resumeReviewerId && !req.planId) {
-        archiveStalePlan(run.planPath, run.runId);
-      }
+      // New launches are always plan+intent-bound; legacy fresh-file runs can
+      // only re-enter through the resume branch above.
     }
     insertOrchestration(run);            // upsert
     void this.execute(run, !!req.keepAgents);

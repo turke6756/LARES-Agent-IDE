@@ -48,6 +48,57 @@ export function closeDatabase(): void {
   db?.close();
 }
 
+export interface ReviewedPlanSourceProposalBackfill {
+  planArtifactId: string;
+  planFolderRelPath: string;
+  proposalArtifactId: string;
+  proposalRelPath: string;
+}
+
+export const REVIEWED_PLAN_SOURCE_PROPOSAL_BACKFILLS: readonly ReviewedPlanSourceProposalBackfill[] = [
+  { planArtifactId: 'plan_e3a91c4f', planFolderRelPath: '.lares/plans/2026-08-03-test-only-keyboard-shortcut-cheat-sheet-overlay-e3a91c4f', proposalArtifactId: 'prop_e3a91c4f', proposalRelPath: '.lares/proposals/2026-08-03-test-only-keyboard-shortcut-cheat-sheet.md' },
+  { planArtifactId: 'plan_e0001372', planFolderRelPath: '.lares/plans/2026-08-05-bridge-the-proposal-to-plan-skill-and-the-planni-e0001372', proposalArtifactId: 'prop_e0001372', proposalRelPath: '.lares/proposals/2026-08-05-planning-surface-skill-bridge.md' },
+  { planArtifactId: 'plan_0e1425af', planFolderRelPath: '.lares/plans/2026-08-05-split-the-proposal-lifecycle-an-authoring-skill--0e1425af', proposalArtifactId: 'prop_0e1425af', proposalRelPath: '.lares/proposals/2026-08-05-proposal-lifecycle-split-authoring-vs-promotion.md' },
+  { planArtifactId: 'plan_5b3ea7d1', planFolderRelPath: '.lares/plans/2026-08-06-save-card-streamlining-one-gesture-no-ceremony-5b3ea7d1', proposalArtifactId: 'prop_5b3ea7d1', proposalRelPath: '.lares/proposals/2026-08-06-save-card-streamlining-restamped.md' },
+  { planArtifactId: 'plan_65e665d7', planFolderRelPath: '.lares/plans/2026-08-07-planning-surface-audit-rubric-and-method-for-an--65e665d7', proposalArtifactId: 'prop_65e665d7', proposalRelPath: '.lares/proposals/2026-08-07-planning-surface-audit-rubric.md' },
+  { planArtifactId: 'plan_ce97b9ad', planFolderRelPath: '.lares/plans/2026-08-08-planning-surface-mechanics-remediation-close-the-ce97b9ad', proposalArtifactId: 'prop_ce97b9ad', proposalRelPath: '.lares/proposals/2026-08-08-planning-surface-mechanics-remediation.md' },
+  { planArtifactId: 'plan_ac37e3ae', planFolderRelPath: '.lares/plans/2026-08-08-save-card-checkpoints-architecture-orientation-h-ac37e3ae', proposalArtifactId: 'prop_ac37e3ae', proposalRelPath: '.lares/proposals/2026-08-08-save-card-checkpoint-architecture-orientation-and-directions.md' },
+];
+
+function backfillReviewedPlanSourceProposals(database: Database.Database): void {
+  database.exec(`CREATE TABLE IF NOT EXISTS applied_migrations (
+    name TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+  )`);
+  const alreadyApplied = database.prepare(`SELECT 1 FROM applied_migrations WHERE name = ?`);
+  const findPair = database.prepare(`
+    SELECT p.id AS plan_id, p.source_proposal_id, pr.id AS proposal_id
+      FROM plans p
+      JOIN proposals pr ON pr.workspace_id = p.workspace_id
+     WHERE p.artifact_id = ? AND p.folder_rel_path = ?
+       AND pr.artifact_id = ? AND pr.path = ?
+       AND NOT EXISTS (
+         SELECT 1 FROM plans owner
+          WHERE owner.source_proposal_id = pr.id AND owner.id <> p.id
+       )
+  `);
+  const apply = database.transaction((mapping: ReviewedPlanSourceProposalBackfill) => {
+    const marker = `wp-id1-source-proposal:${mapping.planArtifactId}:${mapping.proposalArtifactId}`;
+    if (alreadyApplied.get(marker)) return;
+    const pair = findPair.get(
+      mapping.planArtifactId, mapping.planFolderRelPath,
+      mapping.proposalArtifactId, mapping.proposalRelPath,
+    ) as { plan_id: string; source_proposal_id: string | null; proposal_id: string } | undefined;
+    if (!pair) return;
+    if (pair.source_proposal_id !== null && pair.source_proposal_id !== pair.proposal_id) return;
+    database.prepare(`UPDATE plans SET source_proposal_id = ? WHERE id = ? AND source_proposal_id IS NULL`)
+      .run(pair.proposal_id, pair.plan_id);
+    database.prepare(`INSERT INTO applied_migrations (name, applied_at) VALUES (?, ?)`)
+      .run(marker, new Date().toISOString());
+  });
+  for (const mapping of REVIEWED_PLAN_SOURCE_PROPOSAL_BACKFILLS) apply(mapping);
+}
+
 export function initDatabase(): void {
   dbPath = getDbPath();
   db = new Database(dbPath);
@@ -1867,6 +1918,12 @@ function initContextOptimizerSchema(): void {
     ON plans(source_proposal_id) WHERE source_proposal_id IS NOT NULL`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_folder_rel_path
     ON plans(workspace_id, folder_rel_path) WHERE folder_rel_path IS NOT NULL`);
+
+  // WP-ID1: reviewed, exact-identity-only source proposal backfill. Each mapping
+  // has its own guard so a fresh DB is not marked complete before its watcher has
+  // ingested the corresponding rows. No title/path/time heuristic participates:
+  // the exact portable IDs and reviewed disk-relative locations must all match.
+  backfillReviewedPlanSourceProposals(db);
 
   // Planning-surface WP-P2L-schema — planning-intent LEDGER (STAGE P2L). DDL-
   // serialized in the NEXT serial slot after WP-P2A (above), inside this optimizer-

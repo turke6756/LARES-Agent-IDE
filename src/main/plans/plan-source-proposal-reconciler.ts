@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Workspace } from '../../shared/types';
 import { derivePlanIdentityFromMarkdown } from '../../shared/plan-identity';
+import { isPlanArtifactId, isProposalArtifactId } from '../../shared/planning-artifact-ids';
 import {
   applyPlanSourceProposalProjection,
   getProposalByWorkspaceArtifactId,
@@ -76,6 +77,10 @@ export function reconcilePlanSourceProposal(
   input: ReconcilePlanSourceProposalInput,
 ): SourceProposalProjectionResult {
   const manifestAbs = path.join(input.folderAbs, 'plan.json');
+  if (!isPlanArtifactId(input.expectedPlanArtifactId)) {
+    return fail(input, null, 'invalid', 'plan-artifact-id-non-contract',
+      'adopted plan identity does not match plan_[0-9a-f]{8}');
+  }
   let manifestStat: fs.Stats;
   let manifest: Record<string, unknown>;
   try {
@@ -108,6 +113,10 @@ export function reconcilePlanSourceProposal(
       || typeof sourceRelPath !== 'string' || sourceRelPath.trim() === '') {
     return fail(input, observedManifestMtime, 'invalid', 'source-proposal-invalid',
       'source_proposal must contain non-empty artifact_id and rel_path');
+  }
+  if (!isProposalArtifactId(sourceArtifactId)) {
+    return fail(input, observedManifestMtime, 'invalid', 'source-artifact-id-non-contract',
+      'source proposal identity does not match prop_[0-9a-f]{8}', sourceArtifactId, sourceRelPath);
   }
 
   // Proposal registration is intentionally flat. Accept exactly the active

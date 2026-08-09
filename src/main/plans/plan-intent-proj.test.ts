@@ -81,7 +81,7 @@ class FakeBetterSqlite {
   const ipc = require('./plan-ipc') as typeof import('./plan-ipc');
 
   const workspace = db.createWorkspace({ title: 'P2L projection', path: workspaceRoot, pathType: 'windows' });
-  const artifactId = 'plan_projection_fixture';
+  const artifactId = 'plan_abcdef12';
   const folderRelPath = '.lares/plans/projection-fixture';
   const folderAbs = path.join(workspaceRoot, '.lares', 'plans', 'projection-fixture');
   fs.mkdirSync(path.join(folderAbs, 'deliberations'), { recursive: true });
@@ -108,7 +108,7 @@ class FakeBetterSqlite {
 
   // First generation establishes two historical statuses that disappear/change later.
   fs.writeFileSync(path.join(folderAbs, 'plan.md'), [
-    marker('intent_pending'), marker('intent_folded'), marker('intent_old'), marker('intent_withdrawn'),
+    marker('int_11111111'), marker('int_22222222'), marker('int_33333333'), marker('int_44444444'),
   ].join('\n'));
   const adopted = db.adoptStructuredPlan({
     workspaceId: workspace.id, artifactId, folderRelPath,
@@ -119,13 +119,13 @@ class FakeBetterSqlite {
   });
   assert.equal(scan().committed, true);
 
-  fs.writeFileSync(path.join(folderAbs, 'deliberations', 'pending.md'), output('intent_pending', 'run-pending'));
-  fs.writeFileSync(path.join(folderAbs, 'deliberations', 'rerun.md'), output('intent_pending', 'run-pending'));
-  fs.writeFileSync(path.join(folderAbs, 'deliberations', 'folded.md'), output('intent_folded', 'run-folded'));
+  fs.writeFileSync(path.join(folderAbs, 'deliberations', 'pending.md'), output('int_11111111', 'run-pending'));
+  fs.writeFileSync(path.join(folderAbs, 'deliberations', 'rerun.md'), output('int_11111111', 'run-pending'));
+  fs.writeFileSync(path.join(folderAbs, 'deliberations', 'folded.md'), output('int_22222222', 'run-folded'));
   fs.writeFileSync(path.join(folderAbs, 'plan.md'), [
-    marker('intent_pending'), marker('intent_folded'), marker('intent_replacement', 'intent_old'),
-    integration('intent_pending', 'deliberations/rerun.md', 'rerun adopted in analysis'),
-    integration('intent_folded', 'deliberations/folded.md', 'folded into final plan'),
+    marker('int_11111111'), marker('int_22222222'), marker('int_55555555', 'int_33333333'),
+    integration('int_11111111', 'deliberations/rerun.md', 'rerun adopted in analysis'),
+    integration('int_22222222', 'deliberations/folded.md', 'folded into final plan'),
     '[rerun](deliberations/rerun.md)', '[folded](deliberations/folded.md)',
   ].join('\n'));
   assert.equal(scan().committed, true);
@@ -138,12 +138,12 @@ class FakeBetterSqlite {
     leadProvider: 'claude', reviewerProvider: 'codex', turnTimeoutMs: 1,
     lastRelayedTs: {}, startedAt: '2026-08-03T00:00:00.000Z', updatedAt: '2026-08-03T00:00:01.000Z',
   });
-  db.insertOrchestration(run('run-pending', 'intent_pending'));
-  db.insertOrchestration(run('run-folded', 'intent_folded'));
+  db.insertOrchestration(run('run-pending', 'int_11111111'));
+  db.insertOrchestration(run('run-folded', 'int_22222222'));
 
   test('projects independent output history, rung, integration note, and open state', () => {
     const result = ledger.getPlanIntentsProjection(adopted.planId)!;
-    const pending = result.intents.find((intent) => intent.intentId === 'intent_pending')!;
+    const pending = result.intents.find((intent) => intent.intentId === 'int_11111111')!;
     assert.equal(pending.rung, 'returned');
     assert.equal(pending.open, true, 'one unfolded active output keeps the intent open');
     assert.equal(pending.fullyFoldedIn, false);
@@ -153,7 +153,7 @@ class FakeBetterSqlite {
       { path: 'deliberations/rerun.md', folded: true },
     ], 'a folded rerun does not collapse or hide the pending output');
 
-    const folded = result.intents.find((intent) => intent.intentId === 'intent_folded')!;
+    const folded = result.intents.find((intent) => intent.intentId === 'int_22222222')!;
     assert.equal(folded.rung, 'folded-in');
     assert.equal(folded.fullyFoldedIn, true);
     assert.equal(folded.open, false);
@@ -161,8 +161,8 @@ class FakeBetterSqlite {
 
   test('surfaces withdrawn/superseded history and derives confidence', () => {
     const result = ledger.getPlanIntentsProjection(adopted.planId)!;
-    const withdrawn = result.intents.find((intent) => intent.intentId === 'intent_withdrawn')!;
-    const superseded = result.intents.find((intent) => intent.intentId === 'intent_old')!;
+    const withdrawn = result.intents.find((intent) => intent.intentId === 'int_44444444')!;
+    const superseded = result.intents.find((intent) => intent.intentId === 'int_33333333')!;
     assert.deepEqual({ status: withdrawn.status, flag: withdrawn.withdrawn }, { status: 'withdrawn', flag: true });
     assert.deepEqual({ status: superseded.status, flag: superseded.superseded }, { status: 'superseded', flag: true });
     assert.deepEqual(result.confidence, {

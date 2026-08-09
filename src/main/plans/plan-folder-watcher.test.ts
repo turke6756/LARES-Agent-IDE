@@ -20,6 +20,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -156,6 +157,9 @@ function freshWorkspace(): void {
 function plansHomeAbs(): string { return path.join(wsRoot, '.lares', 'plans'); }
 function folderAbsOf(sku: string): string { return path.join(plansHomeAbs(), sku); }
 function relOf(sku: string): string { return `.lares/plans/${sku}`; }
+function artifactForSku(sku: string): string {
+  return `plan_${crypto.createHash('sha256').update(sku).digest('hex').slice(0, 8)}`;
+}
 
 /** Write a §R0-shaped plan folder. `artifactId` defaults to `plan_<sku>`; pass
  *  `planJson:'malformed'` for an unterminated blob, or omit `planMd`. */
@@ -169,7 +173,7 @@ function writeFolder(sku: string, opts: {
   else if (typeof opts.planJson === 'string') body = opts.planJson;
   else body = JSON.stringify({
     schema_version: 1,
-    plan_artifact_id: opts.artifactId ?? `plan_${sku}`,
+    plan_artifact_id: opts.artifactId ?? artifactForSku(sku),
     plan_sku: sku,
     ...(opts.planJson ?? {}),
   });
@@ -217,6 +221,9 @@ test('validatePlanFolder classifies valid / absent / malformed / no-artifact-id'
 
   writeFolder('v-noid', { planJson: { plan_artifact_id: '' } as any });
   assert.equal(wm.validatePlanFolder(folderAbsOf('v-noid')).reason, 'no-artifact-id');
+
+  writeFolder('v-noncontract', { artifactId: 'plan_pigt5a83' });
+  assert.equal(wm.validatePlanFolder(folderAbsOf('v-noncontract')).reason, 'non-contract-artifact-id');
 });
 
 test('computeFolderSignature rises when a nested output file is added/edited', () => {
@@ -240,7 +247,7 @@ test('a valid folder is adopted as a structured/hardening row keyed by plan_arti
   const settled: any[] = [];
   const res = await newWatcher({ settled }).reconcileWorkspace(ws, false);
 
-  const row = dbm.getPlanByWorkspaceArtifactId(ws.id, 'plan_2026-08-03-adopt-aaaa')!;
+  const row = dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku('2026-08-03-adopt-aaaa'))!;
   assert.ok(row, 'row adopted');
   assert.equal(row.format, 'structured');
   assert.equal(row.runState, 'hardening');
@@ -256,13 +263,13 @@ test('adopt is idempotent by plan_artifact_id — no duplicate row, no re-settle
   writeFolder('idem-bbbb', { mtimeMs: 2_000_000 });
   const w = newWatcher();
   await w.reconcileWorkspace(ws, false);
-  const first = dbm.getPlanByWorkspaceArtifactId(ws.id, 'plan_idem-bbbb')!;
+  const first = dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku('idem-bbbb'))!;
   const before = planRowCount();
 
   const settled: any[] = [];
   const w2 = newWatcher({ settled });
   const res2 = await w2.reconcileWorkspace(ws, false);
-  const second = dbm.getPlanByWorkspaceArtifactId(ws.id, 'plan_idem-bbbb')!;
+  const second = dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku('idem-bbbb'))!;
   assert.equal(second.id, first.id, 'same plan id (idempotent)');
   assert.equal(planRowCount(), before, 'no duplicate row');
   assert.equal(settled.length, 0, 'no settle on an unchanged re-scan');
@@ -274,7 +281,7 @@ test('a nested output edit fires a settled(changed) callback (depth:0 root watch
   const settled: any[] = [];
   const w = newWatcher({ settled });
   await w.reconcileWorkspace(ws, false); // adopt (settled: 'adopted') + seed prior signature
-  const row = dbm.getPlanByWorkspaceArtifactId(ws.id, 'plan_nested-cccc')!;
+  const row = dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku('nested-cccc'))!;
   settled.length = 0;
 
   // Edit a NESTED output with a later mtime; plan.md itself is untouched.
@@ -294,16 +301,16 @@ test('late-validity: a dir without plan.json is skipped, then adopted once plan.
   fs.writeFileSync(path.join(folderAbsOf(sku), 'plan.md'), '# not yet\n');
   const w = newWatcher();
   const r1 = await w.reconcileWorkspace(ws, false);
-  assert.equal(dbm.getPlanByWorkspaceArtifactId(ws.id, `plan_${sku}`), null, 'not adopted without plan.json');
+  assert.equal(dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku(sku)), null, 'not adopted without plan.json');
   assert.ok(!r1.watchable.includes(relOf(sku)));
 
   // plan.json arrives (rename-event OR periodic reconciliation covers this).
   fs.writeFileSync(
     path.join(folderAbsOf(sku), 'plan.json'),
-    JSON.stringify({ schema_version: 1, plan_artifact_id: `plan_${sku}`, plan_sku: sku }),
+    JSON.stringify({ schema_version: 1, plan_artifact_id: artifactForSku(sku), plan_sku: sku }),
   );
   const r2 = await w.reconcileWorkspace(ws, false);
-  assert.ok(dbm.getPlanByWorkspaceArtifactId(ws.id, `plan_${sku}`), 'adopted after plan.json appears');
+  assert.ok(dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku(sku)), 'adopted after plan.json appears');
   assert.ok(r2.watchable.includes(relOf(sku)));
 });
 
@@ -314,15 +321,15 @@ test('over-cap: a folder past the child-sub cap still adopts + updates, surfacin
   assert.equal(res.watchable.length, 1, 'one folder within the cap');
   assert.equal(res.overCap.length, 1, 'one folder over the cap');
   // BOTH are adopted (over-cap never means unregistered).
-  assert.ok(dbm.getPlanByWorkspaceArtifactId(ws.id, 'plan_cap-a-eeee'));
-  assert.ok(dbm.getPlanByWorkspaceArtifactId(ws.id, 'plan_cap-b-ffff'));
+  assert.ok(dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku('cap-a-eeee')));
+  assert.ok(dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku('cap-b-ffff')));
   const degraded = res.diagnostics.find((d) => d.kind === 'degraded-watch');
   assert.ok(degraded && res.overCap.includes(degraded.relPath), 'degraded-watch surfaced for the over-cap folder');
 });
 
 test('duplicate plan_artifact_id across two folders leaves the loser unregistered with a both-paths diagnostic', async () => {
-  const relA = writeFolder('dup-a-gggg', { artifactId: 'plan_shared_dup' });
-  const relB = writeFolder('dup-b-hhhh', { artifactId: 'plan_shared_dup' });
+  const relA = writeFolder('dup-a-gggg', { artifactId: 'plan_d00fd00f' });
+  const relB = writeFolder('dup-b-hhhh', { artifactId: 'plan_d00fd00f' });
   const before = planRowCount();
   const res = await newWatcher().reconcileWorkspace(ws, false);
   // a sorts before b → a canonical, b duplicate.
@@ -338,7 +345,7 @@ test('malformed plan.json is quarantined — not adopted, never rewritten', asyn
   const abs = path.join(folderAbsOf(sku), 'plan.json');
   const before = fs.readFileSync(abs, 'utf8');
   const res = await newWatcher().reconcileWorkspace(ws, false);
-  assert.equal(dbm.getPlanByWorkspaceArtifactId(ws.id, `plan_${sku}`), null, 'not adopted');
+  assert.equal(dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku(sku)), null, 'not adopted');
   assert.equal(fs.readFileSync(abs, 'utf8'), before, 'plan.json untouched');
   assert.ok(res.diagnostics.some((d) => d.kind === 'malformed-plan-json' && d.relPath === relOf(sku)));
 });
@@ -348,19 +355,19 @@ test('a removed folder is reported + soft-deleted, and revives (same id) when it
   writeFolder(sku, { mtimeMs: 6_000_000 });
   const w = newWatcher();
   await w.reconcileWorkspace(ws, false);
-  const row = dbm.getPlanByWorkspaceArtifactId(ws.id, `plan_${sku}`)!;
+  const row = dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku(sku))!;
   assert.equal(row.deletedAt, null);
 
   fs.rmSync(folderAbsOf(sku), { recursive: true, force: true });
   const res = await w.reconcileWorkspace(ws, false);
   assert.ok(res.removed.includes(relOf(sku)), 'removal reported');
-  assert.ok(dbm.getPlanByWorkspaceArtifactId(ws.id, `plan_${sku}`)!.deletedAt != null, 'row soft-deleted');
+  assert.ok(dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku(sku))!.deletedAt != null, 'row soft-deleted');
   assert.ok(!res.settled.some((s) => s.folderRelPath === relOf(sku)), 'never settle on removal');
 
   // Reappears → same id revived (deleted_at cleared), no new row.
   writeFolder(sku, { mtimeMs: 7_000_000 });
   await w.reconcileWorkspace(ws, false);
-  const revived = dbm.getPlanByWorkspaceArtifactId(ws.id, `plan_${sku}`)!;
+  const revived = dbm.getPlanByWorkspaceArtifactId(ws.id, artifactForSku(sku))!;
   assert.equal(revived.id, row.id, 'same plan id revived');
   assert.equal(revived.deletedAt, null, 'deleted_at cleared on revive');
 });

@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 interface TestCase { name: string; run(): Promise<void> | void; }
 const tests: TestCase[] = [];
@@ -147,18 +148,18 @@ function byIntent(result: ScanResult, id: string): Projection {
   assert.ok(found, `expected projection for ${id}`);
   return found;
 }
-function freshFixture(planBody = sentinel(intentJson('int_a'))): void {
+function freshFixture(planBody = sentinel(intentJson('int_aaaaaaaa'))): void {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'pil-ws-'));
   const sku = `fixture-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   folderRelPath = `.lares/plans/${sku}`;
   folderAbs = path.join(root, '.lares', 'plans', sku);
-  artifactId = `plan_${Math.random().toString(16).slice(2)}`;
+  artifactId = `plan_${crypto.randomBytes(4).toString('hex')}`;
   fs.mkdirSync(folderAbs, { recursive: true });
   fs.writeFileSync(path.join(folderAbs, 'plan.json'), JSON.stringify({
     schema_version: 1,
     plan_artifact_id: artifactId,
     plan_sku: sku,
-    source_proposal: { artifact_id: 'prop_fixture', rel_path: '.lares/proposals/source.md' },
+    source_proposal: { artifact_id: 'prop_f17e0abc', rel_path: '.lares/proposals/source.md' },
   }));
   writePlan(planBody);
   workspaceId = dbm.createWorkspace({ title: sku, path: root, pathType: 'windows' }).id;
@@ -174,48 +175,48 @@ test('valid sentinels upsert by (plan_id, intent_id)', () => {
   const second = scan();
   assert.equal(first.intents.length, 1);
   assert.equal(second.intents.length, 1, 'rescan does not duplicate the intent');
-  assert.equal(byIntent(second, 'int_a').status, 'active');
+  assert.equal(byIntent(second, 'int_aaaaaaaa').status, 'active');
 });
 
 test('pre-hardening scan falls back to the contained linked source proposal', () => {
   freshFixture();
   const sourceAbs = path.join(root, '.lares', 'proposals', 'source.md');
   fs.mkdirSync(path.dirname(sourceAbs), { recursive: true });
-  fs.writeFileSync(sourceAbs, sentinel(intentJson('int_source')));
+  fs.writeFileSync(sourceAbs, sentinel(intentJson('int_50a2ce00')));
   fs.unlinkSync(path.join(folderAbs, 'plan.md'));
   const result = scan();
   assert.equal(result.committed, true);
-  assert.equal(byIntent(result, 'int_source').status, 'active');
+  assert.equal(byIntent(result, 'int_50a2ce00').status, 'active');
 });
 
 test('delete / move / restore preserves output history and current presence', () => {
   freshFixture();
-  writeOutput('research/run-1.md', 'int_a');
+  writeOutput('research/run-1.md', 'int_aaaaaaaa');
   let result = scan();
-  assert.equal(byIntent(result, 'int_a').outputs[0].presentOnDisk, true);
+  assert.equal(byIntent(result, 'int_aaaaaaaa').outputs[0].presentOnDisk, true);
 
   fs.unlinkSync(path.join(folderAbs, 'research', 'run-1.md'));
   result = scan();
-  assert.equal(byIntent(result, 'int_a').outputs[0].presentOnDisk, false, 'delete marks absent');
+  assert.equal(byIntent(result, 'int_aaaaaaaa').outputs[0].presentOnDisk, false, 'delete marks absent');
 
-  writeOutput('research/run-moved.md', 'int_a', 'orc_2');
+  writeOutput('research/run-moved.md', 'int_aaaaaaaa', 'orc_2');
   result = scan();
-  assert.equal(byIntent(result, 'int_a').outputs.length, 2, 'move adds an observation row');
-  assert.equal(byIntent(result, 'int_a').outputs.find((o) => o.relPath === 'research/run-moved.md')!.presentOnDisk, true);
+  assert.equal(byIntent(result, 'int_aaaaaaaa').outputs.length, 2, 'move adds an observation row');
+  assert.equal(byIntent(result, 'int_aaaaaaaa').outputs.find((o) => o.relPath === 'research/run-moved.md')!.presentOnDisk, true);
 
-  writeOutput('research/run-1.md', 'int_a');
+  writeOutput('research/run-1.md', 'int_aaaaaaaa');
   fs.unlinkSync(path.join(folderAbs, 'research', 'run-moved.md'));
   result = scan();
-  assert.equal(byIntent(result, 'int_a').outputs.length, 2);
-  assert.equal(byIntent(result, 'int_a').outputs.find((o) => o.relPath === 'research/run-1.md')!.presentOnDisk, true, 'restore revives row');
+  assert.equal(byIntent(result, 'int_aaaaaaaa').outputs.length, 2);
+  assert.equal(byIntent(result, 'int_aaaaaaaa').outputs.find((o) => o.relPath === 'research/run-1.md')!.presentOnDisk, true, 'restore revives row');
 });
 
 test('multiple runs of one open intent remain independent observations', () => {
   freshFixture();
-  writeOutput('research/run-1.md', 'int_a', 'orc_1');
-  writeOutput('research/run-2.md', 'int_a', 'orc_2');
-  writePlan(`${sentinel(intentJson('int_a'))}\n[fold first](research/run-1.md)\n${integration('int_a', 'research/run-1.md')}`);
-  const intent = byIntent(scan(), 'int_a');
+  writeOutput('research/run-1.md', 'int_aaaaaaaa', 'orc_1');
+  writeOutput('research/run-2.md', 'int_aaaaaaaa', 'orc_2');
+  writePlan(`${sentinel(intentJson('int_aaaaaaaa'))}\n[fold first](research/run-1.md)\n${integration('int_aaaaaaaa', 'research/run-1.md')}`);
+  const intent = byIntent(scan(), 'int_aaaaaaaa');
   assert.equal(intent.outputs.length, 2);
   assert.equal(intent.outputs.find((o) => o.relPath === 'research/run-1.md')!.foldedIn, true);
   assert.equal(intent.outputs.find((o) => o.relPath === 'research/run-2.md')!.foldedIn, false);
@@ -225,10 +226,10 @@ test('multiple runs of one open intent remain independent observations', () => {
 
 test('withdrawn outputs are excluded from the fully-folded requirement', () => {
   freshFixture();
-  writeOutput('research/active.md', 'int_a');
-  writeOutput('research/withdrawn.md', 'int_a', 'orc_2');
-  writePlan(`${sentinel(intentJson('int_a'))}\n[active](research/active.md)\n${integration('int_a', 'research/active.md')}\n${integration('int_a', 'research/withdrawn.md', 'withdrawn')}`);
-  const intent = byIntent(scan(), 'int_a');
+  writeOutput('research/active.md', 'int_aaaaaaaa');
+  writeOutput('research/withdrawn.md', 'int_aaaaaaaa', 'orc_2');
+  writePlan(`${sentinel(intentJson('int_aaaaaaaa'))}\n[active](research/active.md)\n${integration('int_aaaaaaaa', 'research/active.md')}\n${integration('int_aaaaaaaa', 'research/withdrawn.md', 'withdrawn')}`);
+  const intent = byIntent(scan(), 'int_aaaaaaaa');
   assert.equal(intent.outputs.find((o) => o.relPath === 'research/withdrawn.md')!.foldedIn, false);
   assert.equal(intent.fullyFoldedIn, true);
   assert.equal(intent.open, false);
@@ -237,50 +238,50 @@ test('withdrawn outputs are excluded from the fully-folded requirement', () => {
 test('a new intent supersedes the referenced old intent', () => {
   freshFixture();
   scan();
-  writePlan(`${sentinel(intentJson('int_a'))}\n${sentinel(intentJson('int_b', { supersedes_intent_id: 'int_a' }))}`);
+  writePlan(`${sentinel(intentJson('int_aaaaaaaa'))}\n${sentinel(intentJson('int_bbbbbbbb', { supersedes_intent_id: 'int_aaaaaaaa' }))}`);
   const result = scan();
-  assert.equal(byIntent(result, 'int_a').status, 'superseded');
-  assert.equal(byIntent(result, 'int_b').status, 'active');
+  assert.equal(byIntent(result, 'int_aaaaaaaa').status, 'superseded');
+  assert.equal(byIntent(result, 'int_bbbbbbbb').status, 'active');
 });
 
 test('fully-valid removal of markup withdraws a known active intent', () => {
   freshFixture();
   scan();
   writePlan('# no marked intents\n');
-  assert.equal(byIntent(scan(), 'int_a').status, 'withdrawn');
+  assert.equal(byIntent(scan(), 'int_aaaaaaaa').status, 'withdrawn');
 });
 
 test('removing an exact reference recomputes folded_in and reopens the intent', () => {
   freshFixture();
-  writeOutput('research/result.md', 'int_a');
-  writePlan(`${sentinel(intentJson('int_a'))}\n[result](research/result.md)\n${integration('int_a', 'research/result.md')}`);
-  let intent = byIntent(scan(), 'int_a');
+  writeOutput('research/result.md', 'int_aaaaaaaa');
+  writePlan(`${sentinel(intentJson('int_aaaaaaaa'))}\n[result](research/result.md)\n${integration('int_aaaaaaaa', 'research/result.md')}`);
+  let intent = byIntent(scan(), 'int_aaaaaaaa');
   assert.equal(intent.fullyFoldedIn, true);
   assert.equal(intent.open, false);
 
-  writePlan(`${sentinel(intentJson('int_a'))}\n${integration('int_a', 'research/result.md')}`);
-  intent = byIntent(scan(), 'int_a');
+  writePlan(`${sentinel(intentJson('int_aaaaaaaa'))}\n${integration('int_aaaaaaaa', 'research/result.md')}`);
+  intent = byIntent(scan(), 'int_aaaaaaaa');
   assert.equal(intent.outputs[0].foldedIn, false);
   assert.equal(intent.open, true);
 });
 
 test('one malformed PLAN-INTENT keeps the prior last-good intent set', () => {
-  freshFixture(`${sentinel(intentJson('int_a'))}\n${sentinel(intentJson('int_b'))}`);
+  freshFixture(`${sentinel(intentJson('int_aaaaaaaa'))}\n${sentinel(intentJson('int_bbbbbbbb'))}`);
   scan();
-  writePlan(`${sentinel(intentJson('int_a'))}\n<!--PLAN-INTENT\n{ "intent_id": "int_b", BROKEN }\n-->`);
+  writePlan(`${sentinel(intentJson('int_aaaaaaaa'))}\n<!--PLAN-INTENT\n{ "intent_id": "int_bbbbbbbb", BROKEN }\n-->`);
   const result = scan();
   assert.equal(result.committed, true, 'valid parsed records may still upsert');
   assert.equal(result.complete, false);
-  assert.equal(byIntent(result, 'int_b').status, 'active', 'malformed omission is not withdrawal');
+  assert.equal(byIntent(result, 'int_bbbbbbbb').status, 'active', 'malformed omission is not withdrawal');
   assert.ok(result.diagnostics.some((d) => d.kind === 'malformed-intent'));
 });
 
 test('over-cap output enumeration leaves the entire prior projection intact', () => {
   freshFixture();
-  writeOutput('research/one.md', 'int_a');
+  writeOutput('research/one.md', 'int_aaaaaaaa');
   const before = scan();
   writePlan('# would withdraw if partially applied\n');
-  writeOutput('research/two.md', 'int_a');
+  writeOutput('research/two.md', 'int_aaaaaaaa');
   const failed = scan({ maxOutputFiles: 1 });
   assert.equal(failed.committed, false);
   assert.ok(failed.diagnostics.some((d) => d.kind === 'scan-cap-exceeded'));
@@ -292,18 +293,18 @@ test('a withdrawn sentinel cannot be reused and emits a diagnostic', () => {
   scan();
   writePlan('# removed\n');
   scan();
-  writePlan(sentinel(intentJson('int_a')));
+  writePlan(sentinel(intentJson('int_aaaaaaaa')));
   const result = scan();
-  assert.equal(byIntent(result, 'int_a').status, 'withdrawn');
+  assert.equal(byIntent(result, 'int_aaaaaaaa').status, 'withdrawn');
   assert.ok(result.diagnostics.some((d) => d.kind === 'reused-withdrawn-sentinel'));
 });
 
 test('startup reconciliation uses the same last-good cap rule', async () => {
   freshFixture();
-  writeOutput('research/one.md', 'int_a');
+  writeOutput('research/one.md', 'int_aaaaaaaa');
   const before = scan();
   writePlan('# boot scan must not withdraw\n');
-  writeOutput('research/two.md', 'int_a');
+  writeOutput('research/two.md', 'int_aaaaaaaa');
 
   // The watcher uses the production cap; make plan.md itself over that cap so
   // its boot-settled scan fails before the transaction. Boot dispatch is
@@ -317,12 +318,12 @@ test('startup reconciliation uses the same last-good cap rule', async () => {
 
 test('prose/code/comment substrings are rejected; only an exact Markdown link folds', () => {
   freshFixture();
-  writeOutput('research/result.md', 'int_a');
-  writePlan(`${sentinel(intentJson('int_a'))}\nresearch/result.md\n\`research/result.md\`\n<!-- [fake](research/result.md) -->\n\`\`\`md\n[fake](research/result.md)\n\`\`\`\n`);
-  let intent = byIntent(scan(), 'int_a');
+  writeOutput('research/result.md', 'int_aaaaaaaa');
+  writePlan(`${sentinel(intentJson('int_aaaaaaaa'))}\nresearch/result.md\n\`research/result.md\`\n<!-- [fake](research/result.md) -->\n\`\`\`md\n[fake](research/result.md)\n\`\`\`\n`);
+  let intent = byIntent(scan(), 'int_aaaaaaaa');
   assert.equal(intent.outputs[0].foldedIn, false, 'substring-like forms do not fold');
-  writePlan(`${sentinel(intentJson('int_a'))}\n[exact](./research/result.md)`);
-  intent = byIntent(scan(), 'int_a');
+  writePlan(`${sentinel(intentJson('int_aaaaaaaa'))}\n[exact](./research/result.md)`);
+  intent = byIntent(scan(), 'int_aaaaaaaa');
   assert.equal(intent.outputs[0].foldedIn, true, 'normalized exact resolved link folds');
 });
 

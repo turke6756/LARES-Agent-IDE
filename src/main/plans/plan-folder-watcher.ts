@@ -25,6 +25,7 @@
 import fs from 'fs';
 import path from 'path';
 import type { ObservedOverviewSourceToken, Workspace } from '../../shared/types';
+import { isPlanArtifactId } from '../../shared/planning-artifact-ids';
 import { adoptStructuredPlan, softDeletePlan, type StructuredPlanChange } from '../database';
 import { workspaceStateDir, workspaceStateDirName } from '../workspace-state-dir';
 import { observeOverviewSource } from './plan-human-overview';
@@ -51,6 +52,7 @@ export type FolderChangeKind = 'boot' | 'adopted' | 'changed';
 export type PlanFolderDiagnosticKind =
   | 'malformed-plan-json'
   | 'missing-plan-artifact-id'
+  | 'non-contract-plan-artifact-id'
   | 'duplicate-artifact-id'
   | 'degraded-watch';
 
@@ -88,7 +90,7 @@ export interface FolderReconcileResult {
 
 export type PlanFolderValidity =
   | { valid: true; planArtifactId: string; planSku: string | null }
-  | { valid: false; reason: 'absent' | 'malformed' | 'no-artifact-id' };
+  | { valid: false; reason: 'absent' | 'malformed' | 'no-artifact-id' | 'non-contract-artifact-id' };
 
 /** Validate a directory as a §R0 plan folder: `plan.json` must be a regular file
  *  (not a reparse point), parse as JSON, and carry a non-empty string
@@ -113,6 +115,9 @@ export function validatePlanFolder(folderAbs: string): PlanFolderValidity {
   }
   if (!json || typeof json.plan_artifact_id !== 'string' || json.plan_artifact_id === '') {
     return { valid: false, reason: 'no-artifact-id' };
+  }
+  if (!isPlanArtifactId(json.plan_artifact_id)) {
+    return { valid: false, reason: 'non-contract-artifact-id' };
   }
   return {
     valid: true,
@@ -291,6 +296,11 @@ export class PlanFolderWatcher {
             kind: 'missing-plan-artifact-id', workspaceId: ws.id, relPath: `${prefix}/${name}`,
             detail: `plan.json has no valid plan_artifact_id; not adopted: ${prefix}/${name}`,
           });
+        } else if (validity.reason === 'non-contract-artifact-id') {
+          result.diagnostics.push({
+            kind: 'non-contract-plan-artifact-id', workspaceId: ws.id, relPath: `${prefix}/${name}`,
+            detail: `plan.json plan_artifact_id does not match plan_[0-9a-f]{8}; quarantined (not adopted): ${prefix}/${name}`,
+          });
         }
         continue; // absent plan.json (stray dir) is skipped silently
       }
@@ -438,7 +448,12 @@ export class PlanFolderWatcher {
 // (workspace_id, plan_artifact_id)). Idempotent: a second call for an
 // already-adopted folder is a no-op refresh (`change: 'unchanged'`).
 
-export type AdoptFailureReason = 'absent' | 'malformed' | 'no-artifact-id' | 'conflict';
+export type AdoptFailureReason =
+  | 'absent'
+  | 'malformed'
+  | 'no-artifact-id'
+  | 'non-contract-artifact-id'
+  | 'conflict';
 
 export interface AdoptResult {
   /** true when a live `plans` row exists for this folder after the call. */

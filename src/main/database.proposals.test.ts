@@ -242,6 +242,49 @@ test('plans(workspace_id, folder_rel_path) is unique per workspace only when pre
   rawInsertPlan({ id: 'pl-f-5', path: '.lares/plans/f5/plan.md', folder_rel_path: null });
 });
 
+test('WP-ID1 reviewed exact mapping backfills source_proposal_id and leaves unrelated history unbound', () => {
+  const proposalPath = '.lares/proposals/2026-08-03-test-only-keyboard-shortcut-cheat-sheet.md';
+  dbm.insertProposalRecord(makeProposal({
+    id: 'reviewed-proposal-row', artifactId: 'prop_e3a91c4f', path: proposalPath,
+  }));
+  rawInsertPlan({
+    id: 'reviewed-plan-row', artifact_id: 'plan_e3a91c4f',
+    path: '.lares/plans/2026-08-03-test-only-keyboard-shortcut-cheat-sheet-overlay-e3a91c4f/plan.md',
+    folder_rel_path: '.lares/plans/2026-08-03-test-only-keyboard-shortcut-cheat-sheet-overlay-e3a91c4f',
+  });
+  rawInsertPlan({
+    id: 'unreviewed-plan-row', artifact_id: 'plan_deadbeef',
+    path: '.lares/plans/unreviewed/plan.md', folder_rel_path: '.lares/plans/unreviewed',
+  });
+  FakeBetterSqlite.rawRun(
+    `INSERT INTO orchestrations
+      (run_id, name, mode, status, workspace_id, supervisor_id, topic, plan_path,
+       lead_provider, reviewer_provider, turn_timeout_ms, started_at, updated_at, plan_id)
+     VALUES (?, 'groupthink', 'parallel', 'complete', 'ws-1', 'sup-1', 'legacy', ?,
+       'codex', 'claude', 600000, ?, ?, ?)`,
+    ['a1bacc4a', '.lares/plans/unreviewed/plan.md', '2026-08-06T00:00:00Z',
+      '2026-08-06T00:00:00Z', 'unreviewed-plan-row'],
+  );
+
+  dbm.initDatabase();
+
+  const reviewed = FakeBetterSqlite.rawAll(
+    'SELECT source_proposal_id FROM plans WHERE id = ?', ['reviewed-plan-row'],
+  )[0];
+  assert.equal(reviewed.source_proposal_id, 'reviewed-proposal-row');
+  assert.equal(FakeBetterSqlite.rawAll(
+    'SELECT source_proposal_id FROM plans WHERE id = ?', ['unreviewed-plan-row'],
+  )[0].source_proposal_id, null, 'unreviewed plan is untouched');
+  assert.equal(FakeBetterSqlite.rawAll(
+    'SELECT planning_intent_id FROM orchestrations WHERE run_id = ?', ['a1bacc4a'],
+  )[0].planning_intent_id, null, 'historical a1bacc4a remains legacy-unbound');
+
+  dbm.initDatabase();
+  assert.equal(FakeBetterSqlite.rawAll(
+    'SELECT source_proposal_id FROM plans WHERE id = ?', ['reviewed-plan-row'],
+  )[0].source_proposal_id, 'reviewed-proposal-row', 'guarded rerun is idempotent');
+});
+
 test('re-running initDatabase is idempotent (tables + indexes survive a double run)', () => {
   // A second migration pass over the same store must not throw (CREATE ... IF NOT
   // EXISTS + guarded ALTER try/catch) and must leave the data intact.

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Workspace } from '../../shared/types';
+import { isPlanArtifactId } from '../../shared/planning-artifact-ids';
 import {
   adoptStructuredPlan,
   recordPlanSourceProposalProjectionStatus,
@@ -18,7 +19,7 @@ import {
 } from './plan-source-proposal-reconciler';
 
 export type PlanFolderReconcileChangeKind = 'boot' | 'adopted' | 'changed' | 'manual';
-export type AdoptFailureReason = 'absent' | 'malformed' | 'no-artifact-id' | 'conflict';
+export type AdoptFailureReason = 'absent' | 'malformed' | 'no-artifact-id' | 'non-contract-artifact-id' | 'conflict';
 
 export interface AdoptResult {
   adopted: boolean;
@@ -95,6 +96,9 @@ export async function adoptPlanFolderRow(
   }
   if (typeof manifest.plan_artifact_id !== 'string' || manifest.plan_artifact_id === '') {
     return { adopted: false, reason: 'no-artifact-id' };
+  }
+  if (!isPlanArtifactId(manifest.plan_artifact_id)) {
+    return { adopted: false, reason: 'non-contract-artifact-id' };
   }
   let mtimeMs = 0;
   let sizeBytes = 0;

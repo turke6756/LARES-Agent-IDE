@@ -135,7 +135,7 @@ function context() {
   const folderAbs = path.join(workspacePath, '.lares', 'plans', `plan-${seq}`);
   fs.mkdirSync(path.join(folderAbs, 'supplements'), { recursive: true });
   const workspace = dbm.createWorkspace({ title: `ws-${seq}`, path: workspacePath, pathType: 'windows' });
-  const artifactId = `plan_fixture_${seq}`;
+  const artifactId = `plan_${seq.toString(16).padStart(8, '0')}`;
   const plan = dbm.createOrRevivePlan({ workspaceId: workspace.id,
     path: `.lares/plans/plan-${seq}/plan.md`, format: 'structured', runState: 'hardening' });
   return { workspace, plan, folderAbs, folderRelPath: `.lares/plans/plan-${seq}`, artifactId };
@@ -601,7 +601,7 @@ test('watcher boot/change and explicit single-folder refresh share one projectio
   const folderAbs = path.join(workspacePath, ...folderRelPath.split('/'));
   fs.mkdirSync(path.join(folderAbs, 'supplements'), { recursive: true });
   const workspace = dbm.createWorkspace({ title: `watcher-${seq}`, path: workspacePath, pathType: 'windows' });
-  const artifactId = `plan_watcher_${seq}`;
+  const artifactId = `plan_${(0x10000000 + seq).toString(16).slice(-8)}`;
   fs.writeFileSync(path.join(folderAbs, 'plan.json'), JSON.stringify({
     schema_version: 1, plan_artifact_id: artifactId, plan_sku: `watcher-plan-${seq}`,
     responsibility_events: [],
@@ -645,7 +645,7 @@ test('composite watcher signature converges overview creation, lower-mtime repla
   const folderAbs = path.join(workspacePath, ...folderRelPath.split('/'));
   fs.mkdirSync(path.join(folderAbs, 'supplements'), { recursive: true });
   const workspace = dbm.createWorkspace({ title: `overview-watcher-${seq}`, path: workspacePath, pathType: 'windows' });
-  const artifactId = `plan_overview_watcher_${seq}`;
+  const artifactId = `plan_${(0x20000000 + seq).toString(16).slice(-8)}`;
   fs.writeFileSync(path.join(folderAbs, 'plan.json'), JSON.stringify({
     schema_version: 1, plan_artifact_id: artifactId, plan_sku: `overview-watcher-${seq}`,
     responsibility_events: [],

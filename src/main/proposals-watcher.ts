@@ -53,13 +53,17 @@ import {
 } from './database';
 import { workspaceStateDir, workspaceStateDirName } from './workspace-state-dir';
 import { canonicalizeToAbsolute } from './file-activity-normalize';
+import { isProposalArtifactId } from '../shared/planning-artifact-ids';
 
 const PROPOSALS_SUBDIR = 'proposals';
 const DEBOUNCE_MS = 250;
 const WORKSPACE_REFRESH_MS = 30_000;
 const MINTED_ID_PREFIX = 'prop_';
 
-export type ProposalDiagnosticKind = 'duplicate-artifact-id' | 'malformed-frontmatter';
+export type ProposalDiagnosticKind =
+  | 'duplicate-artifact-id'
+  | 'malformed-frontmatter'
+  | 'non-contract-artifact-id';
 
 export interface ProposalDiagnostic {
   kind: ProposalDiagnosticKind;
@@ -328,10 +332,35 @@ export class ProposalsWatcher {
 
     const existing = getProposalByWorkspacePath(ws.id, relPath);
     if (existing) {
+      if (!isProposalArtifactId(existing.artifactId)) {
+        result.diagnostics.push({
+          kind: 'non-contract-artifact-id', workspaceId: ws.id, relPath,
+          detail: `artifact_id ${existing.artifactId ?? '(missing)'} does not match prop_[0-9a-f]{8}; quarantined from further ingestion: ${relPath}`,
+        });
+        log(`non-contract artifact_id quarantined: ${relPath}`);
+        return;
+      }
       // Revive a soft-deleted row's timestamps only when live; otherwise touch fs fields.
       if (existing.deletedAt == null && (existing.mtimeMs !== st.mtimeMs || existing.sizeBytes !== st.size)) {
         const raw = readSmall(absPath);
         const fm = raw != null ? analyzeFrontmatter(raw) : { kind: 'absent' as const };
+        const diskArtifactId = fm.kind === 'present' ? fm.fields.artifact_id : undefined;
+        if (!isProposalArtifactId(diskArtifactId)) {
+          result.diagnostics.push({
+            kind: 'non-contract-artifact-id', workspaceId: ws.id, relPath,
+            detail: `on-disk artifact_id ${diskArtifactId ?? '(missing)'} does not match prop_[0-9a-f]{8}; changed proposal quarantined without updating its registered row: ${relPath}`,
+          });
+          log(`changed proposal has non-contract artifact_id; quarantined: ${relPath}`);
+          return;
+        }
+        if (diskArtifactId !== existing.artifactId) {
+          result.diagnostics.push({
+            kind: 'duplicate-artifact-id', workspaceId: ws.id, relPath,
+            detail: `on-disk artifact_id changed from registered ${existing.artifactId} to ${diskArtifactId}; quarantined without rebinding: ${relPath}`,
+          });
+          log(`proposal artifact_id change quarantined: ${relPath}`);
+          return;
+        }
         const title = (fm.kind === 'present' && fm.fields.title) || existing.title;
         touchProposalRecord(existing.id, {
           title, mtimeMs: st.mtimeMs, sizeBytes: st.size, updatedAt: this.now(),
@@ -374,6 +403,15 @@ export class ProposalsWatcher {
       artifactId = minted;
       // Re-read the on-disk fields off the patched content for title/authored_at.
       fm = analyzeFrontmatter(patched);
+    }
+
+    if (!isProposalArtifactId(artifactId)) {
+      result.diagnostics.push({
+        kind: 'non-contract-artifact-id', workspaceId: ws.id, relPath,
+        detail: `artifact_id ${artifactId} does not match prop_[0-9a-f]{8}; quarantined (not registered, not rewritten): ${relPath}`,
+      });
+      log(`non-contract artifact_id quarantined: ${relPath}`);
+      return;
     }
 
     // ── Duplicate policy: leave unregistered + both-paths diagnostic ──

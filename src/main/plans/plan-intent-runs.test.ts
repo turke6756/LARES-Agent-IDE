@@ -111,13 +111,14 @@ function makeClient(): DashboardClient {
   let fixtureSeq = 0;
   function planFixture(intentId: string) {
     const seq = ++fixtureSeq;
-    const artifactId = `plan_artifact_${seq}`;
+    const artifactHex = seq.toString(16).padStart(8, '0');
+    const artifactId = `plan_${artifactHex}`;
     const folderRelPath = `.lares/plans/p2l-runs-${seq}`;
     const folderAbs = path.join(workspaceRoot, '.lares', 'plans', `p2l-runs-${seq}`);
     fs.mkdirSync(folderAbs, { recursive: true });
     fs.writeFileSync(path.join(folderAbs, 'plan.json'), JSON.stringify({
       schema_version: 1, plan_artifact_id: artifactId, plan_sku: `p2l-runs-${seq}`,
-      source_proposal: { artifact_id: `proposal_${seq}`, rel_path: `.lares/proposals/${seq}.md` },
+      source_proposal: { artifact_id: `prop_${artifactHex}`, rel_path: `.lares/proposals/${seq}.md` },
     }));
     const marker = `<!--PLAN-INTENT\n${JSON.stringify({
       intent_id: intentId, part: 'hardening', kind: 'groupthink-serial',
@@ -143,7 +144,7 @@ function makeClient(): DashboardClient {
   );
 
   test('launch validates same-plan active intent, stamps the row, and projects RUNNING', () => {
-    const fixture = planFixture('intent_running');
+    const fixture = planFixture('int_11111111');
     const started = service.start_run({
       name: 'groupthink', workspaceId: workspace.id, supervisorId: 'supervisor-fixture',
       mode: 'serial', planId: fixture.planId, planningIntentId: fixture.intentId,
@@ -169,11 +170,11 @@ function makeClient(): DashboardClient {
   });
 
   test('inactive and foreign intents are rejected before an orchestration row exists', () => {
-    const inactive = planFixture('intent_inactive');
+    const inactive = planFixture('int_22222222');
     db.getDb().prepare(`UPDATE plan_intents SET status = 'withdrawn' WHERE plan_id = ? AND intent_id = ?`)
       .run(inactive.planId, inactive.intentId);
-    const foreign = planFixture('intent_foreign');
-    const target = planFixture('intent_target');
+    const foreign = planFixture('int_33333333');
+    const target = planFixture('int_44444444');
     const before = db.listOrchestrationRuns().length;
     assert.throws(() => service.start_run({
       name: 'groupthink', workspaceId: workspace.id, supervisorId: 'supervisor-fixture',
@@ -187,30 +188,30 @@ function makeClient(): DashboardClient {
   });
 
   test('follow-ups retain the frozen association and ResolvedPlanStamp stays intent-free', () => {
-    const running = db.listOrchestrationRuns().find((run) => run.planningIntentId === 'intent_running')!;
+    const running = db.listOrchestrationRuns().find((run) => run.planningIntentId === 'int_11111111')!;
     const first = getOrchestrationDispatch(running);
     const second = getOrchestrationDispatch(running);
     assert.equal(first, second, 'follow-up dispatches reuse the run-frozen context');
     assert.ok(!('planningIntentId' in first), 'intent binding is not added to DispatchContext');
     running.updatedAt = new Date().toISOString();
     db.updateOrchestration(running);
-    assert.equal(db.getOrchestrationRun(running.runId)!.planningIntentId, 'intent_running');
+    assert.equal(db.getOrchestrationRun(running.runId)!.planningIntentId, 'int_11111111');
     db.updateOrchestration({ ...running, planningIntentId: null });
-    assert.equal(db.getOrchestrationRun(running.runId)!.planningIntentId, 'intent_running',
+    assert.equal(db.getOrchestrationRun(running.runId)!.planningIntentId, 'int_11111111',
       'generic follow-up persistence cannot clear the frozen association');
-    db.updateOrchestration({ ...running, planningIntentId: 'intent_replacement' });
-    assert.equal(db.getOrchestrationRun(running.runId)!.planningIntentId, 'intent_running',
+    db.updateOrchestration({ ...running, planningIntentId: 'int_66666666' });
+    assert.equal(db.getOrchestrationRun(running.runId)!.planningIntentId, 'int_11111111',
       'generic follow-up persistence cannot replace the frozen association');
   });
 
   test('returned state uses current output presence; legacy unstamped runs degrade disk-only', () => {
-    const running = db.listOrchestrationRuns().find((run) => run.planningIntentId === 'intent_running')!;
+    const running = db.listOrchestrationRuns().find((run) => run.planningIntentId === 'int_11111111')!;
     const runningPlan = db.getPlan(running.planId!)!;
     const runningFolder = path.join(workspaceRoot, path.dirname(runningPlan.path));
     const outputRel = 'deliberations/result.md';
     fs.mkdirSync(path.join(runningFolder, 'deliberations'), { recursive: true });
     fs.writeFileSync(path.join(runningFolder, outputRel),
-      `---\nplan_artifact_id: plan_artifact_1\nintent_id: intent_running\norchestration_id: ${running.runId}\nkind: deliberation\n---\n# Result\n`);
+      `---\nplan_artifact_id: plan_00000001\nintent_id: int_11111111\norchestration_id: ${running.runId}\nkind: deliberation\n---\n# Result\n`);
     ledger.scanPlanIntentLedger({
       workspaceId: workspace.id, workspaceRoot, planId: running.planId!,
       folderAbs: runningFolder, folderRelPath: path.dirname(runningPlan.path).replace(/\\/g, '/'),
@@ -219,7 +220,7 @@ function makeClient(): DashboardClient {
     assert.equal(intent.runs[0].state, 'returned');
     assert.equal(intent.runs[0].returnedOutputExists, true);
 
-    const legacy = planFixture('intent_legacy');
+    const legacy = planFixture('int_55555555');
     fs.mkdirSync(path.join(legacy.folderAbs, 'research'), { recursive: true });
     fs.writeFileSync(path.join(legacy.folderAbs, 'research', 'legacy.md'),
       `---\nplan_artifact_id: ${legacy.artifactId}\nintent_id: ${legacy.intentId}\norchestration_id: old-unstamped-run\nkind: research\n---\n# Legacy result\n`);

@@ -22,6 +22,7 @@
 // distinguished by the promotion.* events, never by new status values.
 
 import type { Agent, LaunchAgentInput } from '../../shared/types';
+import { isPlanArtifactId, isProposalArtifactId } from '../../shared/planning-artifact-ids';
 import type { OrchestrationRun, SendInputConfirmedResult } from '../orchestration/types';
 // Type-only import — erased at compile time, so no runtime cycle with the
 // supervisor module. InternalLaunchContext is main-process-only (never in
@@ -116,6 +117,12 @@ function buildPromotionRun(runId: string, input: PromotionDispatchInput, iso: st
  *  plan.json (that is the worker's job). Returns the runId/agentId + whether
  *  delivery was confirmed. */
 export async function dispatchPromotion(input: PromotionDispatchInput): Promise<PromotionDispatchResult> {
+  if (!isProposalArtifactId(input.request.proposalArtifactId)
+      || !isPlanArtifactId(input.request.planArtifactId)
+      || input.request.planArtifactId.slice('plan_'.length)
+        !== input.request.proposalArtifactId.slice('prop_'.length)) {
+    throw new Error('promotion dispatch rejected non-contract or mismatched portable artifact identity');
+  }
   const runId = input.genRunId();
 
   // ── Phase 1 — reserve orchestration + bind onto the request, atomically,

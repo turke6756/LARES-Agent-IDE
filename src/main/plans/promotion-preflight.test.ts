@@ -11,6 +11,7 @@ import {
   type ClaimScanResult,
   type PromotionPreflightDeps,
 } from './promotion-preflight';
+import { dispatchPromotion } from './promotion-dispatch';
 
 interface TestCase { name: string; run(): Promise<void> | void }
 const tests: TestCase[] = [];
@@ -51,6 +52,21 @@ function planRow(folderRelPath: string): StructuredPlanRow {
     mtimeMs: 1, sizeBytes: 1, deletedAt: null,
   };
 }
+
+test('promotion dispatch rejects non-contract portable identity before reservation or launch', async () => {
+  let launched = false;
+  const request = { ...legacyRow(), proposalArtifactId: 'prop_pigt5a83', planArtifactId: 'plan_pigt5a83' };
+  await assert.rejects(dispatchPromotion({
+    request, workspaceId: request.workspaceId, supervisorId: 'sup-1', prompt: 'x', marker: 'x',
+    launchInput: {} as any, retry: false,
+    deliverer: {
+      async launchAgent() { launched = true; throw new Error('must not launch'); },
+      async sendInputConfirmed() { throw new Error('must not send'); },
+    },
+    now: () => '2026-08-08T00:00:00.000Z', genRunId: () => 'run-never',
+  }), /rejected non-contract or mismatched portable artifact identity/);
+  assert.equal(launched, false);
+});
 
 function deps(
   ws: Workspace,

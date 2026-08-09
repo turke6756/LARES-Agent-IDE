@@ -45,6 +45,10 @@ const svcEvents: Array<{ runId: string; kind: string; payload: unknown }> = [];
 const svcClone = <T>(o: T): T => JSON.parse(JSON.stringify(o));
 db.getWorkspace = (id: string) => (id === 'ws-1' ? { id: 'ws-1', path: os.tmpdir() } : null);
 db.getPlan = (id: string) => (svcPlansStore.has(id) ? svcClone(svcPlansStore.get(id)!) : null);
+db.getActivePlanningIntentForLaunch = (_workspaceId: string, planId: string, intentId: string) =>
+  planId === 'plan-demo' && intentId === 'int_1234abcd'
+    ? { planId, intentId, status: 'active' }
+    : null;
 db.insertOrchestration = (r: OrchestrationRun) => { svcRunsStore.set(r.runId, svcClone(r)); };
 db.updateOrchestration = (r: OrchestrationRun) => { svcRunsStore.set(r.runId, svcClone(r)); };
 db.getOrchestrationRun = (id: string) => (svcRunsStore.has(id) ? svcClone(svcRunsStore.get(id)!) : null);
@@ -280,7 +284,7 @@ test('rail dispatch resolves the plan row path into run.planPath (never plans/ne
   const { runId } = svc.start_run({
     name: 'groupthink', workspaceId: 'ws-1', supervisorId: 'sup-1',
     topic: 'Plan the acceptance demo', mode: 'serial',
-    planId: 'plan-demo', sectionAnchor: 'sec_demo',
+    planId: 'plan-demo', planningIntentId: 'int_1234abcd', sectionAnchor: 'sec_demo',
   } as any);
 
   await svcWaitFor(() => db.getOrchestrationRun(runId)?.status === 'complete');
