@@ -338,6 +338,24 @@ test('Outcome validation has CRLF and LF parity', () => {
   }
 });
 
+test('prose acceptance-count divergence from the machine block fails loudly', () => {
+  const prose = '## WP-A - Package A\n\n**Accept** — the two conditions listed for WP-A in the machine block.';
+  const result = ingest.parsePlanWorkPackageDocument(document([spec()], { prose }), 'plan_fixture');
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostics[0].code, 'prose-mismatch');
+    assert.equal(result.diagnostics[0].packageId, 'WP-A');
+    assert.match(result.diagnostics[0].detail, /claims 2 machine acceptance conditions.*machine block has 1/);
+  }
+});
+
+test('matching prose acceptance counts do not make machine paths authoritative', () => {
+  const prose = '## WP-A - Package A\n\n**Files:** `src/prose-authority.ts`.\n\n'
+    + '**Accept:** one machine condition.';
+  const result = ingest.parsePlanWorkPackageDocument(document([spec()], { prose }), 'plan_fixture');
+  assert.equal(result.ok, true, result.ok ? undefined : JSON.stringify(result.diagnostics));
+});
+
 test('strict parser rejects duplicate/unknown keys, comments, traversal, dependencies, and prose drift', () => {
   const good = spec();
   const cases: Array<[string, string, string]> = [

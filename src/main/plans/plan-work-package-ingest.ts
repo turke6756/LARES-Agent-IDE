@@ -301,6 +301,46 @@ function prosePackageHeadings(body: string): Array<{ id: string; title: string }
   return headings;
 }
 
+const PROSE_COUNT_WORDS = new Map<string, number>([
+  ['zero', 0], ['one', 1], ['two', 2], ['three', 3], ['four', 4], ['five', 5],
+  ['six', 6], ['seven', 7], ['eight', 8], ['nine', 9], ['ten', 10],
+  ['eleven', 11], ['twelve', 12], ['thirteen', 13], ['fourteen', 14],
+  ['fifteen', 15], ['sixteen', 16], ['seventeen', 17], ['eighteen', 18],
+  ['nineteen', 19], ['twenty', 20],
+]);
+const PROSE_COUNT = '(\\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)';
+
+type ProseAcceptanceCountClaim = { packageId: string; count: number; text: string };
+
+function proseAcceptanceCountClaims(body: string): ProseAcceptanceCountClaim[] {
+  const visible = visiblePackageProse(body);
+  const headings = recognizedProsePackageHeadings(visible);
+  const claims: ProseAcceptanceCountClaim[] = [];
+  for (let headingIndex = 0; headingIndex < headings.length; headingIndex += 1) {
+    const heading = headings[headingIndex];
+    const sectionStart = (heading.index ?? 0) + heading[0].length;
+    const sectionEnd = headings[headingIndex + 1]?.index ?? visible.length;
+    const section = visible.slice(sectionStart, sectionEnd);
+    const patterns = [
+      new RegExp(`\\bthe\\s+${PROSE_COUNT}\\s+(?:acceptance\\s+)?conditions?\\s+listed\\s+for\\s+([A-Za-z0-9][A-Za-z0-9._-]{0,63})\\s+in\\s+the\\s+machine\\s+block\\b`, 'gi'),
+      new RegExp(`^\\s*\\*\\*Accept(?::)?\\*\\*[^\\n]*?\\b${PROSE_COUNT}\\s+machine\\s+(?:acceptance\\s+)?conditions?\\b`, 'gim'),
+    ];
+    for (const [patternIndex, pattern] of patterns.entries()) {
+      for (const match of section.matchAll(pattern)) {
+        const rawCount = match[1].toLowerCase();
+        const count = /^\d+$/.test(rawCount) ? Number(rawCount) : PROSE_COUNT_WORDS.get(rawCount);
+        if (count === undefined) continue;
+        claims.push({
+          packageId: patternIndex === 0 ? match[2] : heading[1],
+          count,
+          text: match[0].trim(),
+        });
+      }
+    }
+  }
+  return claims;
+}
+
 type ProseOutcomeResult =
   | { ok: true; byId: Map<string, string | null> }
   | { ok: false; detail: string; packageId?: string };
@@ -404,6 +444,7 @@ export function parsePlanWorkPackageDocument(
   const packages: Validated[] = [];
   const ids = new Set<string>();
   const orders = new Set<number>();
+  const acceptanceCounts = new Map<string, number>();
   for (const item of raw.packages) {
     if (!isRecord(item)) return invalid('package-invalid', 'every package must be an object', sourceRelPath);
     const localId = typeof item.id === 'string' ? item.id : '';
@@ -480,6 +521,7 @@ export function parsePlanWorkPackageDocument(
     });
     ids.add(folded);
     orders.add(item.order as number);
+    acceptanceCounts.set(folded, item.acceptance_conditions.length);
   }
 
   const byId = new Map(packages.map((pkg) => [foldedId(pkg.sourceLocalId), pkg]));
@@ -489,6 +531,21 @@ export function parsePlanWorkPackageDocument(
       if (!target || target.sortOrder >= pkg.sortOrder) {
         return invalid('dependency-invalid', `dependency ${dependency} for ${pkg.sourceLocalId} must exist at a lower order`, sourceRelPath, pkg.sourceLocalId);
       }
+    }
+  }
+
+  for (const claim of proseAcceptanceCountClaims(body)) {
+    const pkg = byId.get(foldedId(claim.packageId));
+    if (!pkg) {
+      return invalid('prose-mismatch',
+        `prose acceptance-count claim names unknown package ${claim.packageId}`,
+        sourceRelPath, claim.packageId);
+    }
+    const actual = acceptanceCounts.get(foldedId(pkg.sourceLocalId))!;
+    if (claim.count !== actual) {
+      return invalid('prose-mismatch',
+        `prose claims ${claim.count} machine acceptance conditions for ${pkg.sourceLocalId}, but the machine block has ${actual}: ${claim.text}`,
+        sourceRelPath, pkg.sourceLocalId);
     }
   }
 
